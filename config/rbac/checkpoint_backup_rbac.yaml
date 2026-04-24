@@ -1,0 +1,58 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: checkpoint-backup-sa
+  namespace: stateful-migration
+  labels:
+    app.kubernetes.io/name: checkpoint-backup
+    app.kubernetes.io/part-of: stateful-migration-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: checkpoint-backup-role
+  labels:
+    app.kubernetes.io/name: checkpoint-backup
+    app.kubernetes.io/part-of: stateful-migration-operator
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/checkpoint"]
+  verbs: ["patch", "create", "update", "proxy"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/checkpoint"]
+  verbs: ["create", "get", "patch", "update", "proxy"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["migration.dcnlab.com"]
+  resources: ["checkpointbackups"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["migration.dcnlab.com"]
+  resources: ["checkpointbackups/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["migration.dcnlab.com"]
+  resources: ["checkpointbackups/finalizers"]
+  verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: checkpoint-backup-rolebinding
+  labels:
+    app.kubernetes.io/name: checkpoint-backup
+    app.kubernetes.io/part-of: stateful-migration-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: checkpoint-backup-role
+subjects:
+- kind: ServiceAccount
+  name: checkpoint-backup-sa
+  namespace: stateful-migration 

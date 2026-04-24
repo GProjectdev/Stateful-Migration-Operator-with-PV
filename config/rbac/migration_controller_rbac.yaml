@@ -1,0 +1,149 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-manager
+  namespace: stateful-migration-operator-system
+  labels:
+    app.kubernetes.io/name: stateful-migration-operator
+    app.kubernetes.io/part-of: stateful-migration-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leader-election-role
+  namespace: stateful-migration-operator-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+  - create
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leader-election-rolebinding
+  namespace: stateful-migration-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: stateful-migration-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: stateful-migration-operator-role
+rules:
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - statefulmigrations
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - statefulmigrations/status
+  verbs:
+  - get
+  - update
+  - patch
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - statefulmigrations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - checkpointbackups
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - checkpointbackups/status
+  verbs:
+  - get
+  - update
+  - patch
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - checkpointbackups/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: stateful-migration-operator-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: stateful-migration-operator-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: stateful-migration-operator-system 

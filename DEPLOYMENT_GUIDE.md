@@ -1,4 +1,3 @@
-# stateful-migration-operator
 # Deployment Guide for Stateful Migration Operator
 
 This guide explains how to deploy both CheckpointBackup and MigrationBackup controllers using the automated `deploy.sh` script.
@@ -61,7 +60,7 @@ The deployment script (`deploy.sh`) handles:
   --karmada-config ~/.kube/karmada \
   --mgmt-config ~/.kube/config \
   --clusters cluster1,cluster2,cluster3 \
-  --version v2.0
+  --version v1.17
 ```
 
 ### 2. Deploy Only CheckpointBackup Controller
@@ -69,14 +68,14 @@ The deployment script (`deploy.sh`) handles:
 ./deploy.sh --checkpoint \
   --karmada-config ~/.kube/karmada \
   --clusters cluster1,cluster2 \
-  --version v2.0
+  --version v1.17
 ```
 
 ### 3. Deploy Only MigrationBackup Controller
 ```bash
 ./deploy.sh --migration \
   --mgmt-config ~/.kube/config \
-  --version v2.0
+  --version v1.17
 ```
 
 ### 4. Dry Run (Preview Changes)
@@ -417,88 +416,3 @@ Add clusters to the list:
 - MigrationBackup controller typically runs as single replica with leader election
 
 This deployment script provides a complete, production-ready solution for deploying the Stateful Migration Operator across your Karmada-managed clusters! 🚀 
-
-# Build Script Usage Examples
-
-## Default Usage (All Controllers, Default Version)
-```bash
-./build-and-push.sh
-```
-**Builds:**
-- `lehuannhatrang/stateful-migration-operator:checkpointBackup_v1.16`
-- `lehuannhatrang/stateful-migration-operator:migrationBackup_v1.16`
-
-## All Controllers with Custom Version
-```bash
-./build-and-push.sh all v1.17
-```
-**Builds:**
-- `lehuannhatrang/stateful-migration-operator:checkpointBackup_v1.17`
-- `lehuannhatrang/stateful-migration-operator:migrationBackup_v1.17`
-
-## CheckpointBackup Controller Only (Default Version)
-```bash
-./build-and-push.sh checkpoint
-```
-**Builds:**
-- `lehuannhatrang/stateful-migration-operator:checkpointBackup_v1.16`
-
-## CheckpointBackup Controller with Custom Version
-```bash
-./build-and-push.sh checkpoint v2.0
-```
-**Builds:**
-- `lehuannhatrang/stateful-migration-operator:checkpointBackup_v2.0` (includes buildah and container tools)
-
-## MigrationBackup Controller Only (Default Version)
-```bash
-./build-and-push.sh migration
-```
-**Builds:**
-- `lehuannhatrang/stateful-migration-operator:migrationBackup_v1.16`
-
-## MigrationBackup Controller with Custom Version
-```bash
-./build-and-push.sh migration v1.18
-```
-**Builds:**
-- `lehuannhatrang/stateful-migration-operator:migrationBackup_v1.18`
-
-## Development Versions
-```bash
-# Build development version
-./build-and-push.sh all dev-$(date +%Y%m%d)
-
-# Build feature branch version
-./build-and-push.sh all feature-auth-v1.0
-
-# Build release candidate
-./build-and-push.sh all v2.0-rc1
-```
-
-## CI/CD Pipeline Examples
-```bash
-# Production release
-./build-and-push.sh all v1.19
-
-# Staging deployment
-./build-and-push.sh all staging-v1.19
-
-# Hotfix release
-./build-and-push.sh all v1.18.1
-```
-
-## Parameters Summary
-| Parameter | Description | Default | Examples |
-|-----------|-------------|---------|----------|
-| controller-type | Type of controller to build | `all` | `all`, `checkpoint`, `migration` |
-| version | Version tag for images | `v1.16` | `v1.17`, `v2.0`, `dev-20241215` |
-
-## Generated Image Format
-```
-lehuannhatrang/stateful-migration-operator:<controller-type>_<version>
-```
-
-**Where:**
-- `<controller-type>` is either `checkpointBackup` or `migrationBackup`
-- `<version>` is the version parameter you provide 

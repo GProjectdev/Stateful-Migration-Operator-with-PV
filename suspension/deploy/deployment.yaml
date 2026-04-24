@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: suspension-controller
+  namespace: stateful-migration
+  labels:
+    app: suspension-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: suspension-controller
+  template:
+    metadata:
+      labels:
+        app: suspension-controller
+    spec:
+      serviceAccountName: suspension-controller
+      containers:
+      - name: manager
+        image: jeongseungjun/karmada-suspension:v1
+        imagePullPolicy: Always
+        env:
+        - name: KARMADA_KUBECONFIG
+          value: /etc/karmada/kubeconfig
+        volumeMounts:
+        - name: karmada-kubeconfig
+          mountPath: /etc/karmada
+          readOnly: true
+        args:
+        - --leader-elect=false
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+        ports:
+        - name: metrics
+          containerPort: 8080
+        - name: health
+          containerPort: 8081
+      volumes:
+      - name: karmada-kubeconfig
+        secret:
+          secretName: karmada-kubeconfig

@@ -1,0 +1,19 @@
+KARMADA_KUBECONFIG=~/.kube/karmada
+
+MGMT_KUBECONFIG=~/.kube/config
+
+NAMESPACE=stateful-migration
+
+OPERATOR_NAMESPACE=stateful-migration
+
+이미지 태그: VERSION=v1.20
+
+이미지 레포:
+
+CheckpointBackup: lehuannhatrang/stateful-migration-operator:checkpointBackup_${VERSION}
+
+MigrationBackup: lehuannhatrang/stateful-migration-operator:migrationBackup_${VERSION}
+
+MigrationRestore: lehuannhatrang/stateful-migration-operator:migrationRestore_${VERSION}
+
+멤버 클러스터들(예): member1, member2
