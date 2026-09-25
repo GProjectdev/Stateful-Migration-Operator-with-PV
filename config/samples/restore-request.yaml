@@ -1,0 +1,28 @@
+apiVersion: migration.dcnlab.com/v1alpha1
+kind: RestoreRequest
+metadata:
+  name: trainer-to-aws-001
+  namespace: fluidcr-demo
+spec:
+  checkpointRef:
+    name: trainer-checkpoint-001
+    uid: REPLACE_WITH_KARMADA_CHECKPOINT_UID
+    generation: 1
+  workloadRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: trainer
+  sourceCluster: onprem
+  targetCluster: aws
+  # Operator attestations: change to true ONLY after each prerequisite is satisfied.
+  sourceFenced: false
+  volumesReady: false
+  pods:
+    - sourcePod: trainer-0
+      targetPod: trainer-0
+      targetNode: REPLACE_WITH_TARGET_NODE
+      archives:
+        - containerName: trainer
+          sourcePath: /var/lib/kubelet/checkpoints/REPLACE_WITH_REPORTED_ARCHIVE.tar
+          targetPath: /var/lib/kubelet/checkpoints/REPLACE_WITH_STAGED_ARCHIVE.tar
+          sha256: REPLACE_WITH_64_LOWERCASE_HEX_SHA256

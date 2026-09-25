@@ -1,0 +1,19 @@
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "stateful-restore-webhook",
+    "namespace": "stateful-migration-system"
+  },
+  "spec": {
+    "selector": {
+      "app": "stateful-member"
+    },
+    "ports": [
+      {
+        "port": 443,
+        "targetPort": "webhook"
+      }
+    ]
+  }
+}

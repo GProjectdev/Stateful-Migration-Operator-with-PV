@@ -1,0 +1,5 @@
+ARG FLUIDCR_PAYLOAD_IMAGE
+FROM ${FLUIDCR_PAYLOAD_IMAGE}
+COPY runtime/fluidcr/ctrl.py /opt/fluidcr/fluidcr/ctrl.py
+# The injector copies files, not this image's environment, into the workload.
+RUN rm -f /opt/fluidcr/fluidcr/__pycache__/ctrl.*.pyc

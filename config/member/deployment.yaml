@@ -1,0 +1,99 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "stateful-member",
+    "namespace": "stateful-migration-system"
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "matchLabels": {
+        "app": "stateful-member"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "stateful-member"
+        }
+      },
+      "spec": {
+        "serviceAccountName": "stateful-member",
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 65532,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "name": "manager",
+            "image": "ghcr.io/gprojectdev/stateful-migration-system:dev",
+            "args": [
+              "--mode=member",
+              "--cluster-name=aws",
+              "--webhook-cert-dir=/etc/webhook"
+            ],
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "ports": [
+              {
+                "name": "health",
+                "containerPort": 8081
+              },
+              {
+                "name": "webhook",
+                "containerPort": 9443
+              }
+            ],
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/readyz",
+                "port": "health"
+              }
+            },
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/healthz",
+                "port": "health"
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "100m",
+                "memory": "128Mi"
+              },
+              "limits": {
+                "memory": "512Mi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "tls",
+                "mountPath": "/etc/webhook",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "tls",
+            "secret": {
+              "secretName": "stateful-restore-tls"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,87 @@
+apiVersion: config.karmada.io/v1alpha1
+kind: ResourceInterpreterCustomization
+metadata:
+  name: fluidcrmigration-interpreter
+spec:
+  target:
+    apiVersion: fluidcr.dcnlab.com/v1alpha1
+    kind: FluidCRMigration
+  customizations:
+    statusReflection:
+      luaScript: |
+        local function copy(value)
+          if type(value) ~= "table" then return value end
+          local out = {}
+          for key, item in pairs(value) do
+            local copied = copy(item)
+            if copied ~= nil then out[key] = copied end
+          end
+          if next(out) == nil then return nil end
+          return out
+        end
+        function ReflectStatus(observedObj)
+          local status = observedObj and observedObj.status
+          local out = {}
+          if type(status) == "table" then
+            for key, value in pairs(status) do
+              if key ~= "clusters" then out[key] = copy(value) end
+            end
+          end
+          return out
+        end
+    statusAggregation:
+      luaScript: |
+        local function copy(value)
+          if type(value) ~= "table" then return value end
+          local out = {}
+          for key, item in pairs(value) do
+            local copied = copy(item)
+            if copied ~= nil then out[key] = copied end
+          end
+          if next(out) == nil then return nil end
+          return out
+        end
+        function AggregateStatus(desiredObj, statusItems)
+          desiredObj.status = desiredObj.status or {}
+          -- Never carry a previous report forward when a member stops reporting.
+          desiredObj.status.clusters = nil
+          local generation = desiredObj.metadata and desiredObj.metadata.generation
+          if type(generation) ~= "number" or generation < 1 then return desiredObj end
+          local spec = desiredObj.spec or {}
+          local counts = {}
+          for _, item in ipairs(statusItems or {}) do
+            local name = item.clusterName
+            if type(name) == "string" and name ~= "" then
+              counts[name] = (counts[name] or 0) + 1
+            end
+          end
+          local clusters = {}
+          for _, item in ipairs(statusItems or {}) do
+            local name = item.clusterName
+            local status = item.status
+            local expected = name == spec.sourceCluster or name == spec.targetCluster
+            -- Checkpoints have no cluster fields; binding reports identify members.
+            if spec.sourceCluster == nil and spec.targetCluster == nil then expected = true end
+            if expected and counts[name] == 1 and type(status) == "table"
+                and status.observedGeneration == generation then
+              local report = copy(status) or {}
+              report.clusters = nil
+              report.clusterName = name
+              table.insert(clusters, report)
+            end
+          end
+          table.sort(clusters, function(a, b) return a.clusterName < b.clusterName end)
+          -- Empty tables serialize as {}, which violates the CRD array schema.
+          if #clusters > 0 then desiredObj.status.clusters = clusters end
+          return desiredObj
+        end
+    healthInterpretation:
+      luaScript: |
+        function InterpretHealth(observedObj)
+          local status = observedObj and observedObj.status
+          local generation = observedObj and observedObj.metadata and observedObj.metadata.generation
+          if type(status) ~= "table" or type(generation) ~= "number" or generation < 1 then
+            return false
+          end
+          return status.observedGeneration == generation and status.phase == "Completed"
+        end

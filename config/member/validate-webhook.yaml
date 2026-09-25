@@ -1,0 +1,54 @@
+{
+  "apiVersion": "admissionregistration.k8s.io/v1",
+  "kind": "ValidatingWebhookConfiguration",
+  "metadata": {
+    "name": "stateful-restore-validate",
+    "annotations": {
+      "cert-manager.io/inject-ca-from": "stateful-migration-system/stateful-restore-cert"
+    }
+  },
+  "webhooks": [
+    {
+      "name": "validate.restore.migration.dcnlab.com",
+      "admissionReviewVersions": [
+        "v1"
+      ],
+      "sideEffects": "None",
+      "failurePolicy": "Fail",
+      "timeoutSeconds": 10,
+      "clientConfig": {
+        "service": {
+          "name": "stateful-restore-webhook",
+          "namespace": "stateful-migration-system",
+          "path": "/validate-restore",
+          "port": 443
+        }
+      },
+      "rules": [
+        {
+          "apiGroups": [
+            ""
+          ],
+          "apiVersions": [
+            "v1"
+          ],
+          "operations": [
+            "CREATE"
+          ],
+          "resources": [
+            "pods"
+          ],
+          "scope": "Namespaced"
+        }
+      ],
+      "objectSelector": {
+        "matchExpressions": [
+          {
+            "key": "migration.dcnlab.com/restore-plan",
+            "operator": "Exists"
+          }
+        ]
+      }
+    }
+  ]
+}

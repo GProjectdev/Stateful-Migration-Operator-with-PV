@@ -1,0 +1,343 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: fluidcrmigrations.fluidcr.dcnlab.com
+spec:
+  group: fluidcr.dcnlab.com
+  names:
+    kind: FluidCRMigration
+    listKind: FluidCRMigrationList
+    plural: fluidcrmigrations
+    singular: fluidcrmigration
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.workloadRef.name
+      name: Workload
+      type: string
+    - jsonPath: .status.message
+      name: Message
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: FluidCRMigration is the Schema for the fluidcrmigrations API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of FluidCRMigration
+            x-kubernetes-validations:
+            - rule: self == oldSelf
+              message: spec is immutable; create a new checkpoint CR
+            properties:
+              appCheckpointTimeoutSeconds:
+                description: |-
+                  AppCheckpointTimeoutSeconds bounds each in-pod /checkpoint REST call.
+                  Defaults to 300.
+                format: int32
+                minimum: 1
+                type: integer
+              container:
+                description: |-
+                  Container overrides which container is checkpointed via the kubelet CRIU
+                  API. When empty, the controller resolves it from the
+                  "fluidcr.dcnlab.com/container" annotation, or the pod's sole container.
+                type: string
+              ctrlPort:
+                description: |-
+                  CtrlPort overrides the in-pod FluidCR control-API port. When zero, the
+                  controller reads the target container's FLUIDCR_CTRL_PORT environment
+                  variable, falling back to 8298.
+                format: int32
+                maximum: 65535
+                minimum: 0
+                type: integer
+              kubeletTimeoutSeconds:
+                description: |-
+                  KubeletTimeoutSeconds bounds each kubelet CRIU checkpoint call.
+                  Defaults to 300.
+                format: int32
+                minimum: 1
+                type: integer
+              resume:
+                description: |-
+                  Resume controls whether the controller releases the application
+                  checkpoint locks (calls the in-pod /resume API) after the container
+                  checkpoints are taken, so the workload continues in place. Defaults to
+                  true.
+                type: boolean
+              workloadRef:
+                description: |-
+                  WorkloadRef references the workload whose pods will be checkpointed.
+                  The controller resolves the workload's pod selector and fans out the
+                  checkpoint workflow to every Running, FluidCR-injected pod it owns.
+                properties:
+                  apiVersion:
+                    description: APIVersion of the workload, e.g. "apps/v1", "batch/v1"
+                      or "v1" (Pod).
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: |-
+                      Kind of the workload. A Pod reference targets that single pod directly;
+                      the other kinds fan out to every pod the workload owns.
+                    enum:
+                    - Deployment
+                    - StatefulSet
+                    - Job
+                    - Pod
+                    type: string
+                  name:
+                    description: Name of the workload.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace of the workload. Defaults to the FluidCRMigration's own
+                      namespace when empty.
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                type: object
+            required:
+            - workloadRef
+            type: object
+          status:
+            description: status defines the observed state of FluidCRMigration
+            properties:
+              clusters:
+                type: array
+                x-kubernetes-list-type: map
+                x-kubernetes-list-map-keys:
+                - clusterName
+                items:
+                  type: object
+                  required:
+                  - clusterName
+                  properties:
+                    clusterName:
+                      type: string
+                    startTime:
+                      type: string
+                      format: date-time
+                    completionTime:
+                      type: string
+                      format: date-time
+                    phase:
+                      type: string
+                    observedGeneration:
+                      type: integer
+                      format: int64
+                    message:
+                      type: string
+                    pods:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    conditions:
+                      type: array
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys:
+                      - type
+                      items:
+                        type: object
+                        required:
+                        - type
+                        - status
+                        - reason
+                        - message
+                        - lastTransitionTime
+                        properties:
+                          type:
+                            type: string
+                          status:
+                            type: string
+                            enum: ["True", "False", "Unknown"]
+                          reason:
+                            type: string
+                          message:
+                            type: string
+                          lastTransitionTime:
+                            type: string
+                            format: date-time
+                          observedGeneration:
+                            type: integer
+                            format: int64
+              completionTime:
+                description: CompletionTime is when the workflow reached a terminal
+                  phase.
+                format: date-time
+                type: string
+              conditions:
+                description: |-
+                  Conditions represent the latest available observations of the
+                  FluidCRMigration's current state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              message:
+                description: Message provides human-readable detail about the current
+                  state.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last reconciled.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the overall phase of the migration workflow.
+                type: string
+              pods:
+                description: Pods tracks the per-pod progress of the workflow.
+                items:
+                  description: PodMigrationStatus tracks the per-pod progress of the
+                    workflow.
+                  properties:
+                    appCheckpointResult:
+                      description: AppCheckpointResult summarizes the in-pod /checkpoint
+                        REST response.
+                      type: string
+                    checkpointFiles:
+                      description: CheckpointFiles lists the CRIU archives produced
+                        for this pod.
+                      items:
+                        description: CheckpointFile records a CRIU checkpoint archive
+                          produced for a container.
+                        properties:
+                          checkpointTime:
+                            description: CheckpointTime is when the checkpoint archive
+                              was created.
+                            format: date-time
+                            type: string
+                          containerName:
+                            description: ContainerName is the container that was checkpointed.
+                            type: string
+                          filePath:
+                            description: |-
+                              FilePath is the absolute path of the checkpoint archive on the host
+                              node, e.g. /var/lib/kubelet/checkpoints/checkpoint-<ns>_<pod>-<container>-<ts>.tar.
+                            type: string
+                        required:
+                        - containerName
+                        - filePath
+                        type: object
+                      type: array
+                    message:
+                      description: Message provides per-pod detail, including the
+                        error on failure.
+                      type: string
+                    nodeName:
+                      description: NodeName is the node the pod runs on.
+                      type: string
+                    phase:
+                      description: Phase is the per-pod phase.
+                      type: string
+                    podIP:
+                      description: PodIP is the pod IP used for the in-pod control-API
+                        calls.
+                      type: string
+                    podName:
+                      description: PodName is the target pod's name.
+                      type: string
+                    podUID:
+                      description: UID of the checkpointed pod incarnation.
+                      type: string
+                  required:
+                  - podName
+                  type: object
+                type: array
+              startTime:
+                description: StartTime is when the workflow started.
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

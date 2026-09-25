@@ -1,0 +1,92 @@
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "ClusterRole",
+  "metadata": {
+    "name": "stateful-management"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "migration.dcnlab.com"
+      ],
+      "resources": [
+        "restorerequests"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch"
+      ]
+    },
+    {
+      "apiGroups": [
+        "migration.dcnlab.com"
+      ],
+      "resources": [
+        "restorerequests/status"
+      ],
+      "verbs": [
+        "get",
+        "update",
+        "patch"
+      ]
+    },
+    {
+      "apiGroups": [
+        "migration.dcnlab.com"
+      ],
+      "resources": [
+        "restoreplans"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch",
+        "create"
+      ]
+    },
+    {
+      "apiGroups": [
+        "fluidcr.dcnlab.com"
+      ],
+      "resources": [
+        "fluidcrmigrations"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch"
+      ]
+    },
+    {
+      "apiGroups": [
+        "policy.karmada.io"
+      ],
+      "resources": [
+        "propagationpolicies"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch",
+        "create"
+      ]
+    },
+    {
+      "apiGroups": [
+        "coordination.k8s.io"
+      ],
+      "resources": [
+        "leases"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch",
+        "create",
+        "update",
+        "patch"
+      ]
+    }
+  ]
+}

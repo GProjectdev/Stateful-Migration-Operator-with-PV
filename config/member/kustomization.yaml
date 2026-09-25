@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - binding.yaml
+  - deployment.yaml
+  - service.yaml
+  - issuer.yaml
+  - certificate.yaml
+  - mutate-webhook.yaml
+  - validate-webhook.yaml
+  - artifact-serviceaccount.yaml
+  - artifact-role.yaml
+  - artifact-binding.yaml
+  - artifact-daemonset.yaml

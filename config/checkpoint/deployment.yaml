@@ -1,0 +1,94 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "stateful-checkpoint",
+    "namespace": "stateful-migration-system"
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "matchLabels": {
+        "app": "stateful-checkpoint"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "stateful-checkpoint"
+        }
+      },
+      "spec": {
+        "serviceAccountName": "stateful-checkpoint",
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 65532,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "name": "manager",
+            "image": "ghcr.io/gprojectdev/stateful-migration-system:dev",
+            "args": [
+              "--mode=checkpoint",
+              "--kubelet-ca-file=/etc/kubelet-ca/ca.crt"
+            ],
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "ports": [
+              {
+                "name": "health",
+                "containerPort": 8081
+              }
+            ],
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/readyz",
+                "port": "health"
+              }
+            },
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/healthz",
+                "port": "health"
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "100m",
+                "memory": "128Mi"
+              },
+              "limits": {
+                "memory": "512Mi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "kubelet-ca",
+                "mountPath": "/etc/kubelet-ca",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "kubelet-ca",
+            "configMap": {
+              "name": "kubelet-serving-ca"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

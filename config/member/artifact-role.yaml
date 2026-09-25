@@ -1,0 +1,35 @@
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "ClusterRole",
+  "metadata": {
+    "name": "stateful-artifact"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "migration.dcnlab.com"
+      ],
+      "resources": [
+        "restoreplans"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch"
+      ]
+    },
+    {
+      "apiGroups": [
+        "migration.dcnlab.com"
+      ],
+      "resources": [
+        "restoreplans/status"
+      ],
+      "verbs": [
+        "get",
+        "update",
+        "patch"
+      ]
+    }
+  ]
+}

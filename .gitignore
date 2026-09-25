@@ -1,0 +1,36 @@
+.idea/
+.vscode/
+
+# Build outputs
+bin/
+dist/
+coverage.out
+*.test
+
+# Go workspace/cache artifacts
+vendor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+go.work
+go.work.sum
+
+# Local credentials and generated kubeconfigs
+*.kubeconfig
+*.config
+*.pem
+*.key
+*.crt
+*.token
+secrets/
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

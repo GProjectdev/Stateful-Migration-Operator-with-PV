@@ -1,0 +1,19 @@
+{
+  "apiVersion": "cert-manager.io/v1",
+  "kind": "Certificate",
+  "metadata": {
+    "name": "stateful-restore-cert",
+    "namespace": "stateful-migration-system"
+  },
+  "spec": {
+    "secretName": "stateful-restore-tls",
+    "dnsNames": [
+      "stateful-restore-webhook.stateful-migration-system.svc",
+      "stateful-restore-webhook.stateful-migration-system.svc.cluster.local"
+    ],
+    "issuerRef": {
+      "name": "stateful-selfsigned",
+      "kind": "Issuer"
+    }
+  }
+}
