@@ -13,10 +13,11 @@ jobs:
         with:
           go-version: "1.24.x"
       - run: go mod tidy && git diff --exit-code -- go.mod go.sum
-      - run: test -z "$(gofmt -l api cmd internal)"
+      - run: test -z "$(gofmt -l api cmd internal runtime/crio)"
       - run: go vet ./...
       - run: go test -race ./...
       - run: python3 -B -m unittest discover -s runtime/tests -v
+      - run: bash -n scripts/create-karmada-kubeconfig.sh
       - run: CGO_ENABLED=0 GOOS=linux go build ./cmd/manager
       - run: |
           for bundle in crd karmada management member checkpoint; do

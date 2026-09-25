@@ -1,7 +1,11 @@
 # Stateful-Migration-System
 
 FluidCR Checkpoint CR과 Karmada ResourceInterpreterCustomization을 사용하는 독립 Checkpoint/Restore 제어 시스템입니다.
-Karmada 전체 소스, CRI-O, CRIU, FluidCR Python payload는 포함하지 않습니다.
+Karmada·CRI-O·CRIU 전체 소스는 포함하지 않습니다. 필요한 FluidCR 완료 대기 overlay와
+CRI-O annotation 연결 패치만 제공합니다.
+
+처음 설치할 때는 **[StatefulSet 2 Pod 통합 설치·마이그레이션 가이드](docs/two-replica-migration-guide.md)**를
+따르세요. [CRI-O·CRIU 설치](docs/runtime-installation.md)와 [Suspension 게이트](docs/suspension.md)를 함께 설명합니다.
 
 ```bash
 git clone --single-branch --branch main https://github.com/GProjectdev/Stateful-Migration-Operator-with-PV.git Stateful-Migration-System
@@ -19,6 +23,7 @@ Restore는 Pod annotation 예제만 있으므로 RestorePlan용 Member 컨트롤
 | 위치 | 구성 | 역할 |
 |---|---|---|
 | MGMT | Restore Controller | Karmada Checkpoint 집계 상태 검증, RestorePlan + 대상 PP 생성 |
+| MGMT | Suspension Controller | UID로 연결한 PV 완료·Restore 준비를 확인하고 opt-in StatefulSet RB 전파 재개 |
 | Source Member | FluidCR Checkpoint Controller | 기존 FluidCR 방식 실행, Pod별 결과를 CR status로 기록 |
 | Target Member | Artifact verifier DaemonSet | 대상 노드 archive 경로·SHA-256 검증 |
 | Target Member | Restore Controller / admission | 준비 상태, Pod 복원 annotation·node affinity, 최종 주입 검증 |
@@ -45,7 +50,9 @@ Deployment/Job 복원, 다른 ordinal로 이동, cron 백업, OCI checkpoint ima
 
 **중요: 런타임 확인이 필요합니다.** FluidCR 예제는
 `checkpoint-restore.crio.io/<container>`를 처리하는 수정 CRI-O를 전제합니다.
-확인한 로컬 CRI-O 소스에는 이 annotation 처리 코드가 보이지 않았습니다.
+지정된 leehun-cri-o 소스도 archive/OCI checkpoint 가져오기는 지원하지만 이 annotation을
+직접 읽지는 않습니다. [설치 가이드](docs/runtime-installation.md)에 따라 leehun-criu와
+CRI-O를 설치하고, 제공하는 작은 annotation adapter 패치를 적용해야 합니다.
 해당 동작을 실제 검증한 runtime을 대상에 설치한 뒤에만 다음 capability label을 붙이세요.
 표준 CRI-O/미지원 runtime에 label만 붙이면 복원 대신 새 프로세스가 시작될 위험이 있습니다.
 
@@ -184,6 +191,10 @@ MGMT manager leader-election Lease는 Karmada의 stateful-migration-system names
 ### 1. Checkpoint 요청
 
 기존 workload가 source에서 실행되고 모든 Pod에 FluidCR이 주입되어 있어야 합니다.
+PVMetadata의 원본 snapshot을 먼저 확보하고 workload ResourceBinding의
+`spec.suspension.dispatching=true`를 설정한 뒤 checkpoint를 시작하세요.
+이 값은 Karmada 전파만 멈추며 원본 프로세스를 정지시키지 않습니다.
+새 Suspension Controller는 완료 후 해제를 담당하고, 초기 중단이나 원본 fencing은 수행하지 않습니다.
 `config/samples/checkpoint.yaml`의 namespace/workload/container/source 이름을 수정합니다.
 애플리케이션 잠금을 유지하기 위해 **resume: false**를 명시합니다.
 
@@ -198,7 +209,7 @@ Pod별 podName/nodeName/podUID/checkpointFiles의 containerName/filePath가 복�
 
 ### 2. Source fence, PV와 파일 준비
 
-1. workload ResourceBinding 이름을 확인하고 dispatch를 중지합니다. 자동 failover/기존 suspension 자동 해제 컨트롤러도 중지합니다.
+1. workload ResourceBinding 이름을 확인하고 dispatch를 중지합니다. 자동 failover/기존 annotation 기반 suspension 자동 해제 컨트롤러도 중지합니다.
 2. 원본 프로세스를 중지하거나 fence합니다. resume:false만으로 외부 쓰기와 split-brain이 완전히 차단된다고 가정하지 마세요.
 3. PVC retention/reclaim policy를 확인하고 PV-Migration-System으로 대상 NFS PV를 준비합니다.
 4. 애플리케이션 checkpoint 데이터와 모든 mount를 보존합니다.
@@ -261,21 +272,31 @@ annotations:
 mount, 이미지, runtimeClass, GPU claim, DDP rank 구성을 source와 일치시킵니다.
 대상 Pod가 이미 생성되어 있으면 소급 복원하지 않습니다. 컨트롤러는 이를 임의 삭제하지 않습니다.
 
-그 다음 workload PropagationPolicy를 target 한 곳으로 변경하고, PV 및 복원 준비를 재확인한 뒤
-ResourceBinding dispatch를 수동 재개합니다. Checkpoint의 source 고정 PP는 변경하지 않습니다.
+PV-Migration-System과 함께 사용하는 StatefulSet은 [Suspension 게이트](docs/suspension.md)의
+RestoreRequest/PVMigration 이름·UID annotation을 RB에 설정합니다.
+그 다음 workload PropagationPolicy를 target 한 곳으로 변경합니다. 현재 UID·generation,
+PV 완료, Restore 준비, workload template와 target-only RB 배치가 모두 맞으면
+새 Suspension Controller가 dispatch 중단 필드를 제거합니다.
+Checkpoint의 source 고정 PP는 변경하지 않습니다.
 
 ```bash
 kubectl --context karmada -n fluidcr-demo patch propagationpolicy <WORKLOAD_PP> --type=merge \
   -p '{"spec":{"placement":{"clusterAffinity":{"clusterNames":["aws"]}}}}'
-kubectl --context karmada -n fluidcr-demo patch resourcebinding <RB_NAME> --type=merge \
-  -p '{"spec":{"suspension":{"dispatching":false}}}'
+kubectl --context karmada -n fluidcr-demo get resourcebinding <RB_NAME> -w
 ```
+
+이 자동 게이트는 StatefulSet + PVMigration 조합에 한정됩니다. 단독 Pod 등 수동 운영 경로는
+모든 준비를 별도로 확인한 뒤 `--type=json -p='[{"op":"remove","path":"/spec/suspension/dispatching"}]'`로
+해제하세요. Karmada의 dispatching 필드는 true만 허용하므로 false를 쓰지 않습니다.
+자동 게이트를 사용하는 RB에서는 수동 해제로 검사를 우회하지 마세요.
 
 ### 5. 결과 확인과 정리
 
 `RestoreRequest.status.phase=Running`은 대상 Pod의 Running/Ready와 설정 일치를 뜻하며
 **메모리 상태·학습 step 복원 성공을 보증하지 않습니다**.
 CRI-O/CRIU 로그와 애플리케이션 iteration, tensor/model 상태, DDP 전체 rank 재결합을 확인하세요.
+FluidCR의 launcher 잠금이 유지되면 모든 대상 컨테이너의 runtime restore를 확인한 후에만
+운영자가 대상에서 resume을 실행합니다. Pod Running만 보고 학습 재개 완료로 판단하지 마세요.
 그 전에는 트래픽 전환, 원본/체크포인트 삭제를 하지 마세요.
 
 Plan과 CR은 자동 삭제하지 않습니다. 운영자가 이력을 보관하고 재복원 정책을 결정해야 합니다.

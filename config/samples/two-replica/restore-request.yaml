@@ -1,0 +1,35 @@
+apiVersion: migration.dcnlab.com/v1alpha1
+kind: RestoreRequest
+metadata:
+  name: trainer-restore-001
+  namespace: fluidcr-demo
+spec:
+  checkpointRef:
+    name: trainer-checkpoint-001
+    uid: ${CHECKPOINT_UID}
+    generation: 1
+  workloadRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: trainer
+  sourceCluster: ${SOURCE_CLUSTER}
+  targetCluster: ${TARGET_CLUSTER}
+  sourceFenced: false
+  volumesReady: false
+  pods:
+  - sourcePod: trainer-0
+    targetPod: trainer-0
+    targetNode: ${TARGET_NODE_0}
+    archives:
+    - containerName: trainer
+      sourcePath: ${SOURCE_ARCHIVE_0}
+      targetPath: ${TARGET_ARCHIVE_0}
+      sha256: ${SHA256_0}
+  - sourcePod: trainer-1
+    targetPod: trainer-1
+    targetNode: ${TARGET_NODE_1}
+    archives:
+    - containerName: trainer
+      sourcePath: ${SOURCE_ARCHIVE_1}
+      targetPath: ${TARGET_ARCHIVE_1}
+      sha256: ${SHA256_1}

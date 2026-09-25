@@ -143,6 +143,21 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	return finish(phase, message, plan.Name)
 }
 
+// ValidateRestoreCheckpoint rechecks the immutable operation before releasing dispatch.
+func ValidateRestoreCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) error {
+	if err := validateRequest(req); err != nil {
+		return err
+	}
+	ready, err := validateCheckpoint(req, cp)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("current source checkpoint is not completed")
+	}
+	return nil
+}
+
 func ownedBy(obj client.Object, req *api.RestoreRequest) bool {
 	owner := metav1.GetControllerOf(obj)
 	return owner != nil && owner.APIVersion == api.GroupVersion.String() && owner.Kind == "RestoreRequest" && owner.Name == req.Name && owner.UID == req.UID

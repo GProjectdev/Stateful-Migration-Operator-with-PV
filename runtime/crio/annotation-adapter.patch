@@ -1,0 +1,28 @@
+diff --git a/server/container_create.go b/server/container_create.go
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -410,5 +410,23 @@
+ 	log.Infof(ctx, "Creating container: %s", oci.LabelsToDescription(req.GetConfig().GetLabels()))
+ 
++	// Explicit annotation restores must never fall back to a cold start.
++	restoreArchive, err := annotationRestoreArchive(
++		s.config.CheckpointRestore(),
++		req.GetConfig().GetMetadata().GetName(),
++		req.GetSandboxConfig().GetLabels(),
++		req.GetSandboxConfig().GetAnnotations(),
++		req.GetConfig().GetAnnotations(),
++	)
++	if err != nil {
++		return nil, fmt.Errorf("annotation checkpoint restore: %w", err)
++	}
++	if restoreArchive != "" {
++		req.GetConfig().GetImage().Image = restoreArchive
++	}
++
+ 	// Check if image is a file. If it is a file it might be a checkpoint archive.
+ 	checkpointImage, err := func() (bool, error) {
++		if restoreArchive != "" {
++			return true, nil
++		}
+ 		if !s.config.CheckpointRestore() {
+

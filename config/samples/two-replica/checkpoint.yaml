@@ -1,0 +1,29 @@
+apiVersion: policy.karmada.io/v1alpha1
+kind: PropagationPolicy
+metadata:
+  name: trainer-checkpoint-source
+  namespace: fluidcr-demo
+spec:
+  resourceSelectors:
+  - apiVersion: fluidcr.dcnlab.com/v1alpha1
+    kind: FluidCRMigration
+    name: trainer-checkpoint-001
+  placement:
+    clusterAffinity:
+      clusterNames:
+      - ${SOURCE_CLUSTER}
+---
+apiVersion: fluidcr.dcnlab.com/v1alpha1
+kind: FluidCRMigration
+metadata:
+  name: trainer-checkpoint-001
+  namespace: fluidcr-demo
+spec:
+  workloadRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: trainer
+  container: trainer
+  resume: false
+  appCheckpointTimeoutSeconds: 300
+  kubeletTimeoutSeconds: 300

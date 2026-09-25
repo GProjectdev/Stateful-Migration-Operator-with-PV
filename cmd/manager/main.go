@@ -15,6 +15,7 @@ import (
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/kubelet"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/management"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/member"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/suspension"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -96,6 +97,9 @@ func main() {
 	switch mode {
 	case "management":
 		err = (&management.RestoreReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), PollInterval: 5 * time.Second}).SetupWithManager(mgr)
+		if err == nil {
+			err = (&suspension.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)
+		}
 	case "member":
 		err = member.NewReconciler(mgr.GetClient(), mgr.GetAPIReader(), cluster).SetupWithManager(mgr)
 		mgr.GetWebhookServer().Register("/mutate-restore", &admission.Webhook{Handler: member.NewWebhook(mgr.GetAPIReader(), cluster)})

@@ -1,0 +1,16 @@
+apiVersion: migration.dcnlab.com/v1alpha1
+kind: PVMigration
+metadata:
+  name: trainer-pv-001
+  namespace: fluidcr-demo
+spec:
+  metadataRef: ${PV_METADATA}
+  sourceCluster: ${SOURCE_CLUSTER}
+  targetCluster: ${TARGET_CLUSTER}
+  resourceBinding: ${RB_NAME}
+  sourceFenced: false
+  volumes:
+  - sourcePVC: checkpoint-trainer-0
+    targetPVC: checkpoint-trainer-0
+  - sourcePVC: checkpoint-trainer-1
+    targetPVC: checkpoint-trainer-1

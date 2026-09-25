@@ -1,0 +1,131 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: trainer
+  namespace: fluidcr-demo
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: trainer
+  ports:
+  - name: control
+    port: 8298
+  - name: rendezvous
+    port: 29500
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trainer
+  namespace: fluidcr-demo
+  labels:
+    migration.dcnlab.com/pv-metadata: enabled
+spec:
+  serviceName: trainer
+  replicas: 2
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app: trainer
+  template:
+    metadata:
+      labels:
+        app: trainer
+      annotations:
+        fluidcr.dcnlab.com/inject: 'true'
+        fluidcr.dcnlab.com/container: trainer
+    spec:
+      runtimeClassName: ${GPU_RUNTIME_CLASS}
+      containers:
+      - name: trainer
+        image: ${TRAINER_IMAGE}
+        command:
+        - python
+        - -u
+        - /workspace/train.py
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: FLUIDCR_CHECKPOINT_PATH
+          value: /checkpoint/$(POD_NAME)/latest.pt
+        - name: FLUIDCR_REGISTRY_DIR
+          value: /tmp/fluidcr-workers
+        - name: FLUIDCR_DISTRIBUTED
+          value: '0'
+        ports:
+        - name: control
+          containerPort: 8298
+        resources:
+          requests:
+            cpu: '2'
+            memory: 8Gi
+            nvidia.com/gpu: '1'
+          limits:
+            cpu: '2'
+            memory: 8Gi
+            nvidia.com/gpu: '1'
+        readinessProbe:
+          tcpSocket:
+            port: control
+          initialDelaySeconds: 30
+        volumeMounts:
+        - name: checkpoint
+          mountPath: /checkpoint
+        - name: shared-mem
+          mountPath: /dev/shm
+      volumes:
+      - name: shared-mem
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+  volumeClaimTemplates:
+  - metadata:
+      name: checkpoint
+    spec:
+      accessModes:
+      - ReadWriteMany
+      storageClassName: ''
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: policy.karmada.io/v1alpha1
+kind: PropagationPolicy
+metadata:
+  name: trainer-workload
+  namespace: fluidcr-demo
+spec:
+  resourceSelectors:
+  - apiVersion: apps/v1
+    kind: StatefulSet
+    name: trainer
+  placement:
+    clusterAffinity:
+      clusterNames:
+      - ${SOURCE_CLUSTER}
+    replicaScheduling:
+      replicaSchedulingType: Duplicated
+---
+apiVersion: policy.karmada.io/v1alpha1
+kind: PropagationPolicy
+metadata:
+  name: trainer-service
+  namespace: fluidcr-demo
+spec:
+  resourceSelectors:
+  - apiVersion: v1
+    kind: Service
+    name: trainer
+  placement:
+    clusterAffinity:
+      clusterNames:
+      - ${SOURCE_CLUSTER}
+      - ${TARGET_CLUSTER}

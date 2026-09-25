@@ -38,8 +38,12 @@ Running means mapped Pods are Running and Ready with the expected restore config
 It is NOT proof of CRIU success, correct training rank state, restored iteration, or data integrity.
 Inspect CRI-O/CRIU logs and application-level progress to establish semantic recovery.
 
-No controller unsuspends ResourceBindings, changes workload placement, deletes source Pods,
-copies archives, migrates PVs or opens traffic. These are explicit operational gates.
+The opt-in Suspension Controller releases StatefulSet ResourceBinding dispatch only after
+current UID-bound PVMigration and RestoreRequest/RestorePlan gates pass.
+It removes the dispatching field rather than assigning false (Karmada accepts true only).
+See [suspension contract](suspension.md).
+No controller changes workload placement, deletes source Pods, copies archives or opens
+traffic. PV-Migration-System separately stages retained NFS PVs.
 SourceFenced and VolumesReady are operator attestations, not independently verified claims.
 
 ## Why a validating webhook too?
@@ -56,15 +60,17 @@ The previous operator read and modified members through the Karmada cluster prox
 packaged checkpoints into registry images, and resumed dispatch when Restore CR placement
 matched. This implementation uses FluidCR archive paths and separates Prepared from Running.
 Legacy StatefulMigration, CheckpointBackup and CheckpointRestore resources are not converted.
-Legacy cron checkpoint scheduling, registry image building and automatic suspension release
-are not included. Explicit operation CRs and external scheduling can be used instead.
+Legacy cron checkpoint scheduling and registry image building are not included.
+Legacy annotation-only suspension release is replaced with UID-bound CR validation.
 
 ## Runtime dependency found during inspection
 
 FluidCR's examples/prod/restore-pod.yaml uses checkpoint-restore.crio.io/<container>.
 The inspected local leehun-cri-o-main server/container_create.go recognizes checkpoint
 archives via the image field, but a repository search did not find this annotation handler.
-Do not assume that source tree implements the example's restore-from-file contract.
+The [runtime installation guide](runtime-installation.md) includes a small explicit adapter
+patch to bridge that annotation to the existing CRI-O checkpoint import path.
+Do not assume that the unpatched source tree implements the example's contract.
 The target must run a tested runtime build that honors this annotation and fails if restore
 fails. The restore webhook requires the admin-certified node label
 migration.dcnlab.com/restore-from-file=true. The label is an attestation, not capability detection.

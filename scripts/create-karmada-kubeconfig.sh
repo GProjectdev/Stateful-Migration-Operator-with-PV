@@ -3,6 +3,8 @@ set -euo pipefail
 umask 077
 context="${1:-karmada}"
 output="${2:-/tmp/stateful-karmada.kubeconfig}"
+namespace="${3:-stateful-migration-system}"
+account="${4:-stateful-management}"
 if [[ -e "$output" ]]; then
   echo "Refusing to overwrite existing kubeconfig: $output" >&2
   exit 1
@@ -13,7 +15,7 @@ if [[ -z "$server" || -z "$ca" ]]; then
   echo "A reachable Karmada server and trusted CA data are required." >&2
   exit 1
 fi
-token="$(kubectl --context "$context" -n stateful-migration-system create token stateful-management --duration=1h)"
+token="$(kubectl --context "$context" -n "$namespace" create token "$account" --duration=1h)"
 kubectl --kubeconfig "$output" config set-cluster karmada --server="$server" >/dev/null
 kubectl --kubeconfig "$output" config set clusters.karmada.certificate-authority-data "$ca" >/dev/null
 kubectl --kubeconfig "$output" config set-credentials stateful-management --token="$token" >/dev/null

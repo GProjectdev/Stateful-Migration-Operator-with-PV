@@ -6,6 +6,21 @@
   },
   "rules": [
     {
+      "apiGroups": ["work.karmada.io"],
+      "resources": ["resourcebindings"],
+      "verbs": ["get", "list", "watch", "patch"]
+    },
+    {
+      "apiGroups": ["apps"],
+      "resources": ["statefulsets"],
+      "verbs": ["get"]
+    },
+    {
+      "apiGroups": ["migration.dcnlab.com"],
+      "resources": ["pvmigrations", "pvmetadata"],
+      "verbs": ["get"]
+    },
+    {
       "apiGroups": [
         "migration.dcnlab.com"
       ],
