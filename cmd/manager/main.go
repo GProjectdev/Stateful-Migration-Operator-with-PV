@@ -50,12 +50,14 @@ func validateOptions(mode, kubeconfig, cluster, node string) error {
 	return nil
 }
 func main() {
-	var mode, cluster, node, root, certDir, probe, ca string
+	var mode, cluster, node, root, sourceRoot, storeRoot, certDir, probe, ca string
 	var leader, insecure bool
 	flag.StringVar(&mode, "mode", "", "management, checkpoint, member or artifact")
 	flag.StringVar(&cluster, "cluster-name", "", "Karmada member name")
 	flag.StringVar(&node, "node-name", os.Getenv("NODE_NAME"), "local node name (artifact mode)")
-	flag.StringVar(&root, "archive-root", "/host-checkpoints", "read-only mounted archive root")
+	flag.StringVar(&root, "archive-root", "/host-checkpoints", "mounted kubelet checkpoint archive root")
+	flag.StringVar(&sourceRoot, "source-archive-root", "", "source archive root for upload; defaults to --archive-root")
+	flag.StringVar(&storeRoot, "artifact-store-root", "", "shared durable file store root mounted in every member cluster")
 	flag.StringVar(&certDir, "webhook-cert-dir", "/etc/webhook", "TLS certificate directory")
 	flag.StringVar(&probe, "health-probe-bind-address", ":8081", "health address")
 	flag.StringVar(&ca, "kubelet-ca-file", "", "CA file for kubelet serving certificates")
@@ -107,7 +109,14 @@ func main() {
 	case "artifact":
 		verifier := artifact.NewVerifier(mgr.GetClient(), mgr.GetAPIReader(), cluster, root)
 		verifier.NodeName = node
+		if sourceRoot != "" {
+			verifier.SourceRoot = sourceRoot
+		}
+		verifier.StoreRoot = storeRoot
 		err = verifier.SetupWithManager(mgr)
+		if err == nil && storeRoot != "" {
+			err = mgr.Add(&artifact.Exporter{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), NodeName: node, SourceRoot: verifier.SourceRoot, StoreRoot: storeRoot})
+		}
 	case "checkpoint":
 		kc, e := kubelet.NewClientWithOptions(kubelet.Options{CAFile: ca, InsecureSkipVerify: insecure})
 		if e != nil {

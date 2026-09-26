@@ -117,6 +117,9 @@ spec:
                     description: Name of the workload.
                     minLength: 1
                     type: string
+                  uid:
+                    description: Management workload UID carried in the member origin label.
+                    type: string
                   namespace:
                     description: |-
                       Namespace of the workload. Defaults to the FluidCRMigration's own
@@ -287,6 +290,14 @@ spec:
                         description: CheckpointFile records a CRIU checkpoint archive
                           produced for a container.
                         properties:
+                          sha256:
+                            type: string
+                            pattern: '^[a-f0-9]{64}$'
+                          durableRef:
+                            type: string
+                          exportedAt:
+                            type: string
+                            format: date-time
                           checkpointTime:
                             description: CheckpointTime is when the checkpoint archive
                               was created.

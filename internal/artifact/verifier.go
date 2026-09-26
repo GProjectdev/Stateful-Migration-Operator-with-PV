@@ -36,6 +36,17 @@ func RelativePath(target string) (string, error) {
 }
 
 func Verify(rootPath, target, digest string) error {
+	var err error
+	for i := 0; i < 8; i++ {
+		err = verifyOnce(rootPath, target, digest)
+		if err == nil || !strings.HasPrefix(err.Error(), "archive changed while ") {
+			return err
+		}
+	}
+	return err
+}
+
+func verifyOnce(rootPath, target, digest string) error {
 	rel, err := RelativePath(target)
 	if err != nil {
 		return err
@@ -111,6 +122,9 @@ func Fresh(p *api.RestorePlan, node string, now time.Time) bool {
 			continue
 		}
 		count++
+		if report.DurableRef == "" {
+			return false
+		}
 		age := now.Sub(report.CheckedAt.Time)
 		if !report.Verified || report.ObservedGeneration != p.Generation || report.CheckedAt.IsZero() || age < 0 || age > MaxAge {
 			return false
@@ -125,6 +139,8 @@ type Verifier struct {
 	NodeName    string
 	ClusterName string
 	Root        string
+	SourceRoot  string
+	StoreRoot   string
 	Interval    time.Duration
 }
 
@@ -132,7 +148,7 @@ func NewVerifier(c client.Client, reader client.Reader, clusterName, root string
 	if root == "" {
 		root = DefaultRoot
 	}
-	return &Verifier{Client: c, Reader: reader, NodeName: os.Getenv("NODE_NAME"), ClusterName: clusterName, Root: root, Interval: 30 * time.Second}
+	return &Verifier{Client: c, Reader: reader, NodeName: os.Getenv("NODE_NAME"), ClusterName: clusterName, Root: root, SourceRoot: root, Interval: 30 * time.Second}
 }
 func (v *Verifier) SetupWithManager(mgr manager.Manager) error { return mgr.Add(v) }
 func (v *Verifier) NeedLeaderElection() bool                   { return false }
@@ -168,22 +184,50 @@ func (v *Verifier) Poll(ctx context.Context) error {
 	var firstErr error
 	for i := range plans.Items {
 		p := &plans.Items[i]
-		if p.Spec.TargetCluster != v.ClusterName || !p.DeletionTimestamp.IsZero() {
+		if (p.Spec.SourceCluster != v.ClusterName && p.Spec.TargetCluster != v.ClusterName) || !p.DeletionTimestamp.IsZero() {
 			continue
 		}
 		found, verified, message := false, true, "SHA256 verified"
+		durableRefs := map[string]bool{}
 		checkedAt := metav1.Now()
 		for _, pod := range p.Spec.Pods {
-			if pod.TargetNode != v.NodeName {
-				continue
+			if p.Spec.SourceCluster == v.ClusterName && pod.SourceNode == v.NodeName {
+				found = true
+				if v.StoreRoot == "" {
+					verified, message = false, "artifact store root is not configured"
+				}
+				for _, archive := range pod.Archives {
+					if verified {
+						if err := Upload(v.StoreRoot, v.SourceRoot, p, archive); err != nil {
+							verified, message = false, err.Error()
+						} else if key, keyErr := ObjectKey(p, archive); keyErr == nil {
+							durableRefs["file-store:"+key] = true
+						}
+					}
+				}
+				if verified {
+					message = "checkpoint archive present in durable file store"
+				}
 			}
-			found = true
-			if len(pod.Archives) == 0 {
-				verified, message = false, "no target archives"
-			}
-			for _, archive := range pod.Archives {
-				if err := Verify(v.Root, archive.TargetPath, archive.SHA256); err != nil {
-					verified, message = false, err.Error()
+			if p.Spec.TargetCluster == v.ClusterName && pod.TargetNode == v.NodeName {
+				found = true
+				if v.StoreRoot == "" {
+					verified, message = false, "target artifact store root is not configured"
+				}
+				if len(pod.Archives) == 0 {
+					verified, message = false, "no target archives"
+				}
+				for _, archive := range pod.Archives {
+					if verified && v.StoreRoot != "" {
+						if err := Download(v.StoreRoot, v.Root, p, archive); err != nil {
+							verified, message = false, err.Error()
+						} else if key, keyErr := ObjectKey(p, archive); keyErr == nil {
+							durableRefs["file-store:"+key] = true
+						}
+					}
+					if err := Verify(v.Root, archive.TargetPath, archive.SHA256); err != nil {
+						verified, message = false, err.Error()
+					}
 				}
 			}
 		}
@@ -191,6 +235,13 @@ func (v *Verifier) Poll(ctx context.Context) error {
 			continue
 		}
 		report := api.ArtifactStatus{NodeName: v.NodeName, ObservedGeneration: p.Generation, Verified: verified, Message: message, CheckedAt: checkedAt}
+		if verified {
+			for ref := range durableRefs {
+				if report.DurableRef == "" || ref < report.DurableRef {
+					report.DurableRef = ref
+				}
+			}
+		}
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			var latest api.RestorePlan
 			if err := v.Reader.Get(ctx, client.ObjectKeyFromObject(p), &latest); err != nil {

@@ -80,7 +80,7 @@ func TestVerifyRejectsSymlinks(t *testing.T) {
 
 func TestFreshness(t *testing.T) {
 	now := time.Now()
-	base := api.ArtifactStatus{NodeName: "n", ObservedGeneration: 4, Verified: true, CheckedAt: metav1.NewTime(now.Add(-30 * time.Second))}
+	base := api.ArtifactStatus{NodeName: "n", ObservedGeneration: 4, Verified: true, DurableRef: "file-store:ns/sha256/" + strings.Repeat("a", 64), CheckedAt: metav1.NewTime(now.Add(-30 * time.Second))}
 	for _, tc := range []struct {
 		name    string
 		reports []api.ArtifactStatus
@@ -105,12 +105,13 @@ func TestFreshness(t *testing.T) {
 
 func TestPollOwnNodeOnlyPreservesStatus(t *testing.T) {
 	root, digest := archive(t)
+	store := t.TempDir()
 	scheme := runtime.NewScheme()
 	if err := api.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	other := api.ArtifactStatus{NodeName: "other", ObservedGeneration: 2, Verified: true, CheckedAt: metav1.Now()}
-	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns", UID: "p", Generation: 2}, Spec: api.RestorePlanSpec{TargetCluster: "target", Pods: []api.RestorePod{{TargetNode: "local", Archives: []api.Archive{{TargetPath: HostRoot + "/job.tar", SHA256: digest}}}, {TargetNode: "other", Archives: []api.Archive{{TargetPath: "/etc/shadow", SHA256: digest}}}}}, Status: api.RestoreStatus{Phase: "Prepared", Message: "member owns this", Artifacts: []api.ArtifactStatus{other}, Pods: []api.PodStatus{{Name: "job", Phase: "Pending"}}}}
+	other := api.ArtifactStatus{NodeName: "other", ObservedGeneration: 2, Verified: true, DurableRef: "file-store:ns/sha256/" + strings.Repeat("b", 64), CheckedAt: metav1.Now()}
+	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns", UID: "p", Generation: 2}, Spec: api.RestorePlanSpec{TargetCluster: "target", Pods: []api.RestorePod{{TargetNode: "local", Archives: []api.Archive{{SourcePath: HostRoot + "/job.tar", TargetPath: HostRoot + "/job.tar", SHA256: digest}}}, {TargetNode: "other", Archives: []api.Archive{{TargetPath: "/etc/shadow", SHA256: digest}}}}}, Status: api.RestoreStatus{Phase: "Prepared", Message: "member owns this", Artifacts: []api.ArtifactStatus{other}, Pods: []api.PodStatus{{Name: "job", Phase: "Pending"}}}}
 	foreign := plan.DeepCopy()
 	foreign.Name = "foreign"
 	foreign.UID = "foreign"
@@ -118,11 +119,15 @@ func TestPollOwnNodeOnlyPreservesStatus(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RestorePlan{}).WithObjects(plan, foreign).Build()
 	v := NewVerifier(c, c, "target", root)
 	v.NodeName = "local"
+	v.StoreRoot = store
 	var storedPlan api.RestorePlan
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &storedPlan); err != nil {
 		t.Fatal(err)
 	}
 	other = storedPlan.Status.Artifacts[0]
+	if err := Upload(store, root, plan, plan.Spec.Pods[0].Archives[0]); err != nil {
+		t.Fatal(err)
+	}
 	if err := v.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +144,11 @@ func TestPollOwnNodeOnlyPreservesStatus(t *testing.T) {
 	if len(got.Status.Artifacts) != 1 {
 		t.Fatal("foreign cluster modified")
 	}
-	if err := os.WriteFile(filepath.Join(root, "job.tar"), []byte("corrupted"), 0600); err != nil {
+	key, err := ObjectKey(plan, plan.Spec.Pods[0].Archives[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, filepath.FromSlash(key)), []byte("corrupted"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := v.Poll(context.Background()); err != nil {

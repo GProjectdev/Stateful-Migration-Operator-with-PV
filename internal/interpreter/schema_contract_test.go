@@ -95,6 +95,8 @@ func schemaCheckType(t *testing.T, path string, typ reflect.Type, schema apiexte
 		return
 	}
 	switch typ.Kind() {
+	case reflect.Pointer:
+		schemaCheckType(t, path, typ.Elem(), schema)
 	case reflect.Struct:
 		if schema.Type != "object" {
 			t.Fatalf("%s must be an object", path)

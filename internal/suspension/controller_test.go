@@ -32,21 +32,21 @@ func newFixture() *fixture {
 		return metav1.ObjectMeta{Name: name, Namespace: "demo", UID: types.UID(uid), Generation: 1}
 	}
 	f.request = &api.RestoreRequest{ObjectMeta: meta("restore", "request-uid"),
-		Spec:   api.RestoreRequestSpec{CheckpointRef: api.CheckpointReference{Name: "checkpoint", UID: "checkpoint-uid", Generation: 1}, WorkloadRef: api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}, SourceCluster: "onprem", TargetCluster: "aws", SourceFenced: true, VolumesReady: true},
+		Spec:   api.RestoreRequestSpec{CheckpointRef: api.CheckpointReference{Name: "checkpoint", UID: "checkpoint-uid", Generation: 1, CheckpointID: "round-001"}, WorkloadRef: api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "workload-uid"}, TrainingRuntimeRef: api.RuntimeReference{Name: "trainer-runtime"}, SourceCluster: "onprem", TargetCluster: "aws", SourceFenced: true, VolumesReady: true},
 		Status: api.RestoreStatus{ObservedGeneration: 1, Phase: "Prepared", PlanName: "plan"}}
 	pods := []interface{}{}
 	volumes := []interface{}{}
 	works := []interface{}{}
 	for _, name := range []string{"trainer-0", "trainer-1"} {
 		archive := api.Archive{ContainerName: "trainer", SourcePath: "/source/" + name + ".tar", TargetPath: "/var/lib/kubelet/checkpoints/" + name + ".tar", SHA256: strings.Repeat("a", 64)}
-		f.request.Spec.Pods = append(f.request.Spec.Pods, api.RestorePod{SourcePod: name, TargetPod: name, TargetNode: "node1", Archives: []api.Archive{archive}})
-		pods = append(pods, map[string]interface{}{"podName": name, "podUID": name + "-uid", "phase": "ContainerCheckpointed", "checkpointFiles": []interface{}{map[string]interface{}{"containerName": "trainer", "filePath": archive.SourcePath}}})
+		f.request.Spec.Pods = append(f.request.Spec.Pods, api.RestorePod{SourcePod: name, SourceNode: "source-" + name, TargetPod: name, TargetNode: "node1", Archives: []api.Archive{archive}})
+		pods = append(pods, map[string]interface{}{"podName": name, "podUID": name + "-uid", "nodeName": "source-" + name, "phase": "ContainerCheckpointed", "checkpointFiles": []interface{}{map[string]interface{}{"containerName": "trainer", "filePath": archive.SourcePath, "sha256": archive.SHA256, "durableRef": "file-store:demo/sha256/" + archive.SHA256}}})
 		volumes = append(volumes, map[string]interface{}{"sourcePVC": "data-" + name, "targetPVC": "data-" + name})
 		works = append(works, map[string]interface{}{"name": "pv-" + name, "namespace": "karmada-es-aws", "applied": true, "detached": true})
 	}
 	yes := true
 	s := f.request.Spec
-	f.plan = &api.RestorePlan{ObjectMeta: meta("plan", "plan-uid"), Spec: api.RestorePlanSpec{RequestUID: string(f.request.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: true, VolumesReady: true, Pods: s.Pods}, Status: api.RestoreStatus{Clusters: []api.ClusterStatus{{ClusterName: "aws", ObservedGeneration: 1, Phase: "Prepared"}}}}
+	f.plan = &api.RestorePlan{ObjectMeta: meta("plan", "plan-uid"), Spec: api.RestorePlanSpec{RequestUID: string(f.request.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: true, VolumesReady: true, Pods: s.Pods}, Status: api.RestoreStatus{Clusters: []api.ClusterStatus{{ClusterName: "aws", ObservedGeneration: 1, Phase: "Prepared"}}}}
 	f.plan.OwnerReferences = []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "RestoreRequest", Name: f.request.Name, UID: f.request.UID, Controller: &yes}}
 	replicas := int32(2)
 	f.sts = &appsv1.StatefulSet{ObjectMeta: meta("trainer", "workload-uid"), Spec: appsv1.StatefulSetSpec{Replicas: &replicas, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{api.PlanLabel: "plan"}}}, VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "data"}}}}}
@@ -61,7 +61,8 @@ func newFixture() *fixture {
 	f.cp.SetNamespace("demo")
 	f.cp.SetUID("checkpoint-uid")
 	f.cp.SetGeneration(1)
-	f.cp.Object["spec"] = map[string]interface{}{"resume": false, "workloadRef": map[string]interface{}{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "trainer"}}
+	f.cp.SetAnnotations(map[string]string{"training.dcnlab.com/checkpoint-id": "round-001"})
+	f.cp.Object["spec"] = map[string]interface{}{"resume": false, "workloadRef": map[string]interface{}{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "trainer", "namespace": "demo", "uid": "workload-uid"}}
 	f.cp.Object["status"] = map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": "onprem", "observedGeneration": int64(1), "phase": "Completed", "pods": pods}}}
 	f.pv = object(api.GroupVersion.String(), "PVMigration")
 	f.pv.SetName("pv")
@@ -132,7 +133,7 @@ func TestGates(t *testing.T) {
 			_ = unstructured.SetNestedMap(f.rb.Object, map[string]interface{}{"clusterNames": []interface{}{"aws"}}, "spec", "suspension", "dispatchingOnClusters")
 		}, false},
 		{"checkpoint-recreated", func(f *fixture) { f.cp.SetUID("other") }, false},
-		{"checkpoint-resumed", func(f *fixture) { _ = unstructured.SetNestedField(f.cp.Object, true, "spec", "resume") }, false},
+		{"checkpoint-resumed", func(f *fixture) { _ = unstructured.SetNestedField(f.cp.Object, true, "spec", "resume") }, true},
 		{"checkpoint-stale", func(f *fixture) { f.cp.SetGeneration(2) }, false},
 		{"pv-recreated", func(f *fixture) { f.pv.SetUID("new") }, false},
 		{"pv-stale", func(f *fixture) {

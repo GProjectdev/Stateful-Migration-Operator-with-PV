@@ -57,10 +57,11 @@ func TestAdmissionIsOptInAndFailClosed(t *testing.T) {
 func TestSuspensionPermissionsAreControlPlaneOnly(t *testing.T) {
 	role := load(t, "karmada/role.yaml")
 	want := map[string]string{
-		"work.karmada.io/resourcebindings":  "get,list,watch,patch",
-		"apps/statefulsets":                 "get",
-		"migration.dcnlab.com/pvmigrations": "get",
-		"migration.dcnlab.com/pvmetadata":   "get",
+		"work.karmada.io/resourcebindings":     "get,list,watch,patch",
+		"apps/statefulsets":                    "get",
+		"migration.dcnlab.com/pvmigrations":    "get",
+		"migration.dcnlab.com/pvmetadata":      "get",
+		"training.dcnlab.com/trainingruntimes": "get",
 	}
 	for _, entry := range role["rules"].([]interface{}) {
 		rule := entry.(map[string]interface{})
@@ -84,16 +85,28 @@ func TestSuspensionPermissionsAreControlPlaneOnly(t *testing.T) {
 		t.Fatalf("missing suspension permissions: %v", want)
 	}
 }
-func TestArtifactHostMountReadOnly(t *testing.T) {
+func TestArtifactDaemonMountsOnlyCheckpointAndStoreWritable(t *testing.T) {
 	d := load(t, "member/artifact-daemonset.yaml")
 	spec := d["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})
 	c := spec["containers"].([]interface{})[0].(map[string]interface{})
-	mounts := c["volumeMounts"].([]interface{})
-	if len(mounts) != 1 || mounts[0].(map[string]interface{})["readOnly"] != true {
-		t.Fatal("archive mount must be read only")
+	security := c["securityContext"].(map[string]interface{})
+	if security["readOnlyRootFilesystem"] != true || security["allowPrivilegeEscalation"] != false {
+		t.Fatal("artifact daemon must keep a read-only root filesystem and no privilege escalation")
 	}
-	volumes := spec["volumes"].([]interface{})
-	if len(volumes) != 1 || volumes[0].(map[string]interface{})["hostPath"].(map[string]interface{})["path"] != "/var/lib/kubelet/checkpoints" {
-		t.Fatal("host mount scope")
+	mounts := map[string]map[string]interface{}{}
+	for _, raw := range c["volumeMounts"].([]interface{}) {
+		m := raw.(map[string]interface{})
+		mounts[m["name"].(string)] = m
+	}
+	if len(mounts) != 2 || mounts["archives"]["mountPath"] != "/host-checkpoints" || mounts["archives"]["readOnly"] != false || mounts["artifact-store"]["mountPath"] != "/artifact-store" || mounts["artifact-store"]["readOnly"] != false {
+		t.Fatal("only checkpoint root and durable store should be writable")
+	}
+	volumes := map[string]map[string]interface{}{}
+	for _, raw := range spec["volumes"].([]interface{}) {
+		v := raw.(map[string]interface{})
+		volumes[v["name"].(string)] = v
+	}
+	if len(volumes) != 2 || volumes["archives"]["hostPath"].(map[string]interface{})["path"] != "/var/lib/kubelet/checkpoints" || volumes["artifact-store"]["persistentVolumeClaim"].(map[string]interface{})["claimName"] != "stateful-migration-artifacts" {
+		t.Fatal("artifact daemon mount scope")
 	}
 }

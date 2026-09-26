@@ -122,7 +122,7 @@ func (s *conflictStatus) Update(ctx context.Context, obj client.Object, opts ...
 		if err := s.owner.Client.Get(ctx, client.ObjectKeyFromObject(obj), &latest); err != nil {
 			return err
 		}
-		latest.Status.Artifacts = append(latest.Status.Artifacts, api.ArtifactStatus{NodeName: "independent-node", ObservedGeneration: 3, Verified: true, CheckedAt: metav1.Now()})
+		latest.Status.Artifacts = append(latest.Status.Artifacts, api.ArtifactStatus{NodeName: "independent-node", ObservedGeneration: 3, Verified: true, DurableRef: "file-store:jobs/sha256/" + strings.Repeat("a", 64), CheckedAt: metav1.Now()})
 		if err := s.owner.Client.Status().Update(ctx, &latest); err != nil {
 			return err
 		}

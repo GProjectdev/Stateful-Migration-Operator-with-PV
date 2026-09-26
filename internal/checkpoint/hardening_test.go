@@ -61,6 +61,47 @@ func TestStatefulSetRequiresCompleteOwnedSnapshot(t *testing.T) {
 	}
 }
 
+func TestManagedWorkloadUIDRequiresMemberOriginLabel(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		label   string
+		wantErr bool
+	}{
+		{name: "matching-label", label: "mgmt-sts-uid"},
+		{name: "missing-label", wantErr: true},
+		{name: "wrong-label", label: "other-mgmt-uid", wantErr: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			replicas := int32(1)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: "default", UID: "member-sts-uid", Generation: 1},
+				Spec:       appsv1.StatefulSetSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "trainer"}}},
+				Status:     appsv1.StatefulSetStatus{ObservedGeneration: 1, Replicas: 1, CurrentReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1, UpdatedReplicas: 1, CurrentRevision: "rev", UpdateRevision: "rev"},
+			}
+			if scenario.label != "" {
+				sts.Labels = map[string]string{LabelWorkloadUID: scenario.label}
+			}
+			pod := newTestPod("p0", "10.0.0.1", "192.168.0.1")
+			pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(sts, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+			m := newTestMigration()
+			m.Spec.WorkloadRef = fluidcr.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "mgmt-sts-uid"}
+
+			c := fake.NewClientBuilder().WithScheme(newTestScheme(t)).WithObjects(sts, pod).Build()
+			r := &FluidCRMigrationReconciler{Client: c}
+			pods, err := r.resolveTargetPods(context.Background(), m)
+			if scenario.wantErr {
+				if err == nil {
+					t.Fatalf("accepted managed workload UID mismatch, pods=%d", len(pods))
+				}
+				return
+			}
+			if err != nil || len(pods) != 1 {
+				t.Fatalf("managed workload UID match: err=%v pods=%d", err, len(pods))
+			}
+		})
+	}
+}
+
 func TestRestartRejectsChangedOrMissingPodUID(t *testing.T) {
 	for _, uid := range []string{"old-uid", ""} {
 		t.Run("uid="+uid, func(t *testing.T) {

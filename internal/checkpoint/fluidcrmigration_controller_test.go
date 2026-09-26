@@ -40,14 +40,16 @@ import (
 type fakeCtrl struct {
 	mu              sync.Mutex
 	checkpointCalls []string
+	checkpointIDs   []string
 	resumeCalls     []string
 	checkpointErr   map[string]error
 }
 
-func (f *fakeCtrl) Checkpoint(_ context.Context, podIP string, _ int, _ time.Duration) (map[string]string, error) {
+func (f *fakeCtrl) Checkpoint(_ context.Context, podIP string, _ int, _ time.Duration, checkpointID string) (map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checkpointCalls = append(f.checkpointCalls, podIP)
+	f.checkpointIDs = append(f.checkpointIDs, checkpointID)
 	if err := f.checkpointErr[podIP]; err != nil {
 		return nil, err
 	}
@@ -134,7 +136,7 @@ func newTestDeployment() *appsv1.Deployment {
 
 func newTestMigration() *fluidcrv1alpha1.FluidCRMigration {
 	return &fluidcrv1alpha1.FluidCRMigration{
-		ObjectMeta: metav1.ObjectMeta{Name: "mig", Namespace: "default", Generation: 1},
+		ObjectMeta: metav1.ObjectMeta{Name: "mig", Namespace: "default", Generation: 1, Annotations: map[string]string{AnnotationCheckpointID: "mig-round-001"}},
 		Spec: fluidcrv1alpha1.FluidCRMigrationSpec{
 			WorkloadRef: fluidcrv1alpha1.WorkloadReference{
 				APIVersion: "apps/v1", Kind: "Deployment", Name: "trainer",
@@ -200,6 +202,11 @@ func TestReconcile_HappyPath(t *testing.T) {
 	}
 	if cp, rs := fc.counts(); cp != 2 || rs != 2 {
 		t.Errorf("ctrl calls: checkpoint=%d resume=%d, want 2 and 2", cp, rs)
+	}
+	for _, id := range fc.checkpointIDs {
+		if id != "mig-round-001" {
+			t.Errorf("checkpointID = %q, want mig-round-001", id)
+		}
 	}
 	if n := fk.count(); n != 2 {
 		t.Errorf("kubelet checkpoint calls = %d, want 2", n)

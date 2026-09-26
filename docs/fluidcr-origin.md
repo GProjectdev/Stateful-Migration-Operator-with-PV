@@ -69,19 +69,61 @@ and CA mounts; `cmd/manager` owns mode selection and main wiring.
 
 Build the supplied overlay on the existing FluidCR payload image:
 
+Configure the FluidCR injector to use that overlay image as described in the
+repository README. The overlay copies this repository's `runtime/fluidcr/`
+package files into `/opt/fluidcr/fluidcr/` in the payload image. That includes
+the adapted control server, launcher, PyTorch backend step counter, and package
+entrypoint; the original local FluidCR source tree remains reference-only and is
+not modified. The Dockerfile removes inherited `__pycache__` directories at
+build time, so copied bytecode cannot mask the new source; payload-image
+environment variables are not relied on because the injector copies files, not
+image environment.
+
+Concrete install/build command:
+
 ```sh
-docker build -f Dockerfile.payload-overlay --build-arg FLUIDCR_PAYLOAD_IMAGE=<existing-payload-image> -t <overlay-image> .
+docker build -f Dockerfile.payload-overlay \
+  --build-arg FLUIDCR_PAYLOAD_IMAGE=<existing-fluidcr-payload-image> \
+  -t <registry>/<fluidcr-payload-overlay>:<tag> .
 ```
 
-Configure the FluidCR injector to use that overlay image as described in the
-repository README. It copies the adapted
-`/opt/fluidcr/fluidcr/ctrl.py` into the training workload. The Dockerfile removes
-inherited `/opt/fluidcr/fluidcr/__pycache__/ctrl.*.pyc` at build time, so copied
-bytecode cannot mask the new source; payload-image environment variables are
-not relied on because the injector copies files, not image environment.
+The management/system coordinator must set
+`training.dcnlab.com/checkpoint-id` on each `FluidCRMigration`. The member
+checkpoint controller treats that annotation as the stable round ID and forwards
+it unchanged as `checkpointID` in the in-pod `/checkpoint` request. Runtime code
+does not generate substitute per-rank IDs. A confirmed checkpoint with a
+`checkpointID` preserves the application checkpoint next to the rank checkpoint
+path at `rounds/<checkpointID>/<checkpoint-file-name>` after the launcher lock is
+observed. This prevents later `latest.pt` overwrites from being confused with the
+application state that matched a historical CRIU archive.
+The launcher keeps `FLUIDCR_CHECKPOINT_PATH` on the live `latest.pt` write path.
+When the control server preserves a confirmed round artifact, it also pins that
+artifact path and checkpoint ID in launcher-process memory before CRIU snapshots
+the launcher. A restored launcher exports the captured values as
+`FLUIDCR_RESTORE_CHECKPOINT_PATH` and `FLUIDCR_RESTORE_CHECKPOINT_ID` for the next
+worker. The PyTorch backend loads from that restore path when present, so
+restored historical CRIU archives resume from their matching model state even if
+`latest.pt` and the mutable status sidecar have since advanced to a later round.
+If the pinned artifact is missing, restore fails closed instead of falling back
+to `latest.pt`.
 
-The Go client sends `{"all":true,"wait":true,"timeoutSeconds":300}` on checkpoint
-(using the requested timeout when lower). The copied endpoint takes one local
+For manual checkpoint requests, generate a unique stable ID before applying the
+`FluidCRMigration` and place it in metadata, for example:
+
+```yaml
+metadata:
+  annotations:
+    training.dcnlab.com/checkpoint-id: trainer-checkpoint-20260926-001
+```
+
+The CRD cannot require a metadata annotation, so the member checkpoint
+controller fails early with a clear missing/invalid annotation error when the ID
+is absent or not in the runtime-safe character set.
+
+The Go client sends
+`{"all":true,"wait":true,"timeoutSeconds":300,"checkpointID":"..."}` on checkpoint
+(using the requested timeout when lower and omitting `checkpointID` only when no
+annotation was supplied by older callers). The copied endpoint takes one local
 worker-to-launcher registry snapshot, rejects empty/ambiguous GPU-worker sets
 and preexisting checkpoint locks before triggering, then invokes the existing
 rank checkpoint generation/manifest/signal protocol. It waits for each signalled
@@ -97,6 +139,35 @@ control process, stale locks, and bad timeouts fail before starting another
 checkpoint. Tests stub FluidCR configuration/distributed helpers and OS signals;
 no torch import is needed.
 
+The same control server exposes `GET /runtime` for the TrainingRuntime member
+collector. The JSON response is:
+
+```json
+{
+  "globalStep": 42,
+  "checkpointID": "mig-round-001",
+  "rank": 0,
+  "worldSize": 2,
+  "observedAt": "2026-09-26T00:00:00Z",
+  "state": "Running",
+  "iterationTimeSeconds": 0.123
+}
+```
+
+`globalStep` and `iterationTimeSeconds` are written by the patched PyTorch
+optimizer-step wrapper in the worker process. Launcher states such as `Running`,
+`CheckpointReady`, `Completed`, and `Failed` are written by the launcher process.
+The control server reads the shared status file next to `FLUIDCR_CHECKPOINT_PATH`.
+It prefers the worker's live `globalStep` over the saved checkpoint payload, uses
+the worker-written `observedAt` instead of the HTTP request time, and returns 503
+when rank/world environment or live worker-registry evidence is unavailable.
+Checkpoint wait latency is reported as `checkpointDurationSeconds` and is not
+mixed into `iterationTimeSeconds`. Optimizer-step telemetry is throttled per
+process to at most once per second by default, configurable with
+`FLUIDCR_RUNTIME_TELEMETRY_INTERVAL_SECONDS`; skipped telemetry does not refresh
+`observedAt`. Checkpoint/request state transitions and durable round metadata
+still bypass the throttle.
+
 ## Safety and limits
 
 StatefulSet discovery requires a nonzero desired replica count, current
@@ -106,6 +177,13 @@ pods owned by the StatefulSet UID. Label-only foreign pods are excluded.
 Deployment discovery verifies the ReplicaSet-to-Deployment UID chain, and Job
 discovery verifies its controlling owner UID. Full replica/rollout consistency
 gating is currently specific to StatefulSets.
+When `spec.workloadRef.uid` is present, the member checkpoint controller treats
+it as the management workload UID and requires the referenced member workload to
+carry `training.dcnlab.com/workload-uid` with the same value before discovering
+pods. This is the managed System path and prevents a recreated member workload
+with the same name/selector from receiving a stale checkpoint request. Manual
+legacy checkpoint CRs that omit `spec.workloadRef.uid` keep the older
+selector/owner checks for compatibility.
 
 Persisted pod work is tied to podUID. Missing legacy UIDs, replacements, and
 changed pod sets fail closed instead of mixing checkpoint generations.

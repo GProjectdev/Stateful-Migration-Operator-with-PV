@@ -35,6 +35,7 @@ spec:
             required:
             - checkpointRef
             - workloadRef
+            - trainingRuntimeRef
             - sourceCluster
             - targetCluster
             - sourceFenced
@@ -50,6 +51,7 @@ spec:
                 - name
                 - uid
                 - generation
+                - checkpointID
                 properties:
                   name:
                     type: string
@@ -63,12 +65,17 @@ spec:
                     type: integer
                     format: int64
                     minimum: 1
+                  checkpointID:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
               workloadRef:
                 type: object
                 required:
                 - apiVersion
                 - kind
                 - name
+                - uid
                 x-kubernetes-validations:
                 - rule: (self.apiVersion == 'apps/v1' && self.kind == 'StatefulSet') || (self.apiVersion == 'v1' && self.kind == 'Pod')
                   message: workloadRef must target apps/v1 StatefulSet or v1 Pod
@@ -89,6 +96,22 @@ spec:
                     type: string
                     minLength: 1
                     maxLength: 253
+                  uid:
+                    type: string
+                    minLength: 1
+                    maxLength: 128
+              trainingRuntimeRef:
+                type: object
+                required:
+                - name
+                properties:
+                  name:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
+                  uid:
+                    type: string
+                    maxLength: 128
               sourceCluster:
                 type: string
                 minLength: 1
@@ -112,11 +135,16 @@ spec:
                   type: object
                   required:
                   - sourcePod
+                  - sourceNode
                   - targetPod
                   - targetNode
                   - archives
                   properties:
                     sourcePod:
+                      type: string
+                      minLength: 1
+                      maxLength: 253
+                    sourceNode:
                       type: string
                       minLength: 1
                       maxLength: 253
@@ -205,6 +233,9 @@ spec:
                     message:
                       type: string
                       maxLength: 4096
+                    durableRef:
+                      type: string
+                      maxLength: 2048
                     checkedAt:
                       type: string
                       format: date-time
@@ -234,6 +265,47 @@ spec:
                     message:
                       type: string
                       maxLength: 4096
+              verification:
+                type: object
+                required:
+                - requestUID
+                - checkpointID
+                - verifiedAt
+                - trainingRuntimeRef
+                - sourceCluster
+                - targetCluster
+                properties:
+                  requestUID:
+                    type: string
+                    minLength: 1
+                    maxLength: 128
+                  checkpointID:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
+                  verifiedAt:
+                    type: string
+                    format: date-time
+                  trainingRuntimeRef:
+                    type: object
+                    required:
+                    - name
+                    properties:
+                      name:
+                        type: string
+                        minLength: 1
+                        maxLength: 253
+                      uid:
+                        type: string
+                        maxLength: 128
+                  sourceCluster:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
+                  targetCluster:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
               clusters:
                 type: array
                 maxItems: 64

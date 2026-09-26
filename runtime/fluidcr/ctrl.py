@@ -1,5 +1,6 @@
 # Derived from FluidCR (Apache-2.0); upstream module content retained below.
-# Local changes add opt-in HTTP checkpoint completion confirmation.
+# Local changes add controller telemetry, checkpointID propagation, and
+# immutable per-round restore binding for Stateful-Migration-System.
 """
 fluidcr.ctrl -- External control CLI and REST shim.
 
@@ -23,9 +24,13 @@ import glob
 import json
 import math
 import os
+import re
+import shutil
 import signal
+import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 
@@ -52,6 +57,16 @@ _api_server: Optional[ThreadingHTTPServer] = None
 _api_thread: Optional[threading.Thread] = None
 _api_lock = threading.Lock()
 _checkpoint_lock = threading.Lock()
+
+_RUNTIME_STATUS_NAME = ".fluidcr-runtime.json"
+_CHECKPOINT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_RUNTIME_TELEMETRY_INTERVAL_SECONDS = float(
+    os.environ.get("FLUIDCR_RUNTIME_TELEMETRY_INTERVAL_SECONDS", "1")
+)
+_runtime_telemetry_lock = threading.Lock()
+_last_runtime_status_write_at = 0.0
+_restore_binding_lock = threading.Lock()
+_restore_bindings: Dict[str, Dict[str, str]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +260,334 @@ def _lock_path_for_ppid(ppid: int) -> str:
     return os.path.join(_BASE_DIR, str(ppid), "lock")
 
 
+def _checkpoint_path_for_ppid(ppid: int) -> str:
+    explicit_path = os.environ.get("FLUIDCR_CHECKPOINT_PATH", "")
+    if explicit_path:
+        return explicit_path
+    return os.path.join(_BASE_DIR, str(ppid), "latest.pt")
+
+
+def _default_checkpoint_path() -> str:
+    explicit_path = os.environ.get("FLUIDCR_CHECKPOINT_PATH", "")
+    if explicit_path:
+        return explicit_path
+    return os.path.join(_BASE_DIR, str(os.getpid()), "latest.pt")
+
+
+def _runtime_status_path(checkpoint_path: Optional[str] = None) -> str:
+    path = checkpoint_path or _default_checkpoint_path()
+    return os.path.join(os.path.dirname(path), _RUNTIME_STATUS_NAME)
+
+
+def _restore_binding_key(checkpoint_path: str) -> str:
+    return os.path.abspath(checkpoint_path)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _env_int(name: str) -> Optional[int]:
+    try:
+        return int(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _validate_checkpoint_id(checkpoint_id: Optional[str]) -> Optional[str]:
+    if checkpoint_id is None:
+        return None
+    value = str(checkpoint_id).strip()
+    if not _CHECKPOINT_ID_RE.fullmatch(value):
+        raise ValueError(
+            "checkpointID must be 1-128 chars: letters, digits, '.', '_', ':', '-'"
+        )
+    return value
+
+
+def _round_artifact_path(checkpoint_path: str, checkpoint_id: str) -> str:
+    return os.path.join(
+        os.path.dirname(checkpoint_path),
+        "rounds",
+        checkpoint_id,
+        os.path.basename(checkpoint_path),
+    )
+
+
+def _atomic_json_write(path: str, payload: Dict) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent or None, prefix=".fluidcr-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_status(checkpoint_path: Optional[str] = None) -> Dict:
+    try:
+        with open(_runtime_status_path(checkpoint_path), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _write_status(checkpoint_path: str, updates: Dict) -> None:
+    data = _read_status(checkpoint_path)
+    data.update(updates)
+    data["observedAt"] = _utc_now()
+    _atomic_json_write(_runtime_status_path(checkpoint_path), data)
+
+
+def _runtime_status_write_deadline(
+    checkpoint_path: str, updates: Dict, force: bool
+) -> Optional[float]:
+    state = str(updates.get("state") or "")
+    durable = force or "checkpointDurationSeconds" in updates
+    durable = durable or (bool(state) and state != "Running")
+    if durable or not os.path.exists(_runtime_status_path(checkpoint_path)):
+        return time.monotonic()
+
+    interval = max(0.0, _RUNTIME_TELEMETRY_INTERVAL_SECONDS)
+    now = time.monotonic()
+    with _runtime_telemetry_lock:
+        if interval and _last_runtime_status_write_at:
+            if now - _last_runtime_status_write_at < interval:
+                return None
+        return now
+
+
+def _record_runtime_status_write(timestamp: float) -> None:
+    global _last_runtime_status_write_at
+    with _runtime_telemetry_lock:
+        _last_runtime_status_write_at = timestamp
+
+
+def bind_restore_checkpoint(
+    checkpoint_path: str, checkpoint_id: str, artifact_path: str
+) -> None:
+    """Pin a restored launcher to the round artifact captured before CRIU.
+
+    This is intentionally process memory, not only the JSON sidecar.  The HTTP
+    control server runs in the launcher process, so CRIU snapshots this binding
+    together with the launcher after a confirmed round.  Later rounds may
+    overwrite both ``latest.pt`` and the sidecar; the restored launcher must
+    still spawn workers against the artifact captured for its archive.
+    """
+    with _restore_binding_lock:
+        _restore_bindings[_restore_binding_key(checkpoint_path)] = {
+            "checkpointID": checkpoint_id,
+            "artifactPath": artifact_path,
+        }
+
+
+def restore_checkpoint_binding(checkpoint_path: Optional[str] = None) -> Optional[Dict[str, str]]:
+    explicit_restore = os.environ.get("FLUIDCR_RESTORE_CHECKPOINT_PATH", "").strip()
+    if explicit_restore:
+        if not os.path.isfile(explicit_restore):
+            raise FileNotFoundError(
+                f"pinned restore checkpoint is missing: {explicit_restore}"
+            )
+        return {
+            "checkpointID": os.environ.get("FLUIDCR_RESTORE_CHECKPOINT_ID", "").strip(),
+            "artifactPath": explicit_restore,
+        }
+
+    live_path = checkpoint_path or _default_checkpoint_path()
+    with _restore_binding_lock:
+        binding = _restore_bindings.get(_restore_binding_key(live_path))
+        binding = dict(binding) if binding else None
+    if binding:
+        artifact = binding.get("artifactPath", "")
+        if not os.path.isfile(artifact):
+            raise FileNotFoundError(f"pinned restore checkpoint is missing: {artifact}")
+        return binding
+    return None
+
+
+def restore_checkpoint_path(checkpoint_path: Optional[str] = None) -> str:
+    """Return the immutable checkpoint artifact a restored worker should load.
+
+    ``FLUIDCR_CHECKPOINT_PATH`` remains the live write target, usually
+    ``latest.pt``.  Confirmed checkpoint rounds record the request-owned
+    ``checkpointID`` and copied round artifact before CRIU snapshots the
+    launcher.  Restored workers load that immutable artifact so later
+    ``latest.pt`` overwrites cannot change the historical model state paired
+    with the CRIU archive.
+    """
+    live_path = checkpoint_path or _default_checkpoint_path()
+    binding = restore_checkpoint_binding(live_path)
+    if binding:
+        return binding["artifactPath"]
+    status = _read_status(live_path)
+    artifact = str(status.get("artifactPath") or "").strip()
+    if artifact and os.path.isfile(artifact):
+        return artifact
+    checkpoint_id = str(status.get("checkpointID") or "").strip()
+    if checkpoint_id:
+        candidate = _round_artifact_path(live_path, checkpoint_id)
+        if os.path.isfile(candidate):
+            return candidate
+    return live_path
+
+
+def record_runtime_status(
+    *,
+    global_step: Optional[int] = None,
+    state: Optional[str] = None,
+    iteration_time_seconds: Optional[float] = None,
+    force: bool = False,
+) -> None:
+    """Persist runtime telemetry for the in-pod ``GET /runtime`` collector.
+
+    The launcher and worker are separate processes.  They communicate runtime
+    observations through this small sidecar JSON next to ``FLUIDCR_CHECKPOINT_PATH``.
+    Existing fields, especially the request-owned checkpointID, are preserved.
+    """
+    updates: Dict = {}
+    if global_step is not None:
+        updates["globalStep"] = int(global_step)
+    if state is not None:
+        updates["state"] = state
+    if iteration_time_seconds is not None:
+        updates["iterationTimeSeconds"] = float(iteration_time_seconds)
+    if updates:
+        checkpoint_path = _default_checkpoint_path()
+        binding = restore_checkpoint_binding(checkpoint_path)
+        if binding:
+            if binding.get("checkpointID"):
+                updates["checkpointID"] = binding["checkpointID"]
+            updates["artifactPath"] = binding["artifactPath"]
+        deadline = _runtime_status_write_deadline(checkpoint_path, updates, force)
+        if deadline is None:
+            return
+        _write_status(checkpoint_path, updates)
+        _record_runtime_status_write(deadline)
+
+
+def _read_checkpoint_global_step(checkpoint_path: str) -> Optional[int]:
+    if not os.path.isfile(checkpoint_path):
+        return None
+    try:
+        import torch  # type: ignore
+
+        try:
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(checkpoint_path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    step_counts = payload.get("step_counts")
+    if isinstance(step_counts, list) and step_counts:
+        try:
+            return int(step_counts[0])
+        except (TypeError, ValueError):
+            return None
+    for key in ("global_step", "globalStep"):
+        if key in payload:
+            try:
+                return int(payload[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _preserve_round_artifacts(parent_pids: List[int], checkpoint_id: str) -> Dict[int, str]:
+    results: Dict[int, str] = {}
+    for ppid in parent_pids:
+        src = _checkpoint_path_for_ppid(ppid)
+        dst = _round_artifact_path(src, checkpoint_id)
+        if os.path.exists(dst):
+            results[ppid] = "artifact-exists"
+            continue
+        if not os.path.isfile(src):
+            results[ppid] = "checkpoint-missing"
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(dst),
+            prefix="." + os.path.basename(dst) + "-",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+                shutil.copyfileobj(inp, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, dst)
+            bind_restore_checkpoint(src, checkpoint_id, dst)
+            _write_status(
+                src,
+                {
+                    "checkpointID": checkpoint_id,
+                    "artifactPath": dst,
+                    "state": "CheckpointReady",
+                    "globalStep": _read_checkpoint_global_step(src) or 0,
+                },
+            )
+            results[ppid] = "artifact-preserved"
+        except Exception as exc:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            results[ppid] = f"artifact-error: {exc}"
+    return results
+
+
+def runtime_status() -> Dict:
+    checkpoint_path = _default_checkpoint_path()
+    status = _read_status(checkpoint_path)
+    rank = _env_int("RANK")
+    world_size = _env_int("WORLD_SIZE")
+    if rank is None or world_size is None:
+        raise ValueError("runtime unavailable: RANK and WORLD_SIZE must be set")
+    observed_at = status.get("observedAt")
+    if not observed_at:
+        raise ValueError("runtime unavailable: no worker status observation")
+    lock_path = os.path.join(os.path.dirname(checkpoint_path), "lock")
+    workers = registered_worker_pids()
+    if os.path.exists(lock_path):
+        state = "CheckpointReady"
+    else:
+        if not workers:
+            raise ValueError("runtime unavailable: no live worker registry")
+        state = status.get("state") or "Running"
+    try:
+        global_step = int(status.get("globalStep", 0))
+    except (TypeError, ValueError):
+        global_step = 0
+    if "globalStep" not in status:
+        checkpoint_step = _read_checkpoint_global_step(checkpoint_path)
+        if checkpoint_step is not None:
+            global_step = checkpoint_step
+    payload = {
+        "globalStep": global_step,
+        "checkpointID": status.get("checkpointID", ""),
+        "rank": rank,
+        "worldSize": world_size,
+        "observedAt": observed_at,
+        "state": state,
+    }
+    if "iterationTimeSeconds" in status:
+        payload["iterationTimeSeconds"] = status["iterationTimeSeconds"]
+    if "checkpointDurationSeconds" in status:
+        payload["checkpointDurationSeconds"] = status["checkpointDurationSeconds"]
+    return payload
+
+
 def checkpoint_pids(
     pids: List[int],
     worker_to_launcher: Optional[Dict[int, int]] = None,
@@ -318,7 +661,9 @@ def _parse_rank_spec(spec: str):
     return ranks
 
 
-def checkpoint_ranks(targets, *, _workers=None) -> Dict[int, str]:
+def checkpoint_ranks(
+    targets, *, _workers=None, checkpoint_id: Optional[str] = None
+) -> Dict[int, str]:
     """Declare a coordinated action: write the manifest, then trigger it.
 
     ``targets`` is the ``"all"`` sentinel or a list of rank ints. Advances the shared
@@ -333,9 +678,16 @@ def checkpoint_ranks(targets, *, _workers=None) -> Dict[int, str]:
     """
     from fluidcr.distributed import bump_generation, write_manifest
 
+    checkpoint_id = _validate_checkpoint_id(checkpoint_id)
     bump_generation()
     write_manifest(targets)
     workers = registered_worker_pids() if _workers is None else _workers
+    if checkpoint_id:
+        for launcher_pid in workers:
+            _write_status(
+                _checkpoint_path_for_ppid(launcher_pid),
+                {"checkpointID": checkpoint_id, "state": "CheckpointRequested"},
+            )
     results: Dict[int, str] = {}
     for _launcher_pid, worker_pid in workers.items():
         if not _pid_uses_gpu(worker_pid):
@@ -351,7 +703,9 @@ def checkpoint_ranks(targets, *, _workers=None) -> Dict[int, str]:
     return results
 
 
-def checkpoint_ranks_and_wait(targets, timeout: float) -> Dict[int, str]:
+def checkpoint_ranks_and_wait(
+    targets, timeout: float, checkpoint_id: Optional[str] = None
+) -> Dict[int, str]:
     """Confirm local whole-workload checkpoints through new launcher locks."""
     if targets != "all":
         raise ValueError("wait requires ranks=all")
@@ -360,6 +714,7 @@ def checkpoint_ranks_and_wait(targets, timeout: float) -> Dict[int, str]:
     if not _checkpoint_lock.acquire(blocking=False):
         raise ValueError("checkpoint already in progress")
     try:
+        checkpoint_id = _validate_checkpoint_id(checkpoint_id)
         registry = registered_worker_pids()
         workers = {
             launcher: worker for launcher, worker in registry.items()
@@ -374,21 +729,58 @@ def checkpoint_ranks_and_wait(targets, timeout: float) -> Dict[int, str]:
             raise ValueError("multiple launchers share one checkpoint lock path")
         if any(os.path.lexists(path) for path in paths):
             raise ValueError("stale checkpoint lock exists; resume before checkpoint")
+        if checkpoint_id:
+            for parent in workers:
+                artifact = _round_artifact_path(
+                    _checkpoint_path_for_ppid(parent), checkpoint_id
+                )
+                if os.path.exists(artifact):
+                    raise ValueError(f"checkpointID already exists: {checkpoint_id}")
 
         # Keep the generation/manifest protocol and one registry snapshot
         # for both signalling and parent-lock confirmation.
-        results = checkpoint_ranks(targets, _workers=workers)
+        started = time.monotonic()
+        results = checkpoint_ranks(
+            targets, _workers=workers, checkpoint_id=checkpoint_id
+        )
         parents = [
             parent for parent, worker in workers.items()
             if results.get(worker) == "checkpoint-signalled"
         ]
         statuses = _wait_for_parent_locks(parents, timeout=timeout)
+        preserved: Dict[int, str] = {}
+        ready_parents = [
+            parent for parent in parents
+            if statuses.get(parent) == "lock-ready"
+        ]
+        if checkpoint_id and ready_parents:
+            preserved = _preserve_round_artifacts(ready_parents, checkpoint_id)
         for parent, worker in workers.items():
             if results.get(worker) == "checkpoint-signalled":
                 status = statuses.get(parent, "timeout-waiting-lock")
-                results[worker] = (
-                    "checkpoint-ready" if status == "lock-ready" else status
-                )
+                if status == "lock-ready" and checkpoint_id:
+                    artifact_status = preserved.get(parent)
+                    results[worker] = (
+                        "checkpoint-ready"
+                        if artifact_status == "artifact-preserved"
+                        else artifact_status or "artifact-missing"
+                    )
+                else:
+                    results[worker] = (
+                        "checkpoint-ready" if status == "lock-ready" else status
+                    )
+                if status == "lock-ready":
+                    checkpoint_path = _checkpoint_path_for_ppid(parent)
+                    existing = _read_status(checkpoint_path).get("checkpointID", "")
+                    _write_status(
+                        checkpoint_path,
+                        {
+                            "checkpointID": checkpoint_id or existing,
+                            "state": "CheckpointReady",
+                            "checkpointDurationSeconds": round(time.monotonic() - started, 6),
+                            "globalStep": _read_checkpoint_global_step(checkpoint_path) or 0,
+                        },
+                    )
         return results
     finally:
         _checkpoint_lock.release()
@@ -524,6 +916,15 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not-found"})
 
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/runtime":
+            try:
+                self._send_json(200, runtime_status())
+            except ValueError as exc:
+                self._send_json(503, {"error": str(exc)})
+        else:
+            self._send_json(404, {"error": "not-found"})
+
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         # Route access logs through FluidCR logger at DEBUG level.
         msg = format % args
@@ -534,6 +935,7 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
         pids = payload.get("pids") or []
         ranks = payload.get("ranks")  # "all" | [ints] | None
         wait = payload.get("wait", False)
+        checkpoint_id = payload.get("checkpointID")
         if not isinstance(wait, bool):
             self._send_json(400, {"error": "wait must be a boolean"})
             return
@@ -545,7 +947,9 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
                 timeout = payload.get("timeoutSeconds", _CHECKPOINT_WAIT_TIMEOUT)
                 if isinstance(timeout, bool):
                     raise ValueError("timeoutSeconds must be numeric")
-                results = checkpoint_ranks_and_wait("all", float(timeout))
+                results = checkpoint_ranks_and_wait(
+                    "all", float(timeout), checkpoint_id=checkpoint_id
+                )
             except (ValueError, TypeError) as exc:
                 self._send_json(400, {"error": str(exc)})
                 return
@@ -562,6 +966,9 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
             return
 
         if pids:
+            if checkpoint_id:
+                self._send_json(400, {"error": "checkpointID supports rank checkpoints only"})
+                return
             try:
                 pid_ints = [int(p) for p in pids]
             except Exception:
@@ -573,7 +980,11 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "empty 'ranks' list"})
                 return
             targets = "all" if ranks in (None, "all") else [int(r) for r in ranks]
-            results = checkpoint_ranks(targets)
+            try:
+                results = checkpoint_ranks(targets, checkpoint_id=checkpoint_id)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
 
         self._send_json(200, {"results": results})
 

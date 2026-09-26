@@ -14,7 +14,7 @@ The following checks passed on 2026-09-25:
 
 Tests cover CRD structural schemas and CEL, actual RIC Lua execution and output schemas, stale/duplicate cluster reports, checkpoint identity and completion handling, restore mapping and ownership, admission rejection, artifact digests, and restricted deployment configuration.
 
-The module and CI target Go 1.24; that exact toolchain was not executed locally. Linux-specific artifact tests were compiled, not executed. Windows symlink tests can skip when the host lacks symlink privileges. These results are not a live Kubernetes integration test.
+The module and CI target Go 1.25; that exact toolchain was not executed locally. Linux-specific artifact tests were compiled, not executed. Windows symlink tests can skip when the host lacks symlink privileges. These results are not a live Kubernetes integration test.
 
 ## Extension Checks
 
@@ -52,3 +52,7 @@ The inspected local CRI-O source does not contain a handler for `checkpoint-rest
 9. Exercise controller restarts, delayed status, unavailable nodes, expired credentials, Pod recreation, and the operator-controlled cleanup policy before production use.
 
 Do not remove the source or recovery artifacts until application-level recovery has been proven. This implementation does not automate source fencing, volume migration, archive transfer, workload placement, or traffic cutover.
+
+## Managed restore identity contract
+
+New managed RestoreRequests must set spec.workloadRef.uid to the MGMT workload UID and spec.trainingRuntimeRef.name explicitly. The referenced FluidCRMigration must carry the same spec.workloadRef.uid and the training.dcnlab.com/checkpoint-id annotation. Restore verification also requires exported checkpointFiles sha256 and durableRef fields from the shared file-store exporter before source loss.

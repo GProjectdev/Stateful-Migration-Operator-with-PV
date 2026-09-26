@@ -54,6 +54,7 @@ type allRequest struct {
 	All            bool    `json:"all"`
 	Wait           bool    `json:"wait,omitempty"`
 	TimeoutSeconds float64 `json:"timeoutSeconds,omitempty"`
+	CheckpointID   string  `json:"checkpointID,omitempty"`
 }
 
 // response models the control-API JSON response.
@@ -65,17 +66,17 @@ type response struct {
 // Checkpoint triggers an application checkpoint of all GPU-using workers in the
 // pod and blocks (server-side) until the checkpoint locks are ready or the
 // in-pod timeout elapses. It returns the per-worker result map.
-func (c *Client) Checkpoint(ctx context.Context, podIP string, port int, timeout time.Duration) (map[string]string, error) {
-	return c.post(ctx, podIP, port, "/checkpoint", timeout)
+func (c *Client) Checkpoint(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string) (map[string]string, error) {
+	return c.post(ctx, podIP, port, "/checkpoint", timeout, checkpointID)
 }
 
 // Resume releases all pending checkpoint locks in the pod so the workers
 // continue. It is idempotent: pods without a pending lock report no-op.
 func (c *Client) Resume(ctx context.Context, podIP string, port int, timeout time.Duration) (map[string]string, error) {
-	return c.post(ctx, podIP, port, "/resume", timeout)
+	return c.post(ctx, podIP, port, "/resume", timeout, "")
 }
 
-func (c *Client) post(ctx context.Context, podIP string, port int, path string, timeout time.Duration) (map[string]string, error) {
+func (c *Client) post(ctx context.Context, podIP string, port int, path string, timeout time.Duration, checkpointID string) (map[string]string, error) {
 	if net.ParseIP(podIP) == nil {
 		return nil, fmt.Errorf("pod IP is empty")
 	}
@@ -94,6 +95,7 @@ func (c *Client) post(ctx context.Context, podIP string, port int, path string, 
 	if path == "/checkpoint" {
 		payloadData.Wait = true
 		payloadData.TimeoutSeconds = timeout.Seconds()
+		payloadData.CheckpointID = checkpointID
 	}
 	payload, err := json.Marshal(payloadData)
 	if err != nil {

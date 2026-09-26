@@ -12,18 +12,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixture() (*api.RestoreRequest, *unstructured.Unstructured) {
 	req := &api.RestoreRequest{ObjectMeta: metav1.ObjectMeta{Name: "restore", Namespace: "default", UID: "request-uid", Generation: 1}, Spec: api.RestoreRequestSpec{
-		CheckpointRef: api.CheckpointReference{Name: "checkpoint", UID: "checkpoint-uid", Generation: 2}, WorkloadRef: api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db"}, SourceCluster: "source", TargetCluster: "target", SourceFenced: true, VolumesReady: true,
-		Pods: []api.RestorePod{{SourcePod: "db-0", TargetPod: "db-0", TargetNode: "node-a", Archives: []api.Archive{{ContainerName: "db", SourcePath: "/checkpoints/db.tar", TargetPath: "/var/lib/kubelet/checkpoints/db.tar", SHA256: strings.Repeat("a", 64)}}}}}}
-	cp := &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{"resume": false, "workloadRef": map[string]interface{}{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "db", "namespace": "default"}}, "status": map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": "source", "observedGeneration": int64(2), "phase": "Completed", "pods": []interface{}{map[string]interface{}{"podName": "db-0", "phase": "ContainerCheckpointed", "checkpointFiles": []interface{}{map[string]interface{}{"containerName": "db", "filePath": "/checkpoints/db.tar"}}}}}}}}}
+		CheckpointRef: api.CheckpointReference{Name: "checkpoint", UID: "checkpoint-uid", Generation: 2, CheckpointID: "round-001"}, WorkloadRef: api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db", UID: "workload-uid"}, TrainingRuntimeRef: api.RuntimeReference{Name: "db-runtime"}, SourceCluster: "source", TargetCluster: "target", SourceFenced: true, VolumesReady: true,
+		Pods: []api.RestorePod{{SourcePod: "db-0", SourceNode: "source-node", TargetPod: "db-0", TargetNode: "node-a", Archives: []api.Archive{{ContainerName: "db", SourcePath: "/checkpoints/db.tar", TargetPath: "/var/lib/kubelet/checkpoints/db.tar", SHA256: strings.Repeat("a", 64)}}}}}}
+	cp := &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{"resume": false, "workloadRef": map[string]interface{}{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "db", "namespace": "default", "uid": "workload-uid"}}, "status": map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": "source", "observedGeneration": int64(2), "phase": "Completed", "pods": []interface{}{map[string]interface{}{"podName": "db-0", "nodeName": "source-node", "phase": "ContainerCheckpointed", "checkpointFiles": []interface{}{map[string]interface{}{"containerName": "db", "filePath": "/checkpoints/db.tar", "sha256": strings.Repeat("a", 64), "durableRef": "file-store:default/sha256/" + strings.Repeat("a", 64)}}}}}}}}}
 	cp.SetGroupVersionKind(checkpointGVK)
 	cp.SetName("checkpoint")
 	cp.SetNamespace("default")
 	cp.SetUID("checkpoint-uid")
 	cp.SetGeneration(2)
+	cp.SetAnnotations(map[string]string{"training.dcnlab.com/checkpoint-id": "round-001"})
 	return req, cp
 }
 
@@ -118,7 +120,7 @@ func TestCheckpointGates(t *testing.T) {
 		}},
 		{"wrong uid", "Failed", func(r *api.RestoreRequest, c *unstructured.Unstructured) { c.SetUID("other") }},
 		{"wrong generation", "Failed", func(r *api.RestoreRequest, c *unstructured.Unstructured) { c.SetGeneration(3) }},
-		{"resume true", "Failed", func(r *api.RestoreRequest, c *unstructured.Unstructured) {
+		{"resume true", "Preparing", func(r *api.RestoreRequest, c *unstructured.Unstructured) {
 			c.Object["spec"].(map[string]interface{})["resume"] = true
 		}},
 		{"resume absent", "Failed", func(r *api.RestoreRequest, c *unstructured.Unstructured) {
@@ -271,8 +273,8 @@ func TestConflictsNeverAdoptOrMutate(t *testing.T) {
 
 func TestStablePod(t *testing.T) {
 	req, cp := fixture()
-	req.Spec.WorkloadRef = api.WorkloadReference{APIVersion: "v1", Kind: "Pod", Name: "db-0"}
-	cp.Object["spec"].(map[string]interface{})["workloadRef"] = map[string]interface{}{"apiVersion": "v1", "kind": "Pod", "name": "db-0", "namespace": "default"}
+	req.Spec.WorkloadRef = api.WorkloadReference{APIVersion: "v1", Kind: "Pod", Name: "db-0", UID: "workload-uid"}
+	cp.Object["spec"].(map[string]interface{})["workloadRef"] = map[string]interface{}{"apiVersion": "v1", "kind": "Pod", "name": "db-0", "namespace": "default", "uid": "workload-uid"}
 	got := reconcile(t, testClient(t, req, cp), req)
 	if got.Status.Phase != "Preparing" {
 		t.Fatal(got.Status)
@@ -287,5 +289,42 @@ func TestAwaitingArtifactsReflection(t *testing.T) {
 	got := reconcile(t, testClient(t, req, cp, plan), req)
 	if got.Status.Phase != "AwaitingArtifacts" || got.Status.Message != "awaiting node reports" {
 		t.Fatal(got.Status)
+	}
+}
+
+func trainingRuntime(req *api.RestoreRequest, podUID string, observed metav1.Time) *unstructured.Unstructured {
+	tr := &unstructured.Unstructured{Object: map[string]interface{}{"status": map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": req.Spec.TargetCluster, "observedGeneration": int64(1), "status": map[string]interface{}{
+		"phase": "Running", "globalStep": int64(11), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "readyRanks": int64(1), "worldSize": int64(1), "workloadUID": req.Spec.WorkloadRef.UID, "memberWorkloadUID": "member-workload", "observedAt": observed.Time.Format(time.RFC3339),
+		"pods": []interface{}{map[string]interface{}{"name": "db-0", "uid": podUID, "rank": int64(0), "globalStep": int64(11), "previousGlobalStep": int64(10), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "previousObservedAt": observed.Time.Add(-time.Second).Format(time.RFC3339), "observedAt": observed.Time.Format(time.RFC3339)}},
+	}}}}}}
+	tr.SetGroupVersionKind(trainingRuntimeGVK)
+	tr.SetName(req.Spec.TrainingRuntimeRef.Name)
+	tr.SetNamespace(req.Namespace)
+	tr.SetUID("training-runtime-uid")
+	tr.SetGeneration(1)
+	return tr
+}
+
+func TestRuntimeTelemetryGatesVerifiedStatus(t *testing.T) {
+	req, cp := fixture()
+	plan := desiredPlan(req)
+	plan.Generation = 1
+	plan.Status.Clusters = []api.ClusterStatus{{ClusterName: "target", ObservedGeneration: 1, Phase: "Running", Message: "pods ready", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}}}
+	got := reconcile(t, testClient(t, req, cp, plan), req)
+	if got.Status.Phase != "Running" {
+		t.Fatalf("without runtime evidence: %+v", got.Status)
+	}
+	got = reconcile(t, testClient(t, req, cp, plan, trainingRuntime(req, "target-pod-uid", metav1.Now())), req)
+	if got.Status.Phase != "Verified" {
+		t.Fatalf("with runtime evidence: %+v", got.Status)
+	}
+	stale := metav1.NewTime(time.Now().Add(-time.Minute))
+	got = reconcile(t, testClient(t, req, cp, plan, trainingRuntime(req, "target-pod-uid", stale)), req)
+	if got.Status.Phase != "Running" {
+		t.Fatalf("stale runtime evidence accepted: %+v", got.Status)
+	}
+	got = reconcile(t, testClient(t, req, cp, plan, trainingRuntime(req, "wrong-pod-uid", metav1.Now())), req)
+	if got.Status.Phase != "Running" {
+		t.Fatalf("wrong pod runtime evidence accepted: %+v", got.Status)
 	}
 }

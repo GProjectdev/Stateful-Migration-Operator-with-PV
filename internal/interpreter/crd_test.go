@@ -295,13 +295,14 @@ func restoreObject(file string) map[string]any {
 		name = "restore-plan"
 		spec["requestUID"] = "request-uid"
 	}
-	spec["checkpointRef"] = map[string]any{"name": "checkpoint-a", "uid": "checkpoint-uid", "generation": int64(1)}
-	spec["workloadRef"] = map[string]any{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "database"}
+	spec["checkpointRef"] = map[string]any{"name": "checkpoint-a", "uid": "checkpoint-uid", "generation": int64(1), "checkpointID": "round-a"}
+	spec["workloadRef"] = map[string]any{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "database", "uid": "workload-uid"}
+	spec["trainingRuntimeRef"] = map[string]any{"name": "database-runtime"}
 	spec["sourceCluster"] = "source"
 	spec["targetCluster"] = "target"
 	spec["sourceFenced"] = true
 	spec["volumesReady"] = true
-	spec["pods"] = []any{map[string]any{"sourcePod": "database-0", "targetPod": "database-0-restore", "targetNode": "node-a", "archives": []any{map[string]any{"containerName": "app", "sourcePath": "/var/lib/checkpoints/checkpoint.tar", "targetPath": "/var/lib/kubelet/checkpoints/checkpoint.tar", "sha256": strings.Repeat("a", 64)}}}}
+	spec["pods"] = []any{map[string]any{"sourcePod": "database-0", "sourceNode": "source-node", "targetPod": "database-0-restore", "targetNode": "node-a", "archives": []any{map[string]any{"containerName": "app", "sourcePath": "/var/lib/checkpoints/checkpoint.tar", "targetPath": "/var/lib/kubelet/checkpoints/checkpoint.tar", "sha256": strings.Repeat("a", 64)}}}}
 	return map[string]any{"apiVersion": "migration.dcnlab.com/v1alpha1", "kind": kind, "metadata": map[string]any{"name": name, "namespace": "default"}, "spec": spec, "status": restoreStatus()}
 }
 

@@ -1,22 +1,20 @@
-# StatefulSet Suspension 게이트
+# StatefulSet Suspension 寃뚯씠??
+??MGMT controller??Karmada API留??ъ슜?섎ŉ Member??吏곸젒 ?묒냽?섏? ?딆뒿?덈떎.
+?먮룞 ?댁젣??StatefulSet + PVMigration 議고빀???쒖젙?⑸땲?? 湲곗〈 ?⑤룆 Pod 蹂듭썝? ?섎룞 ?덉감瑜??ъ슜?⑸땲??
 
-새 MGMT controller는 Karmada API만 사용하며 Member에 직접 접속하지 않습니다.
-자동 해제는 StatefulSet + PVMigration 조합에 한정됩니다. 기존 단독 Pod 복원은 수동 절차를 사용합니다.
+## ?쒖꽌? ?깅줉
 
-## 순서와 등록
-
-1. source의 PVMetadata snapshot을 확보합니다.
-2. workload placement 변경과 checkpoint 전에 RB의 dispatch를 중지합니다.
-3. checkpoint 완료, 원본 실행 차단, PV 준비와 archive 전송을 끝냅니다.
-4. RestoreRequest가 Prepared가 되면 Karmada StatefulSet template에 restore-plan label을 설정합니다.
-5. 아래 operation annotation을 붙이고 workload PP를 target 한 곳으로 변경합니다.
-6. gate가 검증 후 dispatching 필드를 제거합니다. 초기 suspension 설정과 source fencing은 운영자 책임입니다.
+1. source??PVMetadata snapshot???뺣낫?⑸땲??
+2. workload placement 蹂寃쎄낵 checkpoint ?꾩뿉 RB??dispatch瑜?以묒??⑸땲??
+3. checkpoint ?꾨즺, ?먮낯 ?ㅽ뻾 李⑤떒, PV 以鍮꾩? archive ?꾩넚???앸깄?덈떎.
+4. RestoreRequest媛 Prepared媛 ?섎㈃ Karmada StatefulSet template??restore-plan label???ㅼ젙?⑸땲??
+5. ?꾨옒 operation annotation??遺숈씠怨?workload PP瑜?target ??怨녹쑝濡?蹂寃쏀빀?덈떎.
+6. gate媛 寃利???dispatching ?꾨뱶瑜??쒓굅?⑸땲?? 珥덇린 suspension ?ㅼ젙怨?source fencing? ?댁쁺??梨낆엫?낅땲??
 
 ```bash
 kubectl --context karmada -n "$NS" patch resourcebinding "$RB_NAME" --type=merge \
   -p '{"spec":{"suspension":{"dispatching":true}}}'
-# 같은 namespace의 현재 작업만 지정
-RR_UID=$(kubectl --context karmada -n "$NS" get restorerequest "$RESTORE" -o jsonpath='{.metadata.uid}')
+# 媛숈? namespace???꾩옱 ?묒뾽留?吏??RR_UID=$(kubectl --context karmada -n "$NS" get restorerequest "$RESTORE" -o jsonpath='{.metadata.uid}')
 PV_UID=$(kubectl --context karmada -n "$NS" get pvmigration "$PV_MIGRATION" -o jsonpath='{.metadata.uid}')
 kubectl --context karmada -n "$NS" annotate resourcebinding "$RB_NAME" --overwrite \
   migration.dcnlab.com/restore-request="$RESTORE" \
@@ -25,42 +23,42 @@ kubectl --context karmada -n "$NS" annotate resourcebinding "$RB_NAME" --overwri
   migration.dcnlab.com/pv-migration-uid="$PV_UID"
 ```
 
-RB 이름은 StatefulSet 이름과 다를 수 있으므로 spec.resource로 조회합니다.
-기존 annotation 기반 suspension controller는 반드시 중지합니다.
-새 gate와 수동 해제를 병행하면 검사를 우회하게 됩니다.
+RB ?대쫫? StatefulSet ?대쫫怨??ㅻ? ???덉쑝誘濡?spec.resource濡?議고쉶?⑸땲??
+湲곗〈 annotation 湲곕컲 suspension controller??諛섎뱶??以묒??⑸땲??
+??gate? ?섎룞 ?댁젣瑜?蹂묓뻾?섎㈃ 寃?щ? ?고쉶?섍쾶 ?⑸땲??
 
-## 해제 조건
+## ?댁젣 議곌굔
 
-- RestoreRequest UID와 현재 observedGeneration, sourceFenced/volumesReady, Prepared 또는 Running.
-- 소유 RestorePlan의 spec과 현재 target report 일치. Prepared 이전에 Running을 기다리지 않습니다.
-- 현재 checkpoint UID/generation, source Completed 및 모든 Pod archive mapping.
-- RB의 StatefulSet 이름·namespace·UID와 현재 Karmada template plan label 일치.
-- 현재 replica/ordinal 전체와 restore Pod 매핑 일치. target 하나만 선택한 RB.
+- RestoreRequest UID? ?꾩옱 observedGeneration, sourceFenced/volumesReady, Prepared ?먮뒗 Running.
+- ?뚯쑀 RestorePlan??spec怨??꾩옱 target report ?쇱튂. Prepared ?댁쟾??Running??湲곕떎由ъ? ?딆뒿?덈떎.
+- ?꾩옱 checkpoint UID/generation, source Completed 諛?紐⑤뱺 Pod archive mapping.
+- RB??StatefulSet ?대쫫쨌namespace쨌UID? ?꾩옱 Karmada template plan label ?쇱튂.
+- ?꾩옱 replica/ordinal ?꾩껜? restore Pod 留ㅽ븨 ?쇱튂. target ?섎굹留??좏깮??RB.
 - PVMigration UID/generation, source/target/RB, Completed, planHash.
-- PVMetadata의 source와 Karmada StatefulSet UID 일치. Member-local workloadUID와 혼동하지 않습니다.
-- 모든 volumeClaimTemplate/복원 ordinal PVC를 같은 이름으로 매핑하고, 같은 수의 고유 Work가 applied/detached.
-- 실패·누락·legacy none 값은 허용하지 않습니다. stale 완료 annotation만으로 해제하지 않습니다.
+- PVMetadata??source? Karmada StatefulSet UID ?쇱튂. Member-local workloadUID? ?쇰룞?섏? ?딆뒿?덈떎.
+- 紐⑤뱺 volumeClaimTemplate/蹂듭썝 ordinal PVC瑜?媛숈? ?대쫫?쇰줈 留ㅽ븨?섍퀬, 媛숈? ?섏쓽 怨좎쑀 Work媛 applied/detached.
+- ?ㅽ뙣쨌?꾨씫쨌legacy none 媛믪? ?덉슜?섏? ?딆뒿?덈떎. stale ?꾨즺 annotation留뚯쑝濡??댁젣?섏? ?딆뒿?덈떎.
 
-충돌하면 uncached API에서 전체 조건을 다시 검사합니다.
-dispatching은 false가 아닌 **필드 제거**로 해제하며 scheduling 등 다른 필드는 보존합니다.
-중첩 legacy/per-cluster suspension은 자동 처리하지 않습니다.
-PropagationPolicy 자체에 dispatch suspension을 설정한 환경은 먼저 관리 주체를 정리하세요.
-이 controller는 정책의 suspension을 수정하지 않으며, 다른 controller가 중단값을 재설정하는 상황을 해결하지 않습니다.
+異⑸룎?섎㈃ uncached API?먯꽌 ?꾩껜 議곌굔???ㅼ떆 寃?ы빀?덈떎.
+dispatching? false媛 ?꾨땶 **?꾨뱶 ?쒓굅**濡??댁젣?섎ŉ scheduling ???ㅻⅨ ?꾨뱶??蹂댁〈?⑸땲??
+以묒꺽 legacy/per-cluster suspension? ?먮룞 泥섎━?섏? ?딆뒿?덈떎.
+PropagationPolicy ?먯껜??dispatch suspension???ㅼ젙???섍꼍? 癒쇱? 愿由?二쇱껜瑜??뺣━?섏꽭??
+??controller???뺤콉??suspension???섏젙?섏? ?딆쑝硫? ?ㅻⅨ controller媛 以묐떒媛믪쓣 ?ъ꽕?뺥븯???곹솴???닿껐?섏? ?딆뒿?덈떎.
 
-## 한계와 확인
+## ?쒓퀎? ?뺤씤
 
-Kubernetes의 여러 객체 조회는 하나의 원자적 트랜잭션이 아닙니다.
-한 작업 동안 workload spec과 관련 CR을 별도 자동화가 수정하지 않도록 하고 status 쓰기 권한을 제한합니다.
-PVMigration Completed는 확정된 과거 PV 준비 기록이지 현재 NFS 가용성 보장이 아닙니다.
-Prepared도 GPU 복원 성공 증거가 아닙니다. 데이터 전송, source fencing, 애플리케이션 재개·정리는 별도입니다.
-한 번 해제한 RB를 controller가 자동으로 다시 중단시키지는 않습니다.
-해제 시 dispatch-released-for annotation에 RestoreRequest UID를 기록합니다.
-같은 UID로 다시 중단된 RB는 재해제하지 않습니다. 다음 이전은 새 CR과 새 UID로 등록하세요.
+Kubernetes???щ윭 媛앹껜 議고쉶???섎굹???먯옄???몃옖??뀡???꾨떃?덈떎.
+???묒뾽 ?숈븞 workload spec怨?愿??CR??蹂꾨룄 ?먮룞?붽? ?섏젙?섏? ?딅룄濡??섍퀬 status ?곌린 沅뚰븳???쒗븳?⑸땲??
+PVMigration Completed???뺤젙??怨쇨굅 PV 以鍮?湲곕줉?댁? ?꾩옱 NFS 媛?⑹꽦 蹂댁옣???꾨떃?덈떎.
+Prepared??GPU 蹂듭썝 ?깃났 利앷굅媛 ?꾨떃?덈떎. ?곗씠???꾩넚, source fencing, ?좏뵆由ъ??댁뀡 ?ш컻쨌?뺣━??蹂꾨룄?낅땲??
+??踰??댁젣??RB瑜?controller媛 ?먮룞?쇰줈 ?ㅼ떆 以묐떒?쒗궎吏???딆뒿?덈떎.
+?댁젣 ??dispatch-released-for annotation??RestoreRequest UID瑜?湲곕줉?⑸땲??
+媛숈? UID濡??ㅼ떆 以묐떒??RB???ы빐?쒗븯吏 ?딆뒿?덈떎. ?ㅼ쓬 ?댁쟾? ??CR怨???UID濡??깅줉?섏꽭??
 
 ```bash
 kubectl --context karmada -n "$NS" get resourcebinding "$RB_NAME" -o yaml
 kubectl --context host -n stateful-migration-system logs deployment/stateful-management --tail=100
 ```
 
-[Karmada ResourceBinding API](https://karmada.io/docs/reference/karmada-api/work-resources/resource-binding-v1alpha2/)와
-[2 Pod 통합 가이드](two-replica-migration-guide.md)를 참고하세요.
+[Karmada ResourceBinding API](https://karmada.io/docs/reference/karmada-api/work-resources/resource-binding-v1alpha2/)?
+[2 Pod ?듯빀 媛?대뱶](two-replica-migration-guide.md)瑜?李멸퀬?섏꽭??

@@ -21,6 +21,11 @@
       "verbs": ["get"]
     },
     {
+      "apiGroups": ["training.dcnlab.com"],
+      "resources": ["trainingruntimes"],
+      "verbs": ["get"]
+    },
+    {
       "apiGroups": [
         "migration.dcnlab.com"
       ],

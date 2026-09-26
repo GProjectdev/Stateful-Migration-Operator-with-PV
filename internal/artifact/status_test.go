@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"strings"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func (s *concurrentStatus) Update(ctx context.Context, obj client.Object, opts .
 		}
 		latest.Status.Phase = "Running"
 		latest.Status.Pods = []api.PodStatus{{Name: "job", Phase: "Running"}}
-		latest.Status.Artifacts = append(latest.Status.Artifacts, api.ArtifactStatus{NodeName: "other", ObservedGeneration: 2, Verified: true, CheckedAt: metav1.Now()})
+		latest.Status.Artifacts = append(latest.Status.Artifacts, api.ArtifactStatus{NodeName: "other", ObservedGeneration: 2, Verified: true, DurableRef: "file-store:ns/sha256/" + strings.Repeat("c", 64), CheckedAt: metav1.Now()})
 		if err := s.owner.Client.Status().Update(ctx, &latest); err != nil {
 			return err
 		}
@@ -45,15 +46,20 @@ func (s *concurrentStatus) Update(ctx context.Context, obj client.Object, opts .
 
 func TestArtifactConflictRetryPreservesMemberAndOtherNode(t *testing.T) {
 	root, digest := archive(t)
+	store := t.TempDir()
 	scheme := runtime.NewScheme()
 	if err := api.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns", UID: "p", Generation: 2}, Spec: api.RestorePlanSpec{TargetCluster: "target", Pods: []api.RestorePod{{TargetNode: "local", Archives: []api.Archive{{TargetPath: HostRoot + "/job.tar", SHA256: digest}}}}}}
+	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns", UID: "p", Generation: 2}, Spec: api.RestorePlanSpec{TargetCluster: "target", Pods: []api.RestorePod{{TargetNode: "local", Archives: []api.Archive{{SourcePath: HostRoot + "/job.tar", TargetPath: HostRoot + "/job.tar", SHA256: digest}}}}}}
 	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RestorePlan{}).WithObjects(plan).Build()
 	c := &concurrentClient{Client: base}
 	v := NewVerifier(c, base, "target", root)
 	v.NodeName = "local"
+	v.StoreRoot = store
+	if err := Upload(store, root, plan, plan.Spec.Pods[0].Archives[0]); err != nil {
+		t.Fatal(err)
+	}
 	if err := v.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +89,7 @@ func TestDropsVerificationWhenGenerationChanges(t *testing.T) {
 	if err := api.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns", UID: "p", Generation: 2}, Spec: api.RestorePlanSpec{TargetCluster: "target", Pods: []api.RestorePod{{TargetNode: "local", Archives: []api.Archive{{TargetPath: HostRoot + "/job.tar", SHA256: digest}}}}}}
+	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns", UID: "p", Generation: 2}, Spec: api.RestorePlanSpec{TargetCluster: "target", Pods: []api.RestorePod{{TargetNode: "local", Archives: []api.Archive{{SourcePath: HostRoot + "/job.tar", TargetPath: HostRoot + "/job.tar", SHA256: digest}}}}}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RestorePlan{}).WithObjects(plan).Build()
 	v := NewVerifier(c, changedGenerationReader{Reader: c}, "target", root)
 	v.NodeName = "local"

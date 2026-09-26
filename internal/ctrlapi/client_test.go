@@ -65,7 +65,7 @@ func TestCheckpointAndResume(t *testing.T) {
 	c := NewClient()
 	ctx := context.Background()
 
-	results, err := c.Checkpoint(ctx, host, port, 2*time.Second)
+	results, err := c.Checkpoint(ctx, host, port, 2*time.Second, "mig-round-001")
 	if err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestCheckpointAndResume(t *testing.T) {
 	if len(gotPaths) != 2 || gotPaths[0] != "/checkpoint" || gotPaths[1] != "/resume" {
 		t.Fatalf("paths = %v, want [/checkpoint /resume]", gotPaths)
 	}
-	if gotBodies[0]["wait"] != true || gotBodies[0]["timeoutSeconds"] != float64(2) {
+	if gotBodies[0]["wait"] != true || gotBodies[0]["timeoutSeconds"] != float64(2) || gotBodies[0]["checkpointID"] != "mig-round-001" {
 		t.Fatalf("checkpoint must request bounded lock confirmation: %v", gotBodies[0])
 	}
 	if _, exists := gotBodies[1]["wait"]; exists {
@@ -100,7 +100,7 @@ func TestCheckpointServerError(t *testing.T) {
 	defer srv.Close()
 
 	host, port := listenerHostPort(t, srv.URL)
-	if _, err := NewClient().Checkpoint(context.Background(), host, port, time.Second); err == nil {
+	if _, err := NewClient().Checkpoint(context.Background(), host, port, time.Second, "mig-round-001"); err == nil {
 		t.Fatal("expected error on 500 response")
 	}
 }

@@ -40,7 +40,7 @@ Deployment/Job 복원, 다른 ordinal로 이동, cron 백업, OCI checkpoint ima
 
 ## 필수 환경
 
-- Go 1.24 이상, Docker 또는 호환 빌더, kubectl/Kustomize.
+- Go 1.25 이상, Docker 또는 호환 빌더, kubectl/Kustomize.
 - Karmada의 ResourceInterpreterCustomization 및 Lua status reflection/aggregation 지원.
 - 각 Member에 FluidCR payload/injection webhook, GPU runtime/CRIU, kubelet Checkpoint API 준비.
 - Target Member에 cert-manager. 다른 CA를 쓰려면 제공 Certificate/Issuer 대신 TLS Secret과 caBundle을 구성합니다.
@@ -275,7 +275,7 @@ mount, 이미지, runtimeClass, GPU claim, DDP rank 구성을 source와 일치�
 PV-Migration-System과 함께 사용하는 StatefulSet은 [Suspension 게이트](docs/suspension.md)의
 RestoreRequest/PVMigration 이름·UID annotation을 RB에 설정합니다.
 그 다음 workload PropagationPolicy를 target 한 곳으로 변경합니다. 현재 UID·generation,
-PV 완료, Restore 준비, workload template와 target-only RB 배치가 모두 맞으면
+PV 완료, Restore 준비, workload template와 source+target RestorePlan RB 배치가 모두 맞으면
 새 Suspension Controller가 dispatch 중단 필드를 제거합니다.
 Checkpoint의 source 고정 PP는 변경하지 않습니다.
 

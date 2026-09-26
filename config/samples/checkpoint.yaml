@@ -17,11 +17,14 @@ kind: FluidCRMigration
 metadata:
   name: trainer-checkpoint-001
   namespace: fluidcr-demo
+  annotations:
+    training.dcnlab.com/checkpoint-id: trainer-checkpoint-001
 spec:
   workloadRef:
     apiVersion: apps/v1
     kind: StatefulSet
     name: trainer
+    uid: ${WORKLOAD_UID}
   container: trainer
   resume: false
   appCheckpointTimeoutSeconds: 300

@@ -60,6 +60,9 @@ const (
 
 // WorkloadReference identifies the workload whose pods will be checkpointed.
 type WorkloadReference struct {
+	// UID is the management workload identity, checked against the member origin label.
+	UID string `json:"uid,omitempty"`
+
 	// APIVersion of the workload, e.g. "apps/v1", "batch/v1" or "v1" (Pod).
 	// +kubebuilder:validation:MinLength=1
 	// +required
@@ -127,6 +130,11 @@ type FluidCRMigrationSpec struct {
 
 // CheckpointFile records a CRIU checkpoint archive produced for a container.
 type CheckpointFile struct {
+	// SHA256 and DurableRef are published only after the member exporter persists the archive.
+	SHA256     string `json:"sha256,omitempty"`
+	DurableRef string `json:"durableRef,omitempty"`
+	ExportedAt string `json:"exportedAt,omitempty"`
+
 	// ContainerName is the container that was checkpointed.
 	// +required
 	ContainerName string `json:"containerName"`

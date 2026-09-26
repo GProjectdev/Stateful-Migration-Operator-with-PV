@@ -12,7 +12,7 @@ their own in-cluster service accounts. Management never invokes kubelet or Fluid
 Karmada FluidCRMigration --source-only PP--> member FluidCR checkpoint controller
                         <--RIC----------- .status.pods[].checkpointFiles[]
 Karmada RestoreRequest --> management Restore Controller
-                       --> RestorePlan --target-only PP--> member artifact verifier
+                       --> RestorePlan --source+target PP--> member artifact exporter/verifier
                                                         --> restore admission
                        <--RIC------------- .status Prepared / Running
 ```
@@ -32,7 +32,7 @@ Karmada RestoreRequest --> management Restore Controller
 
 ## Preparation versus execution
 
-Prepared means target archives are verified and the plan is armed. It must be observable
+Prepared means target archives were downloaded from the durable file-store, verified, and the plan is armed. It must be observable
 BEFORE releasing suspended workload dispatch. Waiting for Running before release deadlocks.
 Running means mapped Pods are Running and Ready with the expected restore configuration.
 It is NOT proof of CRIU success, correct training rank state, restored iteration, or data integrity.

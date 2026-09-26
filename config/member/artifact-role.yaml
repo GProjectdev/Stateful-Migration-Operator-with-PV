@@ -6,6 +6,16 @@
   },
   "rules": [
     {
+      "apiGroups": ["fluidcr.dcnlab.com"],
+      "resources": ["fluidcrmigrations"],
+      "verbs": ["get", "list", "watch"]
+    },
+    {
+      "apiGroups": ["fluidcr.dcnlab.com"],
+      "resources": ["fluidcrmigrations/status"],
+      "verbs": ["get", "patch"]
+    },
+    {
       "apiGroups": [
         "migration.dcnlab.com"
       ],

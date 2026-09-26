@@ -8,10 +8,15 @@ spec:
     name: trainer-checkpoint-001
     uid: REPLACE_WITH_KARMADA_CHECKPOINT_UID
     generation: 1
+    checkpointID: ${CHECKPOINT_ID}
   workloadRef:
     apiVersion: apps/v1
     kind: StatefulSet
     name: trainer
+    uid: REPLACE_WITH_MANAGEMENT_WORKLOAD_UID
+  trainingRuntimeRef:
+    name: ${TRAINING_RUNTIME_NAME}
+    uid: ${TRAINING_RUNTIME_UID}
   sourceCluster: onprem
   targetCluster: aws
   # Operator attestations: change to true ONLY after each prerequisite is satisfied.
@@ -19,6 +24,7 @@ spec:
   volumesReady: false
   pods:
     - sourcePod: trainer-0
+    sourceNode: REPLACE_WITH_SOURCE_NODE
       targetPod: trainer-0
       targetNode: REPLACE_WITH_TARGET_NODE
       archives:

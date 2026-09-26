@@ -46,15 +46,17 @@ const (
 	// paused workload before the resource disappears.
 	FinalizerName = "fluidcrmigration.fluidcr.dcnlab.com/finalizer"
 
-	conditionReady       = "Ready"
-	defaultTimeoutSecs   = 300
-	waitRequeueInterval  = 15 * time.Second
-	statusUpdateAttempts = 5
+	conditionReady         = "Ready"
+	defaultTimeoutSecs     = 300
+	waitRequeueInterval    = 15 * time.Second
+	statusUpdateAttempts   = 5
+	AnnotationCheckpointID = "training.dcnlab.com/checkpoint-id"
+	LabelWorkloadUID       = "training.dcnlab.com/workload-uid"
 )
 
 // CtrlAPI is the subset of the in-pod FluidCR control API the controller uses.
 type CtrlAPI interface {
-	Checkpoint(ctx context.Context, podIP string, port int, timeout time.Duration) (map[string]string, error)
+	Checkpoint(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string) (map[string]string, error)
 	Resume(ctx context.Context, podIP string, port int, timeout time.Duration) (map[string]string, error)
 }
 
@@ -189,12 +191,16 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 		return ps.Phase == fluidcrv1alpha1.PodPhasePending
 	})
 	if len(appTargets) > 0 {
+		checkpointID, err := checkpointIDFor(m)
+		if err != nil {
+			return r.markFailed(ctx, m, err.Error())
+		}
 		m.Status.Phase = fluidcrv1alpha1.PhaseAppCheckpointing
 		m.Status.Message = fmt.Sprintf("signalling application checkpoint on %d pod(s)", len(appTargets))
 		if err := r.saveStatus(ctx, m); err != nil {
 			return ctrl.Result{}, err
 		}
-		outcomes := r.appCheckpoint(ctx, appTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds))
+		outcomes := r.appCheckpoint(ctx, appTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID)
 		for _, t := range appTargets {
 			ps := getPodStatus(m, t.podName)
 			oc := outcomes[t.podName]
@@ -354,7 +360,7 @@ func (r *FluidCRMigrationReconciler) reconcileDelete(ctx context.Context, m *flu
 }
 
 // appCheckpoint signals the in-pod control API on every target concurrently.
-func (r *FluidCRMigrationReconciler) appCheckpoint(ctx context.Context, targets []target, timeout time.Duration) map[string]appOutcome {
+func (r *FluidCRMigrationReconciler) appCheckpoint(ctx context.Context, targets []target, timeout time.Duration, checkpointID string) map[string]appOutcome {
 	out := make(map[string]appOutcome, len(targets))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -366,7 +372,7 @@ func (r *FluidCRMigrationReconciler) appCheckpoint(ctx context.Context, targets 
 			var results map[string]string
 			err := r.validateTarget(ctx, t)
 			if err == nil {
-				results, err = r.CtrlClient.Checkpoint(ctx, t.podIP, t.port, timeout)
+				results, err = r.CtrlClient.Checkpoint(ctx, t.podIP, t.port, timeout, checkpointID)
 			}
 			mu.Lock()
 			out[t.podName] = appOutcome{summary: ctrlapi.SummarizeResults(results), err: err}
@@ -453,6 +459,9 @@ func (r *FluidCRMigrationReconciler) resolveTargetPods(ctx context.Context, m *f
 		if err := r.Get(ctx, key, &pod); err != nil {
 			return nil, err
 		}
+		if err := validateManagedWorkloadUID(&pod, m); err != nil {
+			return nil, err
+		}
 		if !isEligiblePod(&pod) {
 			return nil, nil
 		}
@@ -535,10 +544,16 @@ func (r *FluidCRMigrationReconciler) workloadSelector(ctx context.Context, m *fl
 		if err := r.Get(ctx, key, &d); err != nil {
 			return nil, err
 		}
+		if err := validateManagedWorkloadUID(&d, m); err != nil {
+			return nil, err
+		}
 		return d.Spec.Selector, nil
 	case "StatefulSet":
 		var s appsv1.StatefulSet
 		if err := r.Get(ctx, key, &s); err != nil {
+			return nil, err
+		}
+		if err := validateManagedWorkloadUID(&s, m); err != nil {
 			return nil, err
 		}
 		return s.Spec.Selector, nil
@@ -547,10 +562,25 @@ func (r *FluidCRMigrationReconciler) workloadSelector(ctx context.Context, m *fl
 		if err := r.Get(ctx, key, &j); err != nil {
 			return nil, err
 		}
+		if err := validateManagedWorkloadUID(&j, m); err != nil {
+			return nil, err
+		}
 		return j.Spec.Selector, nil
 	default:
 		return nil, fmt.Errorf("unsupported workload kind %q", ref.Kind)
 	}
+}
+
+func validateManagedWorkloadUID(obj client.Object, m *fluidcrv1alpha1.FluidCRMigration) error {
+	want := strings.TrimSpace(m.Spec.WorkloadRef.UID)
+	if want == "" {
+		return nil
+	}
+	got := strings.TrimSpace(obj.GetLabels()[LabelWorkloadUID])
+	if got != want {
+		return fmt.Errorf("workload %s/%s %s mismatch: label %s=%q, want %q", obj.GetNamespace(), obj.GetName(), LabelWorkloadUID, LabelWorkloadUID, got, want)
+	}
+	return nil
 }
 
 // markWaiting records a non-terminal Pending state and requeues.
@@ -717,6 +747,27 @@ func isTerminalPhase(p fluidcrv1alpha1.MigrationPhase) bool {
 
 func shouldResume(m *fluidcrv1alpha1.FluidCRMigration) bool {
 	return m.Spec.Resume == nil || *m.Spec.Resume
+}
+
+func checkpointIDFor(m *fluidcrv1alpha1.FluidCRMigration) (string, error) {
+	checkpointID := strings.TrimSpace(m.Annotations[AnnotationCheckpointID])
+	if checkpointID == "" {
+		return "", fmt.Errorf("missing required %s annotation", AnnotationCheckpointID)
+	}
+	if len(checkpointID) > 128 || !validCheckpointID(checkpointID) {
+		return "", fmt.Errorf("invalid %s annotation", AnnotationCheckpointID)
+	}
+	return checkpointID, nil
+}
+
+func validCheckpointID(value string) bool {
+	for i, r := range value {
+		ok := r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == ':' || r == '-'
+		if !ok || (i == 0 && !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return value != ""
 }
 
 func timeoutOf(secs int32) time.Duration {

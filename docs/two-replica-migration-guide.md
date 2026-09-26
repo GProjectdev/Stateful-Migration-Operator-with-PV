@@ -12,6 +12,7 @@ git clone --single-branch --branch main https://github.com/GProjectdev/Karmada_w
 git clone --single-branch --branch main https://github.com/GProjectdev/Stateful-Migration-Operator-with-PV.git Stateful-Migration-System
 export PV_ROOT="$PWD/PV-Migration-System"
 export ST_ROOT="$PWD/Stateful-Migration-System"
+export SYSTEM_ROOT="$PWD/System-Migration-System"  # canonical TrainingRuntime CRD source
 export PV_IMAGE='YOUR_REGISTRY/pv-migration-system:YOUR_TAG'
 export ST_IMAGE='YOUR_REGISTRY/stateful-migration-system:YOUR_TAG'
 export PAYLOAD_BASE='YOUR_EXISTING_FLUIDCR_PAYLOAD_IMAGE'
@@ -59,6 +60,14 @@ done
 
 ## 2. 두 시스템 설치
 
+Install the canonical System `training.dcnlab.com/v1alpha1` TrainingRuntime CRD before the Stateful CRDs. Stateful only consumes this API with unstructured reads; do not install a divergent duplicate from Stateful manifests, or Kubernetes may prune the status fields used for restore verification.
+
+```bash
+kubectl --context karmada apply -f "$SYSTEM_ROOT/config/crd/bases/training.dcnlab.com_trainingruntimes.yaml"
+for ctx in onprem aws; do
+  kubectl --context "$ctx" apply -f "$SYSTEM_ROOT/config/crd/bases/training.dcnlab.com_trainingruntimes.yaml"
+done
+```
 ```bash
 for ctx in karmada onprem aws; do
   kubectl --context "$ctx" apply -k "$PV_ROOT/config/crd"
@@ -155,7 +164,7 @@ for i in $(seq 1 120); do
     jq -e --arg src "$SOURCE_CLUSTER" '.metadata.generation as $g |
       [.status.clusters[]?|select(.clusterName==$src and .observedGeneration==$g and .phase=="Completed")|
        select((.pods|length)==2 and ([.pods[].podName]|sort)==["trainer-0","trainer-1"])|
-       select(all(.pods[]; (.podUID|length)>0 and (.checkpointFiles|length)==1))]|length==1' >/dev/null; then break; fi
+       select(all(.pods[]; (.podUID|length)>0 and (.checkpointFiles|length)==1 and all(.checkpointFiles[]; (.sha256|test("^[0-9a-f]{64}$")) and (.durableRef|startswith("file-store:")) and (.exportedAt|length)>0))) ]|length==1' >/dev/null; then break; fi
   test "$i" -lt 120 || { echo 'Checkpoint timeout; do not continue'; exit 1; }
   sleep 5
 done
@@ -196,19 +205,31 @@ done
 
 Completed는 두 PV Work 적용/detach의 이력 증거이지 현재 PV health, 데이터 복사 또는 복원 성공이 아닙니다. 운영자가 target PV 두 개와 NFS 접근을 확인합니다. 이 단계가 끝나기 전에 workload target placement를 선택하지 않습니다.
 
-## 6. Archive 전송과 RestoreRequest
+## 6. Durable archive export and RestoreRequest
 
-checkpoint.json의 source cluster에서 각 Pod의 nodeName과 checkpointFiles.filePath를 확인합니다. 승인된 SSH/파일전송 도구로 source node archive를 지정 target node의 `/var/lib/kubelet/checkpoints/` 아래에 복사합니다. RIC는 상태와 경로만 전달하며 파일을 전송하지 않습니다. Source/target SHA256이 같아야 합니다. 임시 파일로 전송하고 검증한 뒤 최종 경로로 옮깁니다. Archive에는 프로세스 메모리 비밀정보가 포함될 수 있으므로 암호화 전송과 제한된 접근 권한을 사용하세요.
+Do not copy CRIU archives with SSH as part of restore. The source member artifact exporter must publish every completed checkpoint file into the shared durable file-store before source loss. The RestoreRequest only carries the original source path, the chosen target path, and the immutable sha256 digest; the target member downloads `file-store:<namespace>/sha256/<digest>` from the mounted store.
+
+Require these fields in `/tmp/two-replica/checkpoint.json` before fencing assumptions depend on source loss: `status.clusters[].pods[].checkpointFiles[].sha256`, `durableRef`, and `exportedAt`. If any file lacks them, keep the ResourceBinding suspended and investigate the source artifact exporter/DaemonSet and shared PVC mount.
 
 ```bash
-export SOURCE_ARCHIVE_0=YOUR_REPORTED_ABSOLUTE_ARCHIVE_0
-export SOURCE_ARCHIVE_1=YOUR_REPORTED_ABSOLUTE_ARCHIVE_1
-export TARGET_ARCHIVE_0=/var/lib/kubelet/checkpoints/YOUR_ARCHIVE_0.tar
-export TARGET_ARCHIVE_1=/var/lib/kubelet/checkpoints/YOUR_ARCHIVE_1.tar
+export CHECKPOINT_ID=two-replica-trainer-checkpoint-001
+export WORKLOAD_UID=$(kubectl --context karmada -n fluidcr-demo get statefulset trainer -o jsonpath='{.metadata.uid}')
+export TRAINING_RUNTIME_NAME=trainer-runtime
+export TRAINING_RUNTIME_UID=$(kubectl --context karmada -n fluidcr-demo get trainingruntime "$TRAINING_RUNTIME_NAME" -o jsonpath='{.metadata.uid}')
+export SOURCE_NODE_0=$(jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[]|select(.podName=="trainer-0")|.nodeName' /tmp/two-replica/checkpoint.json)
+export SOURCE_NODE_1=$(jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[]|select(.podName=="trainer-1")|.nodeName' /tmp/two-replica/checkpoint.json)
+export SOURCE_ARCHIVE_0=$(jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[]|select(.podName=="trainer-0")|.checkpointFiles[0].filePath' /tmp/two-replica/checkpoint.json)
+export SOURCE_ARCHIVE_1=$(jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[]|select(.podName=="trainer-1")|.checkpointFiles[0].filePath' /tmp/two-replica/checkpoint.json)
+export SHA256_0=$(jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[]|select(.podName=="trainer-0")|.checkpointFiles[0].sha256' /tmp/two-replica/checkpoint.json)
+export SHA256_1=$(jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[]|select(.podName=="trainer-1")|.checkpointFiles[0].sha256' /tmp/two-replica/checkpoint.json)
+jq -er '.status.clusters[]|select(.clusterName==env.SOURCE_CLUSTER)|.pods[].checkpointFiles[]|
+  select((.sha256|test("^[0-9a-f]{64}$")) and (.durableRef|startswith("file-store:")) and (.exportedAt|length)>0)' \
+  /tmp/two-replica/checkpoint.json >/dev/null
+export TARGET_ARCHIVE_0=/var/lib/kubelet/checkpoints/trainer-0-${SHA256_0}.tar
+export TARGET_ARCHIVE_1=/var/lib/kubelet/checkpoints/trainer-1-${SHA256_1}.tar
 export TARGET_NODE_0=YOUR_TARGET_NODE_0 TARGET_NODE_1=YOUR_TARGET_NODE_1
-export SHA256_0=YOUR_64_LOWERCASE_HEX_DIGEST_0 SHA256_1=YOUR_64_LOWERCASE_HEX_DIGEST_1
 envsubst < "$SAMPLES/restore-request.yaml" > /tmp/two-replica/restore-template.yaml
-# Execute only after actual fencing, PV/NFS checks and archive transport.
+# Execute only after actual fencing, PV/NFS checks, and durable export evidence.
 kubectl patch --local -f /tmp/two-replica/restore-template.yaml --type=merge \
   -p '{"spec":{"sourceFenced":true,"volumesReady":true}}' -o yaml > /tmp/two-replica/restore-request.yaml
 kubectl --context karmada apply -f /tmp/two-replica/restore-request.yaml
@@ -217,11 +238,11 @@ PLAN=$(kubectl --context karmada -n fluidcr-demo get restorerequest trainer-rest
 export PLAN
 ```
 
-Prepared는 target 파일/노드/계획 준비이지 GPU 메모리 복원 성공이 아닙니다. Archive verifier의 관측은 신선해야 하므로 archive와 verifier를 유지하세요. RestoreRequest는 Member에 전파하지 않습니다. 잘못된 immutable 요청은 기존 operation을 점검한 후 새로운 이름으로 만듭니다.
+Prepared means the target node has downloaded the digest-addressed archive from the durable store and verified it locally. It is not proof of GPU memory or training-state recovery. RestoreRequest is management-only and must not be propagated directly to members. A bad immutable request should be replaced with a new operation name after auditing the old one.
 
 ## 7. Suspension gate와 target 전환
 
-새 suspension controller 및 RBAC가 포함된 관리 이미지를 설치한 뒤 진행합니다. Gate는 같은 namespace의 RestoreRequest와 PVMigration을 name+UID로 고정합니다. Source/target/RB, workload identity, 볼륨 집합, 현재 generation, 두 PV Work의 applied/detached, RestorePlan Prepared 및 target-only RB를 확인한 뒤 dispatching 키를 제거합니다. PVMigration controller 자체는 RB를 수정하지 않습니다.
+새 suspension controller 및 RBAC가 포함된 관리 이미지를 설치한 뒤 진행합니다. Gate는 같은 namespace의 RestoreRequest와 PVMigration을 name+UID로 고정합니다. Source/target/RB, workload identity, 볼륨 집합, 현재 generation, 두 PV Work의 applied/detached, RestorePlan Prepared 및 source+target RestorePlan RB를 확인한 뒤 dispatching 키를 제거합니다. PVMigration controller 자체는 RB를 수정하지 않습니다.
 
 ```bash
 RESTORE_UID=$(kubectl --context karmada -n fluidcr-demo get restorerequest trainer-restore-001 -o jsonpath='{.metadata.uid}')
@@ -274,3 +295,7 @@ DDP에서는 WORLD_SIZE=2, ordinal에서 구한 RANK=0/1, LOCAL_RANK=0, MASTER_A
 ## 검증 범위
 
 이 가이드는 parameterized 배포/운영 예시입니다. 서버측 schema dry-run, admission webhook 순서, NFS/PVC binding, patched CRI-O/CRIU, GPU 상태 및 두 Pod 동시 복원은 설치 환경에서 검증해야 합니다. 실패 시 source/target을 동시에 실행하지 말고 RB suspension과 fencing을 유지하며 원인을 확인합니다.
+
+## RestorePlan source and target propagation
+
+RestorePlan propagation now intentionally includes both source and target clusters. The source member/exporter publishes checkpoint archives into the shared durable file store before node loss; the target member/verifier downloads the same content-addressed object by sha256 digest. Manual placement remains user-owned, and the suspension gate still checks only the explicitly annotated operation.

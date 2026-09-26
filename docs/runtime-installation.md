@@ -35,7 +35,7 @@ Adapter는 복원 annotation이 있을 때 CRIU 활성화, restore-plan label, �
 폴더명 main/criu-dev는 commit pin이 아닙니다. 로컬 ZIP과 원격 HEAD의 동일성을 가정하지 않습니다.
 검토한 40자리 SHA를 기록하고 source/target에 같은 소스와 patch를 사용하세요.
 로컬 CRI-O go.mod는 Go 1.26.3을 요구합니다. 실제 checkout의 go.mod/dependencies.yaml이 기준입니다.
-컨트롤러의 Go 1.24 최소 조건과 혼동하지 마세요.
+컨트롤러의 Go 1.25 최소 조건과 혼동하지 마세요.
 CRI-O와 Kubernetes minor 호환성을 확인하고 무조건 최신 main을 기존 노드에 설치하지 마세요.
 
 ```bash

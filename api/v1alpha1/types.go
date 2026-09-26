@@ -21,11 +21,13 @@ type WorkloadReference struct {
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
 	Name       string `json:"name"`
+	UID        string `json:"uid"`
 }
 type CheckpointReference struct {
-	Name       string `json:"name"`
-	UID        string `json:"uid"`
-	Generation int64  `json:"generation"`
+	Name         string `json:"name"`
+	UID          string `json:"uid"`
+	Generation   int64  `json:"generation"`
+	CheckpointID string `json:"checkpointID"`
 }
 type Archive struct {
 	ContainerName string `json:"containerName"`
@@ -35,34 +37,38 @@ type Archive struct {
 }
 type RestorePod struct {
 	SourcePod  string    `json:"sourcePod"`
+	SourceNode string    `json:"sourceNode"`
 	TargetPod  string    `json:"targetPod"`
 	TargetNode string    `json:"targetNode"`
 	Archives   []Archive `json:"archives"`
 }
 type RestoreRequestSpec struct {
-	CheckpointRef CheckpointReference `json:"checkpointRef"`
-	WorkloadRef   WorkloadReference   `json:"workloadRef"`
-	SourceCluster string              `json:"sourceCluster"`
-	TargetCluster string              `json:"targetCluster"`
-	SourceFenced  bool                `json:"sourceFenced"`
-	VolumesReady  bool                `json:"volumesReady"`
-	Pods          []RestorePod        `json:"pods"`
+	CheckpointRef      CheckpointReference `json:"checkpointRef"`
+	WorkloadRef        WorkloadReference   `json:"workloadRef"`
+	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef"`
+	SourceCluster      string              `json:"sourceCluster"`
+	TargetCluster      string              `json:"targetCluster"`
+	SourceFenced       bool                `json:"sourceFenced"`
+	VolumesReady       bool                `json:"volumesReady"`
+	Pods               []RestorePod        `json:"pods"`
 }
 type RestorePlanSpec struct {
-	RequestUID    string              `json:"requestUID"`
-	CheckpointRef CheckpointReference `json:"checkpointRef"`
-	WorkloadRef   WorkloadReference   `json:"workloadRef"`
-	SourceCluster string              `json:"sourceCluster"`
-	TargetCluster string              `json:"targetCluster"`
-	SourceFenced  bool                `json:"sourceFenced"`
-	VolumesReady  bool                `json:"volumesReady"`
-	Pods          []RestorePod        `json:"pods"`
+	RequestUID         string              `json:"requestUID"`
+	CheckpointRef      CheckpointReference `json:"checkpointRef"`
+	WorkloadRef        WorkloadReference   `json:"workloadRef"`
+	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef"`
+	SourceCluster      string              `json:"sourceCluster"`
+	TargetCluster      string              `json:"targetCluster"`
+	SourceFenced       bool                `json:"sourceFenced"`
+	VolumesReady       bool                `json:"volumesReady"`
+	Pods               []RestorePod        `json:"pods"`
 }
 type ArtifactStatus struct {
 	NodeName           string      `json:"nodeName"`
 	ObservedGeneration int64       `json:"observedGeneration"`
 	Verified           bool        `json:"verified"`
 	Message            string      `json:"message,omitempty"`
+	DurableRef         string      `json:"durableRef,omitempty"`
 	CheckedAt          metav1.Time `json:"checkedAt"`
 }
 type PodStatus struct {
@@ -78,14 +84,27 @@ type ClusterStatus struct {
 	Message            string      `json:"message,omitempty"`
 	Pods               []PodStatus `json:"pods,omitempty"`
 }
+type RuntimeReference struct {
+	Name string `json:"name"`
+	UID  string `json:"uid,omitempty"`
+}
+type RestoreVerification struct {
+	RequestUID         string           `json:"requestUID"`
+	CheckpointID       string           `json:"checkpointID"`
+	VerifiedAt         metav1.Time      `json:"verifiedAt"`
+	TrainingRuntimeRef RuntimeReference `json:"trainingRuntimeRef"`
+	SourceCluster      string           `json:"sourceCluster"`
+	TargetCluster      string           `json:"targetCluster"`
+}
 type RestoreStatus struct {
-	ObservedGeneration int64            `json:"observedGeneration,omitempty"`
-	Phase              string           `json:"phase,omitempty"`
-	Message            string           `json:"message,omitempty"`
-	PlanName           string           `json:"planName,omitempty"`
-	Artifacts          []ArtifactStatus `json:"artifacts,omitempty"`
-	Pods               []PodStatus      `json:"pods,omitempty"`
-	Clusters           []ClusterStatus  `json:"clusters,omitempty"`
+	ObservedGeneration int64                `json:"observedGeneration,omitempty"`
+	Phase              string               `json:"phase,omitempty"`
+	Message            string               `json:"message,omitempty"`
+	PlanName           string               `json:"planName,omitempty"`
+	Artifacts          []ArtifactStatus     `json:"artifacts,omitempty"`
+	Pods               []PodStatus          `json:"pods,omitempty"`
+	Clusters           []ClusterStatus      `json:"clusters,omitempty"`
+	Verification       *RestoreVerification `json:"verification,omitempty"`
 }
 type RestoreRequest struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -124,6 +143,10 @@ func copyPods(in []RestorePod) []RestorePod {
 }
 func copyStatus(in RestoreStatus) RestoreStatus {
 	out := in
+	if in.Verification != nil {
+		verification := *in.Verification
+		out.Verification = &verification
+	}
 	if in.Artifacts != nil {
 		out.Artifacts = append([]ArtifactStatus{}, in.Artifacts...)
 	}
