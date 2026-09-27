@@ -90,11 +90,16 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 	if err := validatePlan(plan, r.ClusterName); err != nil {
 		return "Failed", err.Error(), nil, nil, nil
 	}
+	if plan.Spec.LocalPodRestore {
+		if err := validateLocalCheckpoint(ctx, r.Reader, plan); err != nil {
+			return "Failed", err.Error(), nil, nil, nil
+		}
+	}
 	prepared, running := true, true
 	failure := ""
 	statuses := make([]api.PodStatus, 0, len(plan.Spec.Pods))
 	sourceFences := []api.SourcePodFenceStatus(nil)
-	partial := plan.Spec.PartialRestore != nil
+	partial := plan.Spec.PartialRestore != nil || plan.Spec.LocalPodRestore
 	for _, mapping := range plan.Spec.Pods {
 		mappingReady := true
 		var node corev1.Node
@@ -230,6 +235,13 @@ func (r *Reconciler) ensureSourceFenced(ctx context.Context, plan *api.RestorePl
 		if !staged {
 			return fence, false, "", nil
 		}
+		// Persist local deletion intent before the external side effect so a
+		// restart after Delete cannot lose the UID-bound fencing provenance.
+		if plan.Spec.LocalPodRestore && fence.DeleteRequestedAt == nil {
+			now := metav1.Now()
+			fence.Phase, fence.Message, fence.DeleteRequestedAt = "DeleteRequested", "persisting UID-bound source deletion intent", &now
+			return fence, false, "", nil
+		}
 		if err := validateSourcePodForDeletion(ctx, r.Reader, plan, mapping, pod); err != nil {
 			fence.Phase, fence.Message = "Refused", err.Error()
 			return fence, false, fence.Message, nil
@@ -333,6 +345,9 @@ func validateAdmissionReady(ctx context.Context, reader client.Reader, plan *api
 
 func sourcePodOwnedByWorkload(plan *api.RestorePlan, pod *corev1.Pod) bool {
 	if plan.Spec.WorkloadRef.Kind == "Pod" {
+		if plan.Spec.LocalPodRestore && string(pod.UID) != plan.Spec.WorkloadRef.UID {
+			return false
+		}
 		return pod.Name == plan.Spec.WorkloadRef.Name && len(pod.OwnerReferences) == 0
 	}
 	owner := metav1.GetControllerOf(pod)

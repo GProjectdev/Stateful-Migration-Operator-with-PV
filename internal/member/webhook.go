@@ -83,7 +83,11 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 	}
 	sameCluster := p.Spec.SourceCluster == p.Spec.TargetCluster
 	partialTargets := map[int64]bool{}
-	if sameCluster {
+	if p.Spec.LocalPodRestore {
+		if err := validateLocalPodPlan(p); err != nil {
+			return err
+		}
+	} else if sameCluster {
 		var err error
 		partialTargets, err = validatePartialPlan(p)
 		if err != nil {
@@ -110,11 +114,11 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 		if mapping.SourcePod != mapping.TargetPod {
 			return fmt.Errorf("source and target Pod identity must match")
 		}
-		if sameCluster {
+		if sameCluster && !p.Spec.LocalPodRestore {
 			if !partialTargets[mapping.Rank] || strings.TrimSpace(mapping.SourcePodUID) == "" {
 				return fmt.Errorf("same-cluster partial restore requires target rank and sourcePodUID")
 			}
-		} else if strings.TrimSpace(mapping.SourcePodUID) != "" {
+		} else if !p.Spec.LocalPodRestore && strings.TrimSpace(mapping.SourcePodUID) != "" {
 			return fmt.Errorf("sourcePodUID is reserved for same-cluster partial restore")
 		}
 		if (ref.Kind == "Pod" && mapping.TargetPod != ref.Name) || (ref.Kind == "StatefulSet" && !ordinal.MatchString(mapping.TargetPod)) {
@@ -217,6 +221,15 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	}
 	if err := validatePlan(&plan, w.ClusterName); err != nil {
 		return err
+	}
+	if plan.Spec.LocalPodRestore {
+		if err := validateLocalCheckpoint(ctx, w.Reader, &plan); err != nil {
+			return err
+		}
+		fence := previousSourceFence(&plan, &plan.Spec.Pods[0])
+		if fence == nil || fence.DeleteRequestedAt == nil || fence.GoneObservedAt == nil || fence.Phase != "SourceGone" {
+			return fmt.Errorf("local Pod restore requires controller-observed source deletion")
+		}
 	}
 	mapping, err := mappingFor(&plan, pod)
 	if err != nil {
@@ -324,7 +337,7 @@ func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.Re
 }
 
 func activePartialPlan(plan *api.RestorePlan, cluster string) bool {
-	return plan.Spec.PartialRestore != nil && plan.Spec.TargetCluster == cluster && plan.DeletionTimestamp.IsZero() && plan.Status.Phase != "Verified" && plan.Status.Phase != "Failed"
+	return (plan.Spec.PartialRestore != nil || plan.Spec.LocalPodRestore) && plan.Spec.TargetCluster == cluster && plan.DeletionTimestamp.IsZero() && plan.Status.Phase != "Verified" && (plan.Spec.LocalPodRestore || plan.Status.Phase != "Failed")
 }
 
 func workloadMatchesPod(plan *api.RestorePlan, pod *corev1.Pod) bool {

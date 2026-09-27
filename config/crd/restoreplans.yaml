@@ -49,6 +49,9 @@ spec:
                 type: string
                 minLength: 1
                 maxLength: 128
+              localPodRestore:
+                type: boolean
+                description: Explicit member-local standalone Pod restore; does not enable management orchestration.
               checkpointRef:
                 type: object
                 required:

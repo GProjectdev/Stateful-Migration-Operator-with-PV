@@ -72,6 +72,8 @@ type RestoreRequestSpec struct {
 	PartialRestore     *PartialRestoreSpec `json:"partialRestore,omitempty"`
 }
 type RestorePlanSpec struct {
+	// LocalPodRestore opts into a member-local, UID-fenced standalone Pod restore.
+	LocalPodRestore    bool                `json:"localPodRestore,omitempty"`
 	RequestUID         string              `json:"requestUID"`
 	CheckpointRef      CheckpointReference `json:"checkpointRef"`
 	WorkloadRef        WorkloadReference   `json:"workloadRef"`
