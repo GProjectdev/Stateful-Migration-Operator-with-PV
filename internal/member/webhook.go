@@ -25,6 +25,9 @@ const RuntimeCapabilityLabel = "migration.dcnlab.com/restore-from-file"
 const InjectAnnotation = "fluidcr.dcnlab.com/inject"
 const ContainerAnnotation = "fluidcr.dcnlab.com/container"
 const InjectedAnnotation = "fluidcr.dcnlab.com/injected"
+const WorkloadUIDLabel = "training.dcnlab.com/workload-uid"
+
+var errNoRestorePlan = fmt.Errorf("no restore plan applies")
 
 // Reader must be mgr.GetAPIReader(), not the informer cache.
 type Webhook struct {
@@ -51,14 +54,14 @@ func (w *Webhook) Handle(ctx context.Context, req admission.Request) admission.R
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
 		return admission.Denied("invalid Pod")
 	}
-	if _, opted := pod.Labels[api.PlanLabel]; !opted {
-		return admission.Allowed("not opted in")
-	}
 	if pod.Namespace != "" && pod.Namespace != req.Namespace {
 		return admission.Denied("namespace mismatch")
 	}
 	pod.Namespace = req.Namespace
 	if err := w.Apply(ctx, &pod); err != nil {
+		if err == errNoRestorePlan {
+			return admission.Allowed("not opted in")
+		}
 		return admission.Denied(err.Error())
 	}
 	if w.ValidateOnly {
@@ -75,11 +78,21 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 	if cluster == "" || p.Spec.TargetCluster != cluster || p.Namespace == "" || p.UID == "" || p.Generation < 1 || !p.DeletionTimestamp.IsZero() {
 		return fmt.Errorf("invalid, deleting or wrong-cluster plan")
 	}
-	if !p.Spec.SourceFenced || !p.Spec.VolumesReady {
-		return fmt.Errorf("sourceFenced and volumesReady must both be true")
+	if !p.Spec.VolumesReady {
+		return fmt.Errorf("volumesReady must be true")
 	}
-	if p.Spec.SourceCluster == p.Spec.TargetCluster {
-		return fmt.Errorf("source and target clusters must differ")
+	sameCluster := p.Spec.SourceCluster == p.Spec.TargetCluster
+	partialTargets := map[int64]bool{}
+	if sameCluster {
+		var err error
+		partialTargets, err = validatePartialPlan(p)
+		if err != nil {
+			return err
+		}
+	} else if !p.Spec.SourceFenced {
+		return fmt.Errorf("sourceFenced must be true for cross-cluster restore")
+	} else if p.Spec.PartialRestore != nil {
+		return fmt.Errorf("partialRestore is only supported for same-cluster restore")
 	}
 	if p.Spec.RequestUID == "" || p.Spec.CheckpointRef.UID == "" || p.Spec.CheckpointRef.Name == "" || p.Spec.CheckpointRef.Generation < 1 || p.Spec.SourceCluster == "" {
 		return fmt.Errorf("missing immutable request/checkpoint provenance")
@@ -96,6 +109,13 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 	for _, mapping := range p.Spec.Pods {
 		if mapping.SourcePod != mapping.TargetPod {
 			return fmt.Errorf("source and target Pod identity must match")
+		}
+		if sameCluster {
+			if !partialTargets[mapping.Rank] || strings.TrimSpace(mapping.SourcePodUID) == "" {
+				return fmt.Errorf("same-cluster partial restore requires target rank and sourcePodUID")
+			}
+		} else if strings.TrimSpace(mapping.SourcePodUID) != "" {
+			return fmt.Errorf("sourcePodUID is reserved for same-cluster partial restore")
 		}
 		if (ref.Kind == "Pod" && mapping.TargetPod != ref.Name) || (ref.Kind == "StatefulSet" && !ordinal.MatchString(mapping.TargetPod)) {
 			return fmt.Errorf("mapped Pod identity does not belong to workload")
@@ -128,6 +148,39 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 	return nil
 }
 
+func validatePartialPlan(p *api.RestorePlan) (map[int64]bool, error) {
+	partial := p.Spec.PartialRestore
+	if partial == nil {
+		return nil, fmt.Errorf("same-cluster restore requires partialRestore")
+	}
+	if p.Spec.SourceFenced {
+		return nil, fmt.Errorf("same-cluster partial restore requires sourceFenced=false")
+	}
+	if !partial.PreventPeriodicResume {
+		return nil, fmt.Errorf("same-cluster partial restore must prevent periodic resume interference")
+	}
+	if len(partial.TargetRanks) == 0 || len(partial.TargetRanks) != len(p.Spec.Pods) || len(partial.PreservedSurvivors) == 0 {
+		return nil, fmt.Errorf("partialRestore target ranks and preserved survivors are required")
+	}
+	targets := map[int64]bool{}
+	for _, rank := range partial.TargetRanks {
+		if rank < 0 || targets[rank] {
+			return nil, fmt.Errorf("partialRestore target ranks must be unique non-negative values")
+		}
+		targets[rank] = true
+	}
+	seenSurvivorRanks := map[int64]bool{}
+	seenSurvivorPods := map[string]bool{}
+	for _, survivor := range partial.PreservedSurvivors {
+		if survivor.Rank < 0 || targets[survivor.Rank] || seenSurvivorRanks[survivor.Rank] || seenSurvivorPods[survivor.PodName] || strings.TrimSpace(survivor.PodName) == "" || strings.TrimSpace(survivor.PodUID) == "" || strings.TrimSpace(survivor.NodeName) == "" || survivor.Generation <= 0 || !strings.HasPrefix(survivor.PauseLockPath, "/") || !strings.HasSuffix(survivor.PauseLockPath, "/pause-lock") {
+			return nil, fmt.Errorf("partialRestore survivor evidence is incomplete")
+		}
+		seenSurvivorRanks[survivor.Rank] = true
+		seenSurvivorPods[survivor.PodName] = true
+	}
+	return targets, nil
+}
+
 func mappingFor(p *api.RestorePlan, pod *corev1.Pod) (*api.RestorePod, error) {
 	if pod.Namespace != p.Namespace || pod.Name == "" {
 		return nil, fmt.Errorf("exact mapped Pod name and namespace required")
@@ -158,13 +211,9 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	if w.Reader == nil {
 		return fmt.Errorf("uncached API reader required")
 	}
-	name := pod.Labels[api.PlanLabel]
-	if name == "" || pod.Namespace == "" {
-		return fmt.Errorf("restore plan label and namespace required")
-	}
-	var plan api.RestorePlan
-	if err := w.Reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: name}, &plan); err != nil {
-		return fmt.Errorf("restore plan unavailable: %w", err)
+	plan, err := w.planForAdmission(ctx, pod)
+	if err != nil {
+		return err
 	}
 	if err := validatePlan(&plan, w.ClusterName); err != nil {
 		return err
@@ -224,6 +273,10 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	pod.Labels[api.PlanLabel] = plan.Name
 	pod.Annotations[PlanUIDAnnotation] = string(plan.UID)
 	pod.Annotations[PlanGenerationAnnotation] = strconv.FormatInt(plan.Generation, 10)
 	pod.Annotations[ContainerAnnotation] = target
@@ -232,6 +285,60 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	}
 	pinNode(pod, mapping.TargetNode)
 	return nil
+}
+
+func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.RestorePlan, error) {
+	if pod.Namespace == "" {
+		return api.RestorePlan{}, fmt.Errorf("namespace required")
+	}
+	if name := pod.Labels[api.PlanLabel]; name != "" {
+		var plan api.RestorePlan
+		if err := w.Reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: name}, &plan); err != nil {
+			return api.RestorePlan{}, fmt.Errorf("restore plan unavailable: %w", err)
+		}
+		return plan, nil
+	}
+	var plans api.RestorePlanList
+	if err := w.Reader.List(ctx, &plans, client.InNamespace(pod.Namespace)); err != nil {
+		return api.RestorePlan{}, err
+	}
+	var matches []api.RestorePlan
+	for _, plan := range plans.Items {
+		if !activePartialPlan(&plan, w.ClusterName) || !workloadMatchesPod(&plan, pod) {
+			continue
+		}
+		for _, mapping := range plan.Spec.Pods {
+			if mapping.TargetPod == pod.Name {
+				matches = append(matches, plan)
+				break
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return api.RestorePlan{}, errNoRestorePlan
+	}
+	if len(matches) > 1 {
+		return api.RestorePlan{}, fmt.Errorf("ambiguous active partial restore plans for Pod")
+	}
+	return matches[0], nil
+}
+
+func activePartialPlan(plan *api.RestorePlan, cluster string) bool {
+	return plan.Spec.PartialRestore != nil && plan.Spec.TargetCluster == cluster && plan.DeletionTimestamp.IsZero() && plan.Status.Phase != "Verified" && plan.Status.Phase != "Failed"
+}
+
+func workloadMatchesPod(plan *api.RestorePlan, pod *corev1.Pod) bool {
+	if plan.Spec.WorkloadRef.Kind == "Pod" {
+		return pod.Name == plan.Spec.WorkloadRef.Name && len(pod.OwnerReferences) == 0
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.Kind != "StatefulSet" || owner.APIVersion != "apps/v1" || owner.Name != plan.Spec.WorkloadRef.Name {
+		return false
+	}
+	if plan.Spec.WorkloadRef.UID == "" {
+		return true
+	}
+	return pod.Labels[WorkloadUIDLabel] == plan.Spec.WorkloadRef.UID
 }
 
 func checkRestoreAnnotations(pod *corev1.Pod, mapping *api.RestorePod, required bool) error {

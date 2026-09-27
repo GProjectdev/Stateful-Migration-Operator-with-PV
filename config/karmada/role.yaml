@@ -23,7 +23,7 @@
     {
       "apiGroups": ["training.dcnlab.com"],
       "resources": ["trainingruntimes"],
-      "verbs": ["get"]
+      "verbs": ["get", "list", "watch"]
     },
     {
       "apiGroups": [
@@ -75,7 +75,9 @@
       "verbs": [
         "get",
         "list",
-        "watch"
+        "watch",
+        "patch",
+        "update"
       ]
     },
     {

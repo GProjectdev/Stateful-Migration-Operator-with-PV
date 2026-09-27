@@ -19,6 +19,7 @@ package checkpoint
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,15 +35,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	fluidcrv1alpha1 "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/fluidcr/v1alpha1"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/ctrlapi"
 )
 
 // fakeCtrl is an in-memory CtrlAPI that records calls and can inject errors per pod IP.
 type fakeCtrl struct {
-	mu              sync.Mutex
-	checkpointCalls []string
-	checkpointIDs   []string
-	resumeCalls     []string
-	checkpointErr   map[string]error
+	mu                      sync.Mutex
+	checkpointCalls         []string
+	partialCalls            []string
+	checkpointIDs           []string
+	resumeCalls             []string
+	resumeOwnedCalls        []string
+	resumeOwnedCheckpointID string
+	resumeOwnedGeneration   int64
+	checkpointErr           map[string]error
+	resumeOwnedErr          map[string]error
+	runtime                 map[string]ctrlapi.RuntimeStatus
 }
 
 func (f *fakeCtrl) Checkpoint(_ context.Context, podIP string, _ int, _ time.Duration, checkpointID string) (map[string]string, error) {
@@ -56,11 +64,45 @@ func (f *fakeCtrl) Checkpoint(_ context.Context, podIP string, _ int, _ time.Dur
 	return map[string]string{"1234": "checkpoint-ready"}, nil
 }
 
+func (f *fakeCtrl) CheckpointRanks(_ context.Context, podIP string, _ int, _ time.Duration, checkpointID string, _ []int64) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.partialCalls = append(f.partialCalls, podIP)
+	f.checkpointIDs = append(f.checkpointIDs, checkpointID)
+	if err := f.checkpointErr[podIP]; err != nil {
+		return nil, err
+	}
+	return map[string]string{"1234": "checkpoint-signalled"}, nil
+}
+
+func (f *fakeCtrl) Runtime(_ context.Context, podIP string, _ int, _ time.Duration) (ctrlapi.RuntimeStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.runtime != nil {
+		if status, ok := f.runtime[podIP]; ok {
+			return status, nil
+		}
+	}
+	return ctrlapi.RuntimeStatus{}, fmt.Errorf("runtime status missing for %s", podIP)
+}
+
 func (f *fakeCtrl) Resume(_ context.Context, podIP string, _ int, _ time.Duration) (map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resumeCalls = append(f.resumeCalls, podIP)
 	return map[string]string{"lock": "lock-removed"}, nil
+}
+
+func (f *fakeCtrl) ResumeOwned(_ context.Context, podIP string, _ int, _ time.Duration, checkpointID string, generation int64) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resumeOwnedCalls = append(f.resumeOwnedCalls, podIP)
+	f.resumeOwnedCheckpointID = checkpointID
+	f.resumeOwnedGeneration = generation
+	if err := f.resumeOwnedErr[podIP]; err != nil {
+		return nil, err
+	}
+	return map[string]string{"lock": "removed"}, nil
 }
 
 func (f *fakeCtrl) counts() (checkpoint, resume int) {
@@ -132,6 +174,21 @@ func newTestDeployment() *appsv1.Deployment {
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "trainer"}},
 		},
 	}
+}
+
+func newTestStatefulSet() *appsv1.StatefulSet {
+	replicas := int32(2)
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: "default", UID: "statefulset-uid", Generation: 1},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "trainer"}}},
+		Status:     appsv1.StatefulSetStatus{ObservedGeneration: 1, Replicas: 2, CurrentReplicas: 2, ReadyReplicas: 2, AvailableReplicas: 2, UpdatedReplicas: 2, CurrentRevision: "rev", UpdateRevision: "rev"},
+	}
+}
+
+func newStatefulPod(name, podIP, hostIP string) *corev1.Pod {
+	p := newTestPod(name, podIP, hostIP)
+	p.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(newTestStatefulSet(), appsv1.SchemeGroupVersion.WithKind("StatefulSet"))}
+	return p
 }
 
 func newTestMigration() *fluidcrv1alpha1.FluidCRMigration {
@@ -237,6 +294,202 @@ func TestReconcile_ResumeWithoutResumeFlag(t *testing.T) {
 	}
 	if got.Status.Pods[0].Phase != fluidcrv1alpha1.PodPhaseContainerCheckpointed {
 		t.Errorf("pod phase = %q, want ContainerCheckpointed", got.Status.Pods[0].Phase)
+	}
+}
+
+func TestReconcile_PartialCheckpointTargetsOnlySelectedRank(t *testing.T) {
+	s := newTestScheme(t)
+	mig := newTestMigration()
+	noResume := false
+	mig.Spec.Resume = &noResume
+	mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+	mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+	fc := &fakeCtrl{runtime: map[string]ctrlapi.RuntimeStatus{"10.0.0.1": {Rank: 0, WorldSize: 2, CheckpointID: "mig-round-001", SurvivorEvidence: ctrlapi.SurvivorEvidence{Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock", PauseLockPID: 1234, ObservedAt: "now"}}}}
+	fk := &fakeKubelet{}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestStatefulSet(), newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: fk}
+
+	got := reconcileToCompletion(t, r, c)
+
+	if got.Status.Phase != fluidcrv1alpha1.PhaseCompleted {
+		t.Fatalf("phase = %q: %s", got.Status.Phase, got.Status.Message)
+	}
+	if len(fc.partialCalls) != 1 || fc.partialCalls[0] != "10.0.0.2" {
+		t.Fatalf("partial calls = %v, want target rank pod", fc.partialCalls)
+	}
+	if n := fk.count(); n != 1 {
+		t.Fatalf("kubelet checkpoint calls = %d, want target rank only", n)
+	}
+	if _, rs := fc.counts(); rs != 0 {
+		t.Fatalf("resume calls = %d, want none for partial", rs)
+	}
+	survivor := podStatusByName(got.Status.Pods, "trainer-0")
+	if survivor == nil || survivor.Phase != fluidcrv1alpha1.PodPhaseSurvivorPaused || survivor.SurvivorEvidence == nil {
+		t.Fatalf("survivor status = %+v", survivor)
+	}
+	target := podStatusByName(got.Status.Pods, "trainer-1")
+	if target == nil || target.Phase != fluidcrv1alpha1.PodPhaseContainerCheckpointed || len(target.CheckpointFiles) != 1 {
+		t.Fatalf("target status = %+v", target)
+	}
+}
+
+func TestReconcile_RestoreOwnedResumeReleasesSurvivorAfterAuthorization(t *testing.T) {
+	s := newTestScheme(t)
+	mig := newTestMigration()
+	noResume := false
+	mig.Spec.Resume = &noResume
+	mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+	mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+	fc := &fakeCtrl{runtime: map[string]ctrlapi.RuntimeStatus{"10.0.0.1": {Rank: 0, WorldSize: 2, CheckpointID: "mig-round-001", SurvivorEvidence: ctrlapi.SurvivorEvidence{Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock", PauseLockPID: 1234, ObservedAt: "now"}}}}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestStatefulSet(), newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: &fakeKubelet{}}
+
+	got := reconcileToCompletion(t, r, c)
+	if len(fc.resumeOwnedCalls) != 0 {
+		t.Fatalf("restore-owned resume before authorization: %v", fc.resumeOwnedCalls)
+	}
+	got.Annotations[AnnotationRestoreOwnedResume] = "true"
+	if err := c.Update(context.Background(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "mig"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "mig"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.resumeOwnedCalls) != 1 || fc.resumeOwnedCalls[0] != "10.0.0.1" {
+		t.Fatalf("restore-owned resume calls = %v, want survivor only", fc.resumeOwnedCalls)
+	}
+	if fc.resumeOwnedCheckpointID != "mig-round-001" || fc.resumeOwnedGeneration != 7 {
+		t.Fatalf("restore-owned resume contract = checkpointID %q generation %d", fc.resumeOwnedCheckpointID, fc.resumeOwnedGeneration)
+	}
+	survivor := podStatusByName(got.Status.Pods, "trainer-0")
+	if survivor == nil || survivor.Phase != fluidcrv1alpha1.PodPhaseResumed {
+		t.Fatalf("survivor after release = %+v", survivor)
+	}
+	target := podStatusByName(got.Status.Pods, "trainer-1")
+	if target == nil || target.Phase != fluidcrv1alpha1.PodPhaseContainerCheckpointed {
+		t.Fatalf("target phase changed during survivor release: %+v", target)
+	}
+}
+
+func TestReconcile_RestoreOwnedResumeRetryStaysOwnedLane(t *testing.T) {
+	s := newTestScheme(t)
+	mig := newTestMigration()
+	noResume := false
+	mig.Spec.Resume = &noResume
+	mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+	mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+	fc := &fakeCtrl{
+		runtime:        map[string]ctrlapi.RuntimeStatus{"10.0.0.1": {Rank: 0, WorldSize: 2, CheckpointID: "mig-round-001", SurvivorEvidence: ctrlapi.SurvivorEvidence{Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock", PauseLockPID: 1234, ObservedAt: "now"}}},
+		resumeOwnedErr: map[string]error{"10.0.0.1": fmt.Errorf("runtime busy")},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestStatefulSet(), newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: &fakeKubelet{}}
+
+	got := reconcileToCompletion(t, r, c)
+	got.Annotations[AnnotationRestoreOwnedResume] = "true"
+	if err := c.Update(context.Background(), &got); err != nil {
+		t.Fatal(err)
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "mig"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.resumeOwnedCalls) != 1 || fc.resumeOwnedCalls[0] != "10.0.0.1" {
+		t.Fatalf("restore-owned retry first call = %v", fc.resumeOwnedCalls)
+	}
+	if got.Status.Phase != fluidcrv1alpha1.PhasePending || !strings.Contains(got.Status.Message, "restore-owned resume retry pending") {
+		t.Fatalf("retry status = %q %q", got.Status.Phase, got.Status.Message)
+	}
+	if _, generic := fc.counts(); generic != 0 {
+		t.Fatalf("generic resume calls during owned retry = %d", generic)
+	}
+
+	delete(fc.resumeOwnedErr, "10.0.0.1")
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.resumeOwnedCalls) != 2 || got.Status.Phase != fluidcrv1alpha1.PhaseCompleted {
+		t.Fatalf("owned retry did not complete: calls=%v status=%q %q", fc.resumeOwnedCalls, got.Status.Phase, got.Status.Message)
+	}
+	if _, generic := fc.counts(); generic != 0 {
+		t.Fatalf("generic resume calls after owned retry = %d", generic)
+	}
+}
+
+func TestReconcile_RestoreOwnedResumeRetryAfterLostStatusAcceptsReleasedRuntime(t *testing.T) {
+	s := newTestScheme(t)
+	mig := newTestMigration()
+	noResume := false
+	mig.Spec.Resume = &noResume
+	mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+	mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+	fc := &fakeCtrl{runtime: map[string]ctrlapi.RuntimeStatus{"10.0.0.1": {Rank: 0, WorldSize: 2, CheckpointID: "mig-round-001", SurvivorEvidence: ctrlapi.SurvivorEvidence{Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock", PauseLockPID: 1234, ObservedAt: "now"}}}}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestStatefulSet(), newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: &fakeKubelet{}}
+
+	got := reconcileToCompletion(t, r, c)
+	got.Annotations[AnnotationRestoreOwnedResume] = "true"
+	if err := c.Update(context.Background(), &got); err != nil {
+		t.Fatal(err)
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "mig"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.resumeOwnedCalls) != 1 {
+		t.Fatalf("initial restore-owned resume calls = %v", fc.resumeOwnedCalls)
+	}
+
+	// Simulate the API status write being lost after the scoped release reached
+	// FluidCR: persisted status still asks for release, but /runtime no longer
+	// exposes the pause-lock manifest because the survivor is already running.
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	got.Status.Phase = fluidcrv1alpha1.PhasePending
+	got.Status.CompletionTime = nil
+	for i := range got.Status.Pods {
+		if got.Status.Pods[i].PodName == "trainer-0" {
+			got.Status.Pods[i].Phase = fluidcrv1alpha1.PodPhaseSurvivorPaused
+			got.Status.Pods[i].Message = "persisted before release completion"
+		}
+	}
+	if err := c.Status().Update(context.Background(), &got); err != nil {
+		t.Fatal(err)
+	}
+	fc.runtime["10.0.0.1"] = ctrlapi.RuntimeStatus{Rank: 0, WorldSize: 2, State: "Running", CheckpointID: "mig-round-001"}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.resumeOwnedCalls) != 2 || got.Status.Phase != fluidcrv1alpha1.PhaseCompleted {
+		t.Fatalf("idempotent owned retry did not complete: calls=%v status=%q %q", fc.resumeOwnedCalls, got.Status.Phase, got.Status.Message)
+	}
+	if _, generic := fc.counts(); generic != 0 {
+		t.Fatalf("generic resume calls after lost-status retry = %d", generic)
 	}
 }
 

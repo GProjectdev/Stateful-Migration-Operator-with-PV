@@ -21,6 +21,7 @@ This module provides:
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -32,7 +33,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluidcr._config import EXIT_CODE, log, warn
 
@@ -314,6 +315,72 @@ def _round_artifact_path(checkpoint_path: str, checkpoint_id: str) -> str:
     )
 
 
+def _round_trigger_path(checkpoint_id: str) -> str:
+    from fluidcr.distributed import _base_dir
+
+    return os.path.join(_base_dir(), "rounds", checkpoint_id, ".triggered")
+
+
+def _try_claim_round_trigger(checkpoint_id: str) -> bool:
+    path = _round_trigger_path(checkpoint_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(_utc_now())
+        fh.flush()
+        os.fsync(fh.fileno())
+    return True
+
+
+def _targets_equal(left, right) -> bool:
+    if left == "all" or right == "all":
+        return left == right
+    return sorted(int(r) for r in left) == sorted(int(r) for r in right)
+
+
+def _local_rank_world() -> Tuple[int, int]:
+    rank = _env_int("RANK")
+    world = _env_int("WORLD_SIZE")
+    if rank is None or world is None:
+        raise ValueError("partial wait requires RANK and WORLD_SIZE")
+    return rank, world
+
+
+def _env_text(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _pod_identity() -> Dict[str, str]:
+    return {
+        "podName": _env_text("FLUIDCR_POD_NAME", "POD_NAME", "HOSTNAME"),
+        "podUID": _env_text("FLUIDCR_POD_UID", "POD_UID", "K8S_POD_UID"),
+        "nodeName": _env_text("FLUIDCR_NODE_NAME", "NODE_NAME"),
+    }
+
+
+def _require_pod_identity() -> Dict[str, str]:
+    identity = _pod_identity()
+    missing = [name for name, value in identity.items() if not value]
+    if missing:
+        raise ValueError("partial evidence missing " + ", ".join(missing))
+    return identity
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _atomic_json_write(path: str, payload: Dict) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -504,46 +571,50 @@ def _read_checkpoint_global_step(checkpoint_path: str) -> Optional[int]:
     return None
 
 
+def _preserve_round_artifact_path(checkpoint_path: str, checkpoint_id: str) -> str:
+    src = checkpoint_path
+    dst = _round_artifact_path(src, checkpoint_id)
+    if os.path.exists(dst):
+        return "artifact-exists"
+    if not os.path.isfile(src):
+        return "checkpoint-missing"
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(dst),
+        prefix="." + os.path.basename(dst) + "-",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, dst)
+        bind_restore_checkpoint(src, checkpoint_id, dst)
+        _write_status(
+            src,
+            {
+                "checkpointID": checkpoint_id,
+                "artifactPath": dst,
+                "state": "CheckpointReady",
+                "globalStep": _read_checkpoint_global_step(src) or 0,
+            },
+        )
+        return "artifact-preserved"
+    except Exception as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return f"artifact-error: {exc}"
+
+
 def _preserve_round_artifacts(parent_pids: List[int], checkpoint_id: str) -> Dict[int, str]:
     results: Dict[int, str] = {}
     for ppid in parent_pids:
-        src = _checkpoint_path_for_ppid(ppid)
-        dst = _round_artifact_path(src, checkpoint_id)
-        if os.path.exists(dst):
-            results[ppid] = "artifact-exists"
-            continue
-        if not os.path.isfile(src):
-            results[ppid] = "checkpoint-missing"
-            continue
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=os.path.dirname(dst),
-            prefix="." + os.path.basename(dst) + "-",
-            suffix=".tmp",
+        results[ppid] = _preserve_round_artifact_path(
+            _checkpoint_path_for_ppid(ppid), checkpoint_id
         )
-        try:
-            with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
-                shutil.copyfileobj(inp, out)
-                out.flush()
-                os.fsync(out.fileno())
-            os.replace(tmp, dst)
-            bind_restore_checkpoint(src, checkpoint_id, dst)
-            _write_status(
-                src,
-                {
-                    "checkpointID": checkpoint_id,
-                    "artifactPath": dst,
-                    "state": "CheckpointReady",
-                    "globalStep": _read_checkpoint_global_step(src) or 0,
-                },
-            )
-            results[ppid] = "artifact-preserved"
-        except Exception as exc:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            results[ppid] = f"artifact-error: {exc}"
     return results
 
 
@@ -585,6 +656,32 @@ def runtime_status() -> Dict:
         payload["iterationTimeSeconds"] = status["iterationTimeSeconds"]
     if "checkpointDurationSeconds" in status:
         payload["checkpointDurationSeconds"] = status["checkpointDurationSeconds"]
+    try:
+        from fluidcr.distributed import read_survivor_proof
+
+        proof = read_survivor_proof()
+    except Exception:
+        proof = {}
+    if proof and proof.get("state") in ("SurvivorParked", "SurvivorPaused"):
+        identity = _require_pod_identity()
+        if proof.get("podUID") != identity["podUID"]:
+            raise ValueError("runtime survivor proof podUID does not match current pod")
+        if proof.get("rank") != rank:
+            raise ValueError("runtime survivor proof rank does not match current pod")
+        lock = str(proof.get("pauseLockPath") or "")
+        pid = int(proof.get("pid") or proof.get("pauseLockPID") or 0)
+        if not lock or not os.path.exists(lock):
+            raise ValueError("runtime survivor pause-lock proof is missing")
+        if pid <= 0:
+            raise ValueError("runtime survivor proof missing pid")
+        payload["checkpointID"] = proof.get("checkpointID", payload["checkpointID"])
+        payload["phase"] = "SurvivorPaused"
+        payload["survivorEvidence"] = {
+            "generation": proof.get("generation"),
+            "pauseLockPath": lock,
+            "pauseLockPID": pid,
+            "observedAt": proof.get("observedAt", ""),
+        }
     return payload
 
 
@@ -662,7 +759,11 @@ def _parse_rank_spec(spec: str):
 
 
 def checkpoint_ranks(
-    targets, *, _workers=None, checkpoint_id: Optional[str] = None
+    targets,
+    *,
+    _workers=None,
+    checkpoint_id: Optional[str] = None,
+    restore_owned_resume: bool = False,
 ) -> Dict[int, str]:
     """Declare a coordinated action: write the manifest, then trigger it.
 
@@ -679,8 +780,14 @@ def checkpoint_ranks(
     from fluidcr.distributed import bump_generation, write_manifest
 
     checkpoint_id = _validate_checkpoint_id(checkpoint_id)
-    bump_generation()
-    write_manifest(targets)
+    generation = bump_generation()
+    manifest_kwargs = {
+        "checkpoint_id": checkpoint_id,
+        "restore_owned_resume": restore_owned_resume,
+    }
+    if restore_owned_resume:
+        manifest_kwargs["generation"] = generation
+    write_manifest(targets, **manifest_kwargs)
     workers = registered_worker_pids() if _workers is None else _workers
     if checkpoint_id:
         for launcher_pid in workers:
@@ -703,34 +810,191 @@ def checkpoint_ranks(
     return results
 
 
+def _app_checkpoint_evidence_for_path(
+    checkpoint_path: str, checkpoint_id: str
+) -> Dict[str, Any]:
+    status = _read_status(checkpoint_path)
+    artifact = str(status.get("artifactPath") or "").strip()
+    identity = _require_pod_identity()
+    if status.get("checkpointID") != checkpoint_id:
+        raise ValueError("app checkpoint evidence missing requested checkpointID")
+    if status.get("state") != "CheckpointReady":
+        raise ValueError("app checkpoint evidence is not CheckpointReady")
+    if not artifact or not os.path.isfile(artifact):
+        raise ValueError("app checkpoint artifact evidence is missing")
+    return {
+        **identity,
+        "rank": _env_int("RANK"),
+        "checkpointID": checkpoint_id,
+        "phase": "AppCheckpointReady",
+        "globalStep": int(status.get("globalStep", 0) or 0),
+        "observedAt": status.get("observedAt", ""),
+        "appArtifact": {
+            "path": artifact,
+            "sha256": _sha256_file(artifact),
+        },
+    }
+
+
+def _app_checkpoint_evidence(parent: int, checkpoint_id: str) -> Dict[str, Any]:
+    return _app_checkpoint_evidence_for_path(
+        _checkpoint_path_for_ppid(parent), checkpoint_id
+    )
+
+
+def _app_checkpoint_ready_for_path(checkpoint_path: str, checkpoint_id: str) -> bool:
+    try:
+        _app_checkpoint_evidence_for_path(checkpoint_path, checkpoint_id)
+        return True
+    except ValueError:
+        return False
+
+
+def _app_checkpoint_ready(parent: int, checkpoint_id: str) -> bool:
+    try:
+        _app_checkpoint_evidence(parent, checkpoint_id)
+        return True
+    except ValueError:
+        return False
+
+
+def _survivor_evidence(checkpoint_id: str, rank: int) -> Dict[str, Any]:
+    from fluidcr.distributed import read_survivor_proof
+
+    proof = read_survivor_proof()
+    if proof.get("checkpointID") != checkpoint_id:
+        raise ValueError("survivor proof missing requested checkpointID")
+    if proof.get("rank") != rank:
+        raise ValueError("survivor proof rank does not match this pod")
+    if proof.get("state") not in ("SurvivorParked", "SurvivorPaused"):
+        raise ValueError("survivor is not parked")
+    if not proof.get("podUID"):
+        raise ValueError("survivor proof missing podUID")
+    identity = _require_pod_identity()
+    if proof.get("podUID") != identity["podUID"]:
+        raise ValueError("survivor proof podUID does not match current pod")
+    lock = str(proof.get("pauseLockPath") or "")
+    if not lock or not os.path.exists(lock):
+        raise ValueError("survivor pause-lock proof is missing")
+    pid = int(proof.get("pid") or 0)
+    if pid <= 0:
+        raise ValueError("survivor proof missing pid")
+    if os.path.isdir("/proc") and not os.path.exists(os.path.join("/proc", str(pid))):
+        raise ValueError("survivor pid is not live")
+    return {
+        **identity,
+        "rank": rank,
+        "checkpointID": checkpoint_id,
+        "phase": "SurvivorPaused",
+        "survivorEvidence": {
+            "generation": proof.get("generation"),
+            "pauseLockPath": lock,
+            "pauseLockPID": pid,
+            "observedAt": proof.get("observedAt", ""),
+        },
+    }
+
+
+def _wait_for_survivor_evidence(
+    checkpoint_id: str, rank: int, timeout: float
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_error = "survivor proof missing"
+    while time.monotonic() < deadline:
+        try:
+            return _survivor_evidence(checkpoint_id, rank)
+        except ValueError as exc:
+            last_error = str(exc)
+        time.sleep(min(max(_CHECKPOINT_WAIT_INTERVAL, 0.01), 1.0))
+    raise ValueError(last_error)
+
+
 def checkpoint_ranks_and_wait(
-    targets, timeout: float, checkpoint_id: Optional[str] = None
-) -> Dict[int, str]:
-    """Confirm local whole-workload checkpoints through new launcher locks."""
-    if targets != "all":
-        raise ValueError("wait requires ranks=all")
+    targets,
+    timeout: float,
+    checkpoint_id: Optional[str] = None,
+    restore_owned_resume: bool = False,
+    contract: bool = False,
+):
+    """Confirm local checkpoint/survivor evidence for a coordinated round."""
+    partial = targets != "all"
+    if partial:
+        if not checkpoint_id:
+            raise ValueError("partial wait requires checkpointID")
+        restore_owned_resume = True
+        if 0 in [int(r) for r in targets]:
+            raise ValueError("partial rank0 target restore is unsupported")
     if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
         raise ValueError("timeoutSeconds must be between 0 and 300")
     if not _checkpoint_lock.acquire(blocking=False):
         raise ValueError("checkpoint already in progress")
     try:
         checkpoint_id = _validate_checkpoint_id(checkpoint_id)
+        if partial:
+            rank, world_size = _local_rank_world()
+        else:
+            rank, world_size = _env_int("RANK"), _env_int("WORLD_SIZE")
         registry = registered_worker_pids()
         workers = {
             launcher: worker for launcher, worker in registry.items()
             if _pid_uses_gpu(worker)
         }
+        round_already_claimed = False
+        if checkpoint_id:
+            round_already_claimed = os.path.exists(_round_trigger_path(checkpoint_id))
         if not workers:
+            if partial and rank in targets and checkpoint_id and round_already_claimed:
+                from fluidcr.distributed import read_manifest
+
+                manifest = read_manifest()
+                if manifest.get("checkpointID") != checkpoint_id:
+                    raise ValueError("checkpointID round marker conflicts with manifest")
+                if not _targets_equal(manifest.get("targets", "all"), targets):
+                    raise ValueError("checkpointID round marker conflicts with targets")
+                if not manifest.get("restoreOwnedResume"):
+                    raise ValueError("checkpointID round is not restore-owned")
+                checkpoint_path = _default_checkpoint_path()
+                if not _app_checkpoint_ready_for_path(checkpoint_path, checkpoint_id):
+                    lock_path = os.path.join(os.path.dirname(checkpoint_path), "lock")
+                    if os.path.exists(lock_path):
+                        artifact_status = _preserve_round_artifact_path(
+                            checkpoint_path, checkpoint_id
+                        )
+                        if artifact_status not in ("artifact-preserved", "artifact-exists"):
+                            raise ValueError(artifact_status)
+                evidence = _app_checkpoint_evidence_for_path(
+                    checkpoint_path, checkpoint_id
+                )
+                payload = {
+                    "results": {"replay": "checkpoint-ready"},
+                    "checkpointID": checkpoint_id,
+                    "targetRanks": [int(r) for r in targets],
+                    "partial": True,
+                    "rank": rank,
+                    "worldSize": world_size,
+                    "restoreOwnedResume": True,
+                    "noPeriodicResume": True,
+                    "appCheckpointEvidence": {str(rank): evidence},
+                    "survivorEvidence": {},
+                }
+                return payload if contract else payload["results"]
             raise ValueError("no local GPU workers registered")
         if len(set(workers.values())) != len(workers):
             raise ValueError("ambiguous worker-to-launcher registry")
         paths = [_lock_path_for_ppid(parent) for parent in workers]
         if len(set(paths)) != len(paths):
             raise ValueError("multiple launchers share one checkpoint lock path")
-        if any(os.path.lexists(path) for path in paths):
+        if not round_already_claimed and any(os.path.lexists(path) for path in paths):
             raise ValueError("stale checkpoint lock exists; resume before checkpoint")
-        if checkpoint_id:
-            for parent in workers:
+        if partial:
+            pause_path = os.path.join(os.path.dirname(_default_checkpoint_path()), "pause-lock")
+            if not round_already_claimed and os.path.lexists(pause_path):
+                raise ValueError("stale survivor pause-lock exists; resume before checkpoint")
+        if checkpoint_id and not round_already_claimed:
+            target_parents = (
+                workers if not partial or rank in targets else {}
+            )
+            for parent in target_parents:
                 artifact = _round_artifact_path(
                     _checkpoint_path_for_ppid(parent), checkpoint_id
                 )
@@ -740,21 +1004,59 @@ def checkpoint_ranks_and_wait(
         # Keep the generation/manifest protocol and one registry snapshot
         # for both signalling and parent-lock confirmation.
         started = time.monotonic()
-        results = checkpoint_ranks(
-            targets, _workers=workers, checkpoint_id=checkpoint_id
-        )
+        should_trigger = True
+        if checkpoint_id:
+            should_trigger = _try_claim_round_trigger(checkpoint_id)
+        if should_trigger:
+            results = checkpoint_ranks(
+                targets,
+                _workers=workers,
+                checkpoint_id=checkpoint_id,
+                restore_owned_resume=restore_owned_resume,
+            )
+        else:
+            from fluidcr.distributed import read_manifest
+
+            manifest = read_manifest()
+            if manifest.get("checkpointID") != checkpoint_id:
+                raise ValueError("checkpointID round marker conflicts with manifest")
+            if not _targets_equal(manifest.get("targets", "all"), targets):
+                raise ValueError("checkpointID round marker conflicts with targets")
+            if partial and not manifest.get("restoreOwnedResume"):
+                raise ValueError("checkpointID round is not restore-owned")
+            results = {worker: "round-already-triggered" for worker in workers.values()}
         parents = [
             parent for parent, worker in workers.items()
             if results.get(worker) == "checkpoint-signalled"
         ]
-        statuses = _wait_for_parent_locks(parents, timeout=timeout)
+        replay_parents = [
+            parent for parent, worker in workers.items()
+            if results.get(worker) == "round-already-triggered"
+        ]
+        wait_for_targets = parents
+        if checkpoint_id:
+            wait_for_targets = wait_for_targets + [
+                parent for parent in replay_parents
+                if not _app_checkpoint_ready(parent, checkpoint_id)
+            ]
+        if partial and rank not in targets:
+            wait_for_targets = []
+        statuses = _wait_for_parent_locks(wait_for_targets, timeout=timeout)
         preserved: Dict[int, str] = {}
         ready_parents = [
             parent for parent in parents
             if statuses.get(parent) == "lock-ready"
         ]
+        ready_replay_parents = [
+            parent for parent in replay_parents
+            if statuses.get(parent) == "lock-ready"
+        ]
         if checkpoint_id and ready_parents:
             preserved = _preserve_round_artifacts(ready_parents, checkpoint_id)
+        if checkpoint_id and ready_replay_parents:
+            preserved.update(
+                _preserve_round_artifacts(ready_replay_parents, checkpoint_id)
+            )
         for parent, worker in workers.items():
             if results.get(worker) == "checkpoint-signalled":
                 status = statuses.get(parent, "timeout-waiting-lock")
@@ -781,7 +1083,44 @@ def checkpoint_ranks_and_wait(
                             "globalStep": _read_checkpoint_global_step(checkpoint_path) or 0,
                         },
                     )
-        return results
+            elif results.get(worker) == "round-already-triggered" and checkpoint_id:
+                if _app_checkpoint_ready(parent, checkpoint_id):
+                    results[worker] = "checkpoint-ready"
+                else:
+                    status = statuses.get(parent, "timeout-waiting-lock")
+                    artifact_status = preserved.get(parent)
+                    results[worker] = (
+                        "checkpoint-ready"
+                        if artifact_status in ("artifact-preserved", "artifact-exists")
+                        else artifact_status or status
+                    )
+        payload: Dict[str, Any] = {"results": results}
+        if partial:
+            app_checkpoint_evidence: Dict[str, Any] = {}
+            survivor_evidence: Dict[str, Any] = {}
+            if rank in targets:
+                for parent in workers:
+                    app_checkpoint_evidence[str(rank)] = _app_checkpoint_evidence(
+                        parent, checkpoint_id or ""
+                    )
+            else:
+                survivor_evidence[str(rank)] = _wait_for_survivor_evidence(
+                    checkpoint_id or "", rank, timeout
+                )
+                results = {worker: "survivor-parked" for worker in workers.values()}
+                payload["results"] = results
+            payload.update({
+                "checkpointID": checkpoint_id,
+                "targetRanks": [int(r) for r in targets],
+                "partial": True,
+                "rank": rank,
+                "worldSize": world_size,
+                "restoreOwnedResume": True,
+                "noPeriodicResume": True,
+                "appCheckpointEvidence": app_checkpoint_evidence,
+                "survivorEvidence": survivor_evidence,
+            })
+        return payload if contract else payload["results"]
     finally:
         _checkpoint_lock.release()
 
@@ -814,6 +1153,15 @@ def pending_ppids() -> List[int]:
     return sorted(set(ppids))
 
 
+def _restore_owned_manifest_active() -> bool:
+    try:
+        from fluidcr.distributed import read_manifest
+
+        return bool(read_manifest().get("restoreOwnedResume"))
+    except Exception:
+        return False
+
+
 def resume_ppids(ppids: List[int]) -> Dict[int, str]:
     """Remove lock files for the given PPIDs to allow resume.
 
@@ -821,6 +1169,8 @@ def resume_ppids(ppids: List[int]) -> Dict[int, str]:
     ``FLUIDCR_CHECKPOINT_PATH``.  Use only for legacy single-pod setups
     where the lock lives at ``/checkpoint/<ppid>/lock``.
     """
+    if _restore_owned_manifest_active():
+        raise ValueError("restore-owned partial round requires scoped restore resume")
     results: Dict[int, str] = {}
     for ppid in ppids:
         lock_path = os.path.join(_BASE_DIR, str(ppid), "lock")
@@ -835,7 +1185,38 @@ def resume_ppids(ppids: List[int]) -> Dict[int, str]:
     return results
 
 
-def resume_all_pending() -> Dict[str, str]:
+def _validate_restore_owned_resume(
+    manifest: Dict[str, Any],
+    *,
+    checkpoint_id: Optional[str],
+    generation: Optional[int],
+    restore_owned_resume: bool,
+) -> Optional[Dict[str, str]]:
+    if not manifest.get("restoreOwnedResume"):
+        return None
+    if not restore_owned_resume:
+        raise ValueError("restore-owned partial round requires explicit restore resume")
+    if not checkpoint_id:
+        raise ValueError("restore-owned resume requires checkpointID")
+    if generation is None:
+        raise ValueError("restore-owned resume requires generation")
+    if manifest.get("checkpointID") != checkpoint_id:
+        raise ValueError("restore-owned resume checkpointID mismatch")
+    try:
+        manifest_generation = int(manifest.get("generation"))
+    except (TypeError, ValueError):
+        raise ValueError("restore-owned manifest missing generation")
+    if manifest_generation != int(generation):
+        raise ValueError("restore-owned resume generation mismatch")
+    return None
+
+
+def resume_all_pending(
+    *,
+    checkpoint_id: Optional[str] = None,
+    generation: Optional[int] = None,
+    restore_owned_resume: bool = False,
+) -> Dict[str, str]:
     """Remove every pending lock, pause-lock, and the migration manifest.
 
     Globs under BOTH the ctrl base dir and the shared checkpoint base
@@ -853,7 +1234,18 @@ def resume_all_pending() -> Dict[str, str]:
 
     Returns a mapping of removed path -> status.
     """
-    from fluidcr.distributed import manifest_path, _base_dir
+    from fluidcr.distributed import manifest_path, read_manifest, _base_dir
+
+    manifest = read_manifest()
+    if manifest.get("restoreOwnedResume"):
+        _validate_restore_owned_resume(
+            manifest,
+            checkpoint_id=checkpoint_id,
+            generation=generation,
+            restore_owned_resume=restore_owned_resume,
+        )
+    elif restore_owned_resume and checkpoint_id and generation is not None:
+        return {manifest_path(): "already-complete"}
 
     bases: List[str] = []
     for base in (_BASE_DIR, _base_dir()):
@@ -936,19 +1328,25 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
         ranks = payload.get("ranks")  # "all" | [ints] | None
         wait = payload.get("wait", False)
         checkpoint_id = payload.get("checkpointID")
+        restore_owned_resume = bool(payload.get("restoreOwnedResume", False))
         if not isinstance(wait, bool):
             self._send_json(400, {"error": "wait must be a boolean"})
             return
         if wait:
-            if pids or ranks not in (None, "all"):
-                self._send_json(400, {"error": "wait supports only ranks=all"})
+            if pids:
+                self._send_json(400, {"error": "wait does not support pids"})
                 return
             try:
                 timeout = payload.get("timeoutSeconds", _CHECKPOINT_WAIT_TIMEOUT)
                 if isinstance(timeout, bool):
                     raise ValueError("timeoutSeconds must be numeric")
-                results = checkpoint_ranks_and_wait(
-                    "all", float(timeout), checkpoint_id=checkpoint_id
+                targets = "all" if ranks in (None, "all") else [int(r) for r in ranks]
+                response = checkpoint_ranks_and_wait(
+                    targets,
+                    float(timeout),
+                    checkpoint_id=checkpoint_id,
+                    restore_owned_resume=restore_owned_resume,
+                    contract=targets != "all",
                 )
             except (ValueError, TypeError) as exc:
                 self._send_json(400, {"error": str(exc)})
@@ -956,7 +1354,11 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
                 return
-            self._send_json(200, {"results": results})
+            self._send_json(
+                200,
+                response if isinstance(response, dict) and "partial" in response
+                else {"results": response},
+            )
             return
 
         if pids and ranks is not None:
@@ -992,6 +1394,18 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
         payload = self._read_json()
         ppids = payload.get("ppids") or []
         all_flag = bool(payload.get("all"))
+        checkpoint_id = payload.get("checkpointID")
+        generation = payload.get("generation")
+        restore_owned_resume = bool(payload.get("restoreOwnedResume", False))
+
+        if generation is not None:
+            try:
+                if isinstance(generation, bool):
+                    raise ValueError
+                generation = int(generation)
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "generation must be an integer"})
+                return
 
         if ppids and all_flag:
             self._send_json(
@@ -1000,14 +1414,26 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
             return
 
         if all_flag:
-            results = resume_all_pending()
+            try:
+                results = resume_all_pending(
+                    checkpoint_id=checkpoint_id,
+                    generation=generation,
+                    restore_owned_resume=restore_owned_resume,
+                )
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
         else:
             try:
                 ppid_ints = [int(p) for p in ppids]
             except Exception:
                 self._send_json(400, {"error": "invalid 'ppids' payload"})
                 return
-            results = resume_ppids(ppid_ints)
+            try:
+                results = resume_ppids(ppid_ints)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
 
         self._send_json(200, {"results": results})
 
@@ -1167,7 +1593,10 @@ def main_cli(argv: Optional[List[str]] = None) -> int:
             for path, status in results.items():
                 print(f"{path}: {status}")
         elif args.ppids:
-            ppid_results = resume_ppids(args.ppids)
+            try:
+                ppid_results = resume_ppids(args.ppids)
+            except ValueError as exc:
+                parser.error(f"resume: {exc}")
             for ppid, status in ppid_results.items():
                 print(f"PPID {ppid}: {status}")
         else:

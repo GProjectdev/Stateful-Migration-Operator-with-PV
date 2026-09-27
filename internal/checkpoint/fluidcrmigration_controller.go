@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,18 +48,22 @@ const (
 	// paused workload before the resource disappears.
 	FinalizerName = "fluidcrmigration.fluidcr.dcnlab.com/finalizer"
 
-	conditionReady         = "Ready"
-	defaultTimeoutSecs     = 300
-	waitRequeueInterval    = 15 * time.Second
-	statusUpdateAttempts   = 5
-	AnnotationCheckpointID = "training.dcnlab.com/checkpoint-id"
-	LabelWorkloadUID       = "training.dcnlab.com/workload-uid"
+	conditionReady               = "Ready"
+	defaultTimeoutSecs           = 300
+	waitRequeueInterval          = 15 * time.Second
+	statusUpdateAttempts         = 5
+	AnnotationCheckpointID       = "training.dcnlab.com/checkpoint-id"
+	AnnotationRestoreOwnedResume = "training.dcnlab.com/restore-owned-resume"
+	LabelWorkloadUID             = "training.dcnlab.com/workload-uid"
 )
 
 // CtrlAPI is the subset of the in-pod FluidCR control API the controller uses.
 type CtrlAPI interface {
 	Checkpoint(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string) (map[string]string, error)
+	CheckpointRanks(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string, ranks []int64) (map[string]string, error)
+	Runtime(ctx context.Context, podIP string, port int, timeout time.Duration) (ctrlapi.RuntimeStatus, error)
 	Resume(ctx context.Context, podIP string, port int, timeout time.Duration) (map[string]string, error)
+	ResumeOwned(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string, generation int64) (map[string]string, error)
 }
 
 // KubeletAPI is the subset of the kubelet checkpoint API the controller uses.
@@ -84,7 +90,10 @@ type target struct {
 	hostIP    string
 	container string
 	port      int
+	rank      int64
 }
+
+var statefulOrdinal = regexp.MustCompile(`^(.*)-([0-9]+)$`)
 
 // +kubebuilder:rbac:groups=fluidcr.dcnlab.com,resources=fluidcrmigrations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=fluidcr.dcnlab.com,resources=fluidcrmigrations/status,verbs=get;update;patch
@@ -115,13 +124,125 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Single-shot: do nothing once terminal for the current spec generation.
+	if restoreOwnedResumeRequested(&migration) && restoreOwnedResumePending(&migration) {
+		return r.reconcileRestoreOwnedResume(ctx, &migration)
+	}
+
+	// Single-shot once terminal for the current spec generation.
 	if isTerminalPhase(migration.Status.Phase) && migration.Status.ObservedGeneration == migration.Generation {
 		return ctrl.Result{}, nil
 	}
 
 	log.Info("reconciling FluidCRMigration", "workload", migration.Spec.WorkloadRef.Name, "phase", migration.Status.Phase)
 	return r.reconcileWorkflow(ctx, &migration)
+}
+
+func (r *FluidCRMigrationReconciler) reconcileRestoreOwnedResume(ctx context.Context, m *fluidcrv1alpha1.FluidCRMigration) (ctrl.Result, error) {
+	if m.Spec.PartialCheckpoint == nil {
+		return r.markFailed(ctx, m, "restore-owned resume requires partial checkpoint status")
+	}
+	checkpointID, err := checkpointIDFor(m)
+	if err != nil {
+		return r.markFailed(ctx, m, err.Error())
+	}
+	pods, err := r.resolveTargetPods(ctx, m)
+	if err != nil {
+		return r.markWaiting(ctx, m, fmt.Sprintf("waiting for survivor pods before restore-owned resume: %v", err))
+	}
+	byName := map[string]corev1.Pod{}
+	for i := range pods {
+		byName[pods[i].Name] = pods[i]
+	}
+	var release []target
+	var generation int64
+	for i := range m.Status.Pods {
+		ps := &m.Status.Pods[i]
+		if ps.Phase != fluidcrv1alpha1.PodPhaseSurvivorPaused {
+			continue
+		}
+		if ps.SurvivorEvidence == nil || ps.SurvivorEvidence.Generation <= 0 {
+			return r.markFailed(ctx, m, "survivor generation evidence missing before restore-owned resume")
+		}
+		if generation == 0 {
+			generation = ps.SurvivorEvidence.Generation
+		} else if generation != ps.SurvivorEvidence.Generation {
+			return r.markFailed(ctx, m, "survivor generations differ before restore-owned resume")
+		}
+		pod, ok := byName[ps.PodName]
+		if !ok || string(pod.UID) != ps.PodUID {
+			return r.markWaiting(ctx, m, "waiting for UID-matched survivor pod before restore-owned resume")
+		}
+		container, err := resolveContainerName(&pod, m.Spec.Container)
+		if err != nil {
+			return r.markFailed(ctx, m, err.Error())
+		}
+		port := resolveCtrlPort(&pod, container, m.Spec.CtrlPort)
+		if err := r.validateLiveSurvivorEvidence(ctx, ps, &pod, port, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID); err != nil {
+			return r.markWaiting(ctx, m, fmt.Sprintf("waiting for live survivor evidence before restore-owned resume: %v", err))
+		}
+		release = append(release, target{podUID: pod.UID, podName: pod.Name, namespace: pod.Namespace, podIP: pod.Status.PodIP, hostIP: pod.Status.HostIP, container: container, port: port, rank: ps.Rank})
+	}
+	if len(release) == 0 {
+		return ctrl.Result{}, nil
+	}
+	m.Status.Phase = fluidcrv1alpha1.PhaseResuming
+	m.Status.Message = fmt.Sprintf("restore-owned scoped resume for %d survivor pod(s)", len(release))
+	if err := r.saveStatus(ctx, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	outcomes := r.resumeOwned(ctx, release, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID, generation)
+	var errs []string
+	for _, t := range release {
+		ps := getPodStatus(m, t.podName)
+		if err := outcomes[t.podName]; err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", t.podName, err))
+			if ps != nil {
+				ps.Message = fmt.Sprintf("restore-owned resume: %v", err)
+			}
+			continue
+		}
+		if ps != nil {
+			ps.Phase = fluidcrv1alpha1.PodPhaseResumed
+			ps.Message = "restore-owned survivor release completed"
+		}
+	}
+	if len(errs) > 0 {
+		return r.markWaiting(ctx, m, "restore-owned resume retry pending: "+strings.Join(errs, "; "))
+	}
+	now := metav1.Now()
+	m.Status.CompletionTime = &now
+	m.Status.Phase = fluidcrv1alpha1.PhaseCompleted
+	m.Status.Message = "checkpoint completed; restore-owned survivors resumed after target replacement"
+	setReadyCondition(m, metav1.ConditionTrue, "RestoreOwnedResumeCompleted", m.Status.Message)
+	return ctrl.Result{}, r.saveStatus(ctx, m)
+}
+
+func (r *FluidCRMigrationReconciler) validateLiveSurvivorEvidence(ctx context.Context, ps *fluidcrv1alpha1.PodMigrationStatus, pod *corev1.Pod, port int, timeout time.Duration, checkpointID string) error {
+	if ps == nil || ps.SurvivorEvidence == nil {
+		return fmt.Errorf("survivor status evidence missing")
+	}
+	status, err := r.CtrlClient.Runtime(ctx, pod.Status.PodIP, port, timeout)
+	if err != nil {
+		return err
+	}
+	if status.Rank != ps.Rank {
+		return fmt.Errorf("runtime rank mismatch: got %d want %d", status.Rank, ps.Rank)
+	}
+	if status.CheckpointID != checkpointID {
+		return fmt.Errorf("runtime checkpointID mismatch")
+	}
+	evidence := status.SurvivorEvidence
+	if evidence.Generation == 0 && strings.TrimSpace(evidence.PauseLockPath) == "" && evidence.PauseLockPID == 0 {
+		state := strings.ToLower(strings.TrimSpace(status.State))
+		if state == "running" || state == "resumed" {
+			return nil
+		}
+		return fmt.Errorf("runtime survivor pause-lock evidence missing")
+	}
+	if evidence.Generation != ps.SurvivorEvidence.Generation || evidence.PauseLockPath != ps.SurvivorEvidence.PauseLockPath || evidence.PauseLockPID != ps.SurvivorEvidence.PauseLockPID || strings.TrimSpace(evidence.ObservedAt) == "" {
+		return fmt.Errorf("runtime survivor pause-lock evidence mismatch")
+	}
+	return nil
 }
 
 // reconcileWorkflow advances a migration through its phases in a single pass,
@@ -132,6 +253,10 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 	}
 	if r.CtrlClient == nil || r.KubeletClient == nil {
 		return ctrl.Result{}, fmt.Errorf("checkpoint clients must be configured in the member process")
+	}
+	partialTargets, partial, err := partialTargetSet(m)
+	if err != nil {
+		return r.markFailed(ctx, m, err.Error())
 	}
 
 	pods, err := r.resolveTargetPods(ctx, m)
@@ -157,6 +282,10 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 	}
 	for i := range pods {
 		pod := &pods[i]
+		rank, err := resolvePodRank(m, pod)
+		if err != nil {
+			return r.markFailed(ctx, m, err.Error())
+		}
 		container, err := resolveContainerName(pod, m.Spec.Container)
 		if err != nil {
 			// Configuration error: terminal.
@@ -165,6 +294,7 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 		port := resolveCtrlPort(pod, container, m.Spec.CtrlPort)
 		ps := ensurePodStatus(m, pod.Name, pod.Spec.NodeName, pod.Status.PodIP)
 		ps.PodUID = string(pod.UID)
+		ps.Rank = rank
 		if ps.Phase == "" {
 			ps.Phase = fluidcrv1alpha1.PodPhasePending
 		}
@@ -176,7 +306,11 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 			hostIP:    pod.Status.HostIP,
 			container: container,
 			port:      port,
+			rank:      rank,
 		})
+	}
+	if partial && !targetRanksPresent(targets, partialTargets) {
+		return r.markFailed(ctx, m, "partial checkpoint target ranks do not match eligible pods")
 	}
 
 	if m.Status.StartTime == nil {
@@ -185,8 +319,10 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 	}
 	m.Status.ObservedGeneration = m.Generation
 
-	// Phase 1: application checkpoint (concurrent fan-out is mandatory so
-	// distributed-training ranks do not deadlock on a collective barrier).
+	// Phase 1: application checkpoint (concurrent fan-out is mandatory for full
+	// checkpoints so distributed-training ranks do not deadlock on a collective
+	// barrier). Partial checkpoints trigger the manifest once; the runtime role
+	// split makes target ranks exit and survivors park.
 	appTargets := filterTargets(targets, m, func(ps *fluidcrv1alpha1.PodMigrationStatus) bool {
 		return ps.Phase == fluidcrv1alpha1.PodPhasePending
 	})
@@ -200,18 +336,43 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 		if err := r.saveStatus(ctx, m); err != nil {
 			return ctrl.Result{}, err
 		}
-		outcomes := r.appCheckpoint(ctx, appTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID)
-		for _, t := range appTargets {
-			ps := getPodStatus(m, t.podName)
-			oc := outcomes[t.podName]
-			if oc.err != nil {
-				ps.Phase = fluidcrv1alpha1.PodPhaseFailed
-				ps.Message = fmt.Sprintf("app checkpoint: %v", oc.err)
-				continue
+		if partial {
+			outcomes := r.partialAppCheckpoint(ctx, appTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID, m.Spec.PartialCheckpoint.TargetRanks)
+			for _, t := range appTargets {
+				ps := getPodStatus(m, t.podName)
+				oc := outcomes[t.podName]
+				if oc.err != nil {
+					ps.Phase = fluidcrv1alpha1.PodPhaseFailed
+					ps.Message = fmt.Sprintf("partial app checkpoint: %v", oc.err)
+					continue
+				}
+				ps.AppCheckpointResult = oc.summary
+				if partialTargets[t.rank] {
+					ps.Phase = fluidcrv1alpha1.PodPhaseAppCheckpointed
+				} else {
+					if err := r.recordSurvivorEvidence(ctx, t, ps, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds)); err != nil {
+						ps.Phase = fluidcrv1alpha1.PodPhaseFailed
+						ps.Message = fmt.Sprintf("survivor evidence: %v", err)
+						continue
+					}
+					ps.Phase = fluidcrv1alpha1.PodPhaseSurvivorPaused
+				}
+				ps.Message = ""
 			}
-			ps.Phase = fluidcrv1alpha1.PodPhaseAppCheckpointed
-			ps.AppCheckpointResult = oc.summary
-			ps.Message = ""
+		} else {
+			outcomes := r.appCheckpoint(ctx, appTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID)
+			for _, t := range appTargets {
+				ps := getPodStatus(m, t.podName)
+				oc := outcomes[t.podName]
+				if oc.err != nil {
+					ps.Phase = fluidcrv1alpha1.PodPhaseFailed
+					ps.Message = fmt.Sprintf("app checkpoint: %v", oc.err)
+					continue
+				}
+				ps.Phase = fluidcrv1alpha1.PodPhaseAppCheckpointed
+				ps.AppCheckpointResult = oc.summary
+				ps.Message = ""
+			}
 		}
 		if err := r.saveStatus(ctx, m); err != nil {
 			return ctrl.Result{}, err
@@ -224,7 +385,8 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 	if !appFailed {
 		ckptTargets := filterTargets(targets, m, func(ps *fluidcrv1alpha1.PodMigrationStatus) bool {
 			return podRank(ps.Phase) >= podRank(fluidcrv1alpha1.PodPhaseAppCheckpointed) &&
-				podRank(ps.Phase) < podRank(fluidcrv1alpha1.PodPhaseContainerCheckpointed)
+				podRank(ps.Phase) < podRank(fluidcrv1alpha1.PodPhaseContainerCheckpointed) &&
+				(!partial || partialTargets[ps.Rank])
 		})
 		if len(ckptTargets) > 0 {
 			m.Status.Phase = fluidcrv1alpha1.PhaseContainerCheckpointing
@@ -383,6 +545,47 @@ func (r *FluidCRMigrationReconciler) appCheckpoint(ctx context.Context, targets 
 	return out
 }
 
+func (r *FluidCRMigrationReconciler) partialAppCheckpoint(ctx context.Context, targets []target, timeout time.Duration, checkpointID string, ranks []int64) map[string]appOutcome {
+	out := make(map[string]appOutcome, len(targets))
+	if len(targets) == 0 {
+		return out
+	}
+	trigger := targets[0]
+	for _, t := range targets {
+		if t.rank == ranks[0] {
+			trigger = t
+			break
+		}
+	}
+	results, err := r.CtrlClient.CheckpointRanks(ctx, trigger.podIP, trigger.port, timeout, checkpointID, ranks)
+	summary := ctrlapi.SummarizeResults(results)
+	for _, t := range targets {
+		out[t.podName] = appOutcome{summary: summary, err: err}
+	}
+	return out
+}
+
+func (r *FluidCRMigrationReconciler) recordSurvivorEvidence(ctx context.Context, t target, ps *fluidcrv1alpha1.PodMigrationStatus, timeout time.Duration) error {
+	status, err := r.CtrlClient.Runtime(ctx, t.podIP, t.port, timeout)
+	if err != nil {
+		return err
+	}
+	if status.Rank != t.rank {
+		return fmt.Errorf("runtime rank mismatch: got %d want %d", status.Rank, t.rank)
+	}
+	evidence := status.SurvivorEvidence
+	if evidence.Generation <= 0 || strings.TrimSpace(evidence.PauseLockPath) == "" || evidence.PauseLockPID <= 0 || strings.TrimSpace(evidence.ObservedAt) == "" {
+		return fmt.Errorf("survivor pause evidence missing")
+	}
+	ps.SurvivorEvidence = &fluidcrv1alpha1.SurvivorEvidence{
+		Generation:    evidence.Generation,
+		PauseLockPath: evidence.PauseLockPath,
+		PauseLockPID:  evidence.PauseLockPID,
+		ObservedAt:    evidence.ObservedAt,
+	}
+	return nil
+}
+
 // containerCheckpoint invokes the kubelet CRIU checkpoint API on every target.
 func (r *FluidCRMigrationReconciler) containerCheckpoint(ctx context.Context, targets []target, timeout time.Duration) map[string]ckptOutcome {
 	out := make(map[string]ckptOutcome, len(targets))
@@ -423,6 +626,28 @@ func (r *FluidCRMigrationReconciler) resume(ctx context.Context, targets []targe
 			err := r.validateTarget(ctx, t)
 			if err == nil {
 				_, err = r.CtrlClient.Resume(ctx, t.podIP, t.port, timeout)
+			}
+			mu.Lock()
+			out[t.podName] = err
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+func (r *FluidCRMigrationReconciler) resumeOwned(ctx context.Context, targets []target, timeout time.Duration, checkpointID string, generation int64) map[string]error {
+	out := make(map[string]error, len(targets))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := range targets {
+		t := targets[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := r.validateTarget(ctx, t)
+			if err == nil {
+				_, err = r.CtrlClient.ResumeOwned(ctx, t.podIP, t.port, timeout, checkpointID, generation)
 			}
 			mu.Lock()
 			out[t.podName] = err
@@ -717,6 +942,58 @@ func filterTargets(targets []target, m *fluidcrv1alpha1.FluidCRMigration, keep f
 	return out
 }
 
+func partialTargetSet(m *fluidcrv1alpha1.FluidCRMigration) (map[int64]bool, bool, error) {
+	if m.Spec.PartialCheckpoint == nil {
+		return nil, false, nil
+	}
+	if m.Spec.Resume == nil || *m.Spec.Resume {
+		return nil, true, fmt.Errorf("partial checkpoint requires spec.resume=false")
+	}
+	if len(m.Spec.PartialCheckpoint.TargetRanks) == 0 {
+		return nil, true, fmt.Errorf("partial checkpoint targetRanks are required")
+	}
+	targets := map[int64]bool{}
+	for _, rank := range m.Spec.PartialCheckpoint.TargetRanks {
+		if rank < 0 || targets[rank] {
+			return nil, true, fmt.Errorf("partial checkpoint targetRanks must be unique non-negative values")
+		}
+		targets[rank] = true
+	}
+	return targets, true, nil
+}
+
+func targetRanksPresent(targets []target, targetRanks map[int64]bool) bool {
+	found := map[int64]bool{}
+	for _, t := range targets {
+		if targetRanks[t.rank] {
+			found[t.rank] = true
+		}
+	}
+	return len(found) == len(targetRanks)
+}
+
+func resolvePodRank(m *fluidcrv1alpha1.FluidCRMigration, pod *corev1.Pod) (int64, error) {
+	if m.Spec.PartialCheckpoint == nil {
+		return 0, nil
+	}
+	switch m.Spec.WorkloadRef.Kind {
+	case "Pod":
+		return 0, nil
+	case "StatefulSet":
+		matches := statefulOrdinal.FindStringSubmatch(pod.Name)
+		if len(matches) != 3 || matches[1] != m.Spec.WorkloadRef.Name {
+			return 0, fmt.Errorf("cannot resolve rank from StatefulSet pod %s", pod.Name)
+		}
+		rank, err := strconv.ParseInt(matches[2], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("cannot parse StatefulSet rank from pod %s", pod.Name)
+		}
+		return rank, nil
+	default:
+		return 0, fmt.Errorf("partial checkpoint requires Pod or StatefulSet workload rank mapping")
+	}
+}
+
 func anyPodFailed(m *fluidcrv1alpha1.FluidCRMigration) bool {
 	for i := range m.Status.Pods {
 		if m.Status.Pods[i].Phase == fluidcrv1alpha1.PodPhaseFailed {
@@ -731,6 +1008,8 @@ func podRank(p fluidcrv1alpha1.PodPhase) int {
 	case fluidcrv1alpha1.PodPhaseAppCheckpointed:
 		return 1
 	case fluidcrv1alpha1.PodPhaseContainerCheckpointed:
+		return 2
+	case fluidcrv1alpha1.PodPhaseSurvivorPaused:
 		return 2
 	case fluidcrv1alpha1.PodPhaseResumed:
 		return 3
@@ -747,6 +1026,22 @@ func isTerminalPhase(p fluidcrv1alpha1.MigrationPhase) bool {
 
 func shouldResume(m *fluidcrv1alpha1.FluidCRMigration) bool {
 	return m.Spec.Resume == nil || *m.Spec.Resume
+}
+
+func restoreOwnedResumeRequested(m *fluidcrv1alpha1.FluidCRMigration) bool {
+	return m.Annotations[AnnotationRestoreOwnedResume] == "true"
+}
+
+func restoreOwnedResumePending(m *fluidcrv1alpha1.FluidCRMigration) bool {
+	if m.Spec.PartialCheckpoint == nil {
+		return false
+	}
+	for i := range m.Status.Pods {
+		if m.Status.Pods[i].Phase == fluidcrv1alpha1.PodPhaseSurvivorPaused {
+			return true
+		}
+	}
+	return false
 }
 
 func checkpointIDFor(m *fluidcrv1alpha1.FluidCRMigration) (string, error) {

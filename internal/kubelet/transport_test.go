@@ -2,8 +2,13 @@ package kubelet
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -110,5 +115,64 @@ func TestCheckpointRejectsBadPaths(t *testing.T) {
 		if _, err := parseCheckpointPath([]byte(body)); err == nil {
 			t.Fatalf("accepted %s", body)
 		}
+	}
+}
+
+func TestMountedCARotationFailsClosedWithoutRestart(t *testing.T) {
+	hits := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = io.WriteString(w, `{"items":["/var/lib/kubelet/checkpoints/snapshot.tar"]}`)
+	}))
+	defer srv.Close()
+	opts, host := testOptions(t, srv)
+	c, err := NewClientWithOptions(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := func() error {
+		_, err := c.Checkpoint(context.Background(), host, "ns", "pod", "container", time.Second)
+		return err
+	}
+	if err := checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(opts.CAFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(opts.CAFile, []byte("invalid CA"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoint(); err == nil {
+		t.Fatal("invalid rotated CA used old trust")
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(99), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(opts.CAFile, otherCA, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoint(); err == nil {
+		t.Fatal("removed CA remained trusted through pooled connection")
+	}
+	if hits != 1 {
+		t.Fatalf("untrusted requests reached endpoint: %d", hits)
+	}
+	if err := os.WriteFile(opts.CAFile, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoint(); err != nil {
+		t.Fatalf("recovery after CA rotation: %v", err)
+	}
+	if hits != 2 {
+		t.Fatalf("successful requests: %d", hits)
 	}
 }

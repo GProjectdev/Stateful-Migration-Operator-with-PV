@@ -21,6 +21,7 @@ package kubelet
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -33,6 +34,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,7 +54,10 @@ const (
 
 // Client calls the kubelet checkpoint API.
 type Client struct {
+	mu         sync.Mutex
 	httpClient *http.Client
+	caFile     string
+	caHash     [32]byte
 	tokenFile  string
 	port       int
 }
@@ -90,6 +95,7 @@ func NewClientWithOptions(opts Options) (*Client, error) {
 		return nil, fmt.Errorf("invalid kubelet port")
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: opts.InsecureSkipVerify}
+	var caHash [32]byte
 	if !opts.InsecureSkipVerify {
 		if opts.CAFile == "" {
 			opts.CAFile = ServiceAccountCAPath
@@ -103,6 +109,9 @@ func NewClientWithOptions(opts Options) (*Client, error) {
 			return nil, fmt.Errorf("kubelet CA contains no certificates")
 		}
 		tlsConfig.RootCAs = pool
+		caHash = sha256.Sum256(pem)
+	} else {
+		opts.CAFile = ""
 	}
 	if _, err := readToken(opts.TokenFile); err != nil {
 		return nil, err
@@ -117,8 +126,41 @@ func NewClientWithOptions(opts Options) (*Client, error) {
 			},
 		},
 		tokenFile: opts.TokenFile,
+		caFile:    opts.CAFile,
+		caHash:    caHash,
 		port:      opts.Port,
 	}, nil
+}
+
+// New requests use the mounted CA bundle. Existing requests may finish with
+// their original transport; changed trust never reuses its idle connections.
+func (c *Client) requestClient() (*http.Client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.caFile == "" {
+		return c.httpClient, nil
+	}
+	data, err := os.ReadFile(c.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("reload kubelet CA: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	if digest == c.caHash {
+		return c.httpClient, nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("reloaded kubelet CA contains no certificates")
+	}
+	previous := c.httpClient.Transport.(*http.Transport)
+	transport := previous.Clone()
+	transport.TLSClientConfig = previous.TLSClientConfig.Clone()
+	transport.TLSClientConfig.RootCAs = pool
+	next := *c.httpClient
+	next.Transport = transport
+	c.httpClient, c.caHash = &next, digest
+	previous.CloseIdleConnections()
+	return c.httpClient, nil
 }
 
 func readToken(file string) (string, error) {
@@ -163,7 +205,11 @@ func (c *Client) Checkpoint(ctx context.Context, hostIP, namespace, pod, contain
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	httpClient, err := c.requestClient()
+	if err != nil {
+		return "", err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("call kubelet checkpoint API: %w", err)
 	}

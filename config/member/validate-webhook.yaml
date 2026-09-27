@@ -41,14 +41,7 @@
           "scope": "Namespaced"
         }
       ],
-      "objectSelector": {
-        "matchExpressions": [
-          {
-            "key": "migration.dcnlab.com/restore-plan",
-            "operator": "Exists"
-          }
-        ]
-      }
+      "matchPolicy": "Equivalent"
     }
   ]
 }

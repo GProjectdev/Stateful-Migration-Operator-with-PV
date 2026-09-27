@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -160,5 +161,194 @@ func TestPodWatchFindsUnlabelledConflictingPod(t *testing.T) {
 	pod.Namespace = "other"
 	if len(r.plansForPod(context.Background(), pod)) != 0 {
 		t.Fatal("cross namespace mapping")
+	}
+}
+
+func partialFixture() (*api.RestorePlan, *corev1.Pod, *corev1.Node) {
+	plan, pod, node := fixture()
+	plan.Spec.SourceCluster = "spot-cluster"
+	plan.Spec.TargetCluster = "spot-cluster"
+	plan.Spec.SourceFenced = false
+	plan.Spec.WorkloadRef = api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "workload-uid"}
+	plan.Spec.Pods[0].SourcePod = "trainer-1"
+	plan.Spec.Pods[0].TargetPod = "trainer-1"
+	plan.Spec.Pods[0].Rank = 1
+	plan.Spec.Pods[0].SourcePodUID = "source-uid"
+	plan.Spec.PartialRestore = &api.PartialRestoreSpec{TargetRanks: []int64{1}, PreventPeriodicResume: true, PreservedSurvivors: []api.SurvivorEvidence{{Rank: 0, PodName: "trainer-0", PodUID: "survivor-uid", NodeName: "node-survivor", Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock"}}}
+	pod.Name = "trainer-1"
+	pod.Labels = map[string]string{WorkloadUIDLabel: "workload-uid"}
+	pod.Annotations = map[string]string{InjectAnnotation: "true"}
+	controller := true
+	pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "workload-uid", Controller: &controller}}
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	return plan, pod, node
+}
+
+func partialAdmissionObjects() []client.Object {
+	replicas := int32(2)
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: "jobs", UID: "workload-uid"}, Spec: appsv1.StatefulSetSpec{Replicas: &replicas, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{WorkloadUIDLabel: "workload-uid"}, Annotations: map[string]string{InjectAnnotation: "true"}}}}}
+	endpoints := &corev1.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: WebhookServiceName, Namespace: WebhookServiceNamespace}, Subsets: []corev1.EndpointSubset{{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.10"}}, Ports: []corev1.EndpointPort{{Name: "webhook", Port: 9443}}}}}
+	return []client.Object{sts, endpoints}
+}
+
+func withPartialAdmission(objects ...client.Object) []client.Object {
+	out := append([]client.Object{}, objects...)
+	out = append(out, partialAdmissionObjects()...)
+	return out
+}
+
+func TestPartialSourceFenceActuatorDeletesOnlyUIDMatchedStagedSourcePod(t *testing.T) {
+	plan, pod, node := partialFixture()
+	pod.UID = "source-uid"
+	pod.Spec.NodeName = "node-a"
+	c := testClient(t, withPartialAdmission(plan, node, pod)...)
+	r := NewReconciler(c, c, "spot-cluster")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plan)}); err != nil {
+		t.Fatal(err)
+	}
+	var old corev1.Pod
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &old); !apierrors.IsNotFound(err) {
+		t.Fatalf("source pod was not gracefully deleted by fake client: %v", err)
+	}
+	var got api.RestorePlan
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Prepared" || len(got.Status.SourceFences) != 1 || got.Status.SourceFences[0].Phase != "DeleteRequested" || got.Status.SourceFences[0].DeleteRequestedAt == nil {
+		t.Fatalf("unexpected fence status: phase=%s fences=%+v", got.Status.Phase, got.Status.SourceFences)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plan)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.SourceFences[0].Phase != "SourceGone" || got.Status.SourceFences[0].GoneObservedAt == nil {
+		t.Fatalf("source UID gone proof missing: %+v", got.Status.SourceFences)
+	}
+}
+
+func TestPartialSourceFenceRefusesAbsentNameWithoutPriorDeleteProof(t *testing.T) {
+	plan, _, node := partialFixture()
+	c := testClient(t, withPartialAdmission(plan, node)...)
+	r := NewReconciler(c, c, "spot-cluster")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plan)}); err != nil {
+		t.Fatal(err)
+	}
+	var got api.RestorePlan
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Failed" || got.Status.SourceFences[0].Phase != "Refused" {
+		t.Fatalf("absent source name should not prove fencing: %+v", got.Status)
+	}
+}
+
+func TestPartialSourceFenceRefusesUnsafeUIDCollisionsBeforeDelete(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*api.RestorePlan, *corev1.Pod)
+	}{
+		{"uid mismatch", func(_ *api.RestorePlan, p *corev1.Pod) { p.UID = "other-uid" }},
+		{"replayed plan uid", func(p *api.RestorePlan, pod *corev1.Pod) {
+			pod.UID = "new-uid"
+			pod.Annotations[PlanUIDAnnotation] = "old-plan"
+			pod.Annotations[PlanGenerationAnnotation] = fmt.Sprint(p.Generation)
+		}},
+		{"replayed generation", func(p *api.RestorePlan, pod *corev1.Pod) {
+			pod.UID = "new-uid"
+			pod.Annotations[PlanUIDAnnotation] = string(p.UID)
+			pod.Annotations[PlanGenerationAnnotation] = fmt.Sprint(p.Generation + 1)
+		}},
+		{"unstaged source", func(p *api.RestorePlan, pod *corev1.Pod) {
+			pod.UID = "source-uid"
+			p.Status.Artifacts = nil
+		}},
+		{"wrong owner", func(_ *api.RestorePlan, pod *corev1.Pod) {
+			pod.UID = "source-uid"
+			pod.Spec.NodeName = "node-a"
+			pod.OwnerReferences[0].UID = "other-workload"
+		}},
+		{"unready source node", func(_ *api.RestorePlan, pod *corev1.Pod) {
+			pod.UID = "source-uid"
+			pod.Spec.NodeName = "node-a"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, pod, node := partialFixture()
+			tc.change(plan, pod)
+			if tc.name == "unready source node" {
+				node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+			}
+			c := testClient(t, withPartialAdmission(plan, node, pod)...)
+			r := NewReconciler(c, c, "spot-cluster")
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plan)}); err != nil {
+				t.Fatal(err)
+			}
+			var stillThere corev1.Pod
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &stillThere); err != nil {
+				t.Fatalf("pod was deleted despite refusal: %v", err)
+			}
+			var got api.RestorePlan
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &got); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "unstaged source" {
+				if got.Status.Phase != "AwaitingArtifacts" || got.Status.SourceFences[0].Phase != "Pending" {
+					t.Fatalf("unstaged source should wait without delete: %+v", got.Status)
+				}
+				return
+			}
+			if got.Status.Phase != "Failed" || got.Status.SourceFences[0].Phase != "Refused" {
+				t.Fatalf("unsafe collision not refused: %+v", got.Status)
+			}
+		})
+	}
+}
+
+func TestPartialReplacementPodAfterFenceMustRemainBoundToPlanAndNode(t *testing.T) {
+	plan, pod, node := partialFixture()
+	now := metav1.Now()
+	plan.Status.SourceFences = []api.SourcePodFenceStatus{{PodName: "trainer-1", SourcePodUID: "source-uid", ObservedGeneration: plan.Generation, Phase: "DeleteRequested", DeleteRequestedAt: &now}}
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	inject(pod)
+	pod.UID = "replacement-uid"
+	pod.Spec.NodeName = "node-a"
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	c := testClient(t, withPartialAdmission(plan, node, pod)...)
+	r := NewReconciler(c, c, "spot-cluster")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plan)}); err != nil {
+		t.Fatal(err)
+	}
+	var got api.RestorePlan
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Running" || got.Status.SourceFences[0].Phase != "SourceGone" || got.Status.Pods[0].UID != "replacement-uid" {
+		t.Fatalf("replacement proof not accepted: %+v", got.Status)
+	}
+}
+
+func TestPartialReplacementPodWithoutPriorFenceIsReplay(t *testing.T) {
+	plan, pod, node := partialFixture()
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.UID = "replacement-uid"
+	c := testClient(t, withPartialAdmission(plan, node, pod)...)
+	r := NewReconciler(c, c, "spot-cluster")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plan)}); err != nil {
+		t.Fatal(err)
+	}
+	var got api.RestorePlan
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Failed" || got.Status.SourceFences[0].Phase != "Refused" {
+		t.Fatalf("replacement replay accepted without prior source fence: %+v", got.Status)
 	}
 }

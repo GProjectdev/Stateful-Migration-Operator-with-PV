@@ -47,9 +47,8 @@ func TestAdmissionIsOptInAndFailClosed(t *testing.T) {
 		if wh["failurePolicy"] != "Fail" || wh["sideEffects"] != "None" {
 			t.Fatal("unsafe webhook policy")
 		}
-		s := wh["objectSelector"].(map[string]interface{})["matchExpressions"].([]interface{})[0].(map[string]interface{})
-		if s["key"] != "migration.dcnlab.com/restore-plan" || s["operator"] != "Exists" {
-			t.Fatal("wrong scope")
+		if _, scoped := wh["objectSelector"]; scoped {
+			t.Fatal("restore webhook must see unlabeled partial replacement Pods")
 		}
 	}
 }
@@ -61,7 +60,8 @@ func TestSuspensionPermissionsAreControlPlaneOnly(t *testing.T) {
 		"apps/statefulsets":                    "get",
 		"migration.dcnlab.com/pvmigrations":    "get",
 		"migration.dcnlab.com/pvmetadata":      "get",
-		"training.dcnlab.com/trainingruntimes": "get",
+		"training.dcnlab.com/trainingruntimes": "get,list,watch",
+		"fluidcr.dcnlab.com/fluidcrmigrations": "get,list,watch,patch,update",
 	}
 	for _, entry := range role["rules"].([]interface{}) {
 		rule := entry.(map[string]interface{})

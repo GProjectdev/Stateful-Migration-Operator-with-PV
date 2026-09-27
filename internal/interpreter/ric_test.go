@@ -284,6 +284,7 @@ func TestRICAggregationKeepsSourceAndTargetSeparateAndDeterministic(t *testing.T
 		sourceStatus["clusterName"] = "spoofed"
 		sourceStatus["clusters"] = []any{map[string]any{"clusterName": "recursive"}}
 		sourceStatus["pods"] = []any{map[string]any{"name": "db-0", "podName": "db-0", "uid": "source-id", "podUID": "source-id", "nodeName": "source-node", "phase": "Completed", "checkpointFiles": []any{map[string]any{"containerName": "db", "filePath": "/source/archive.tar", "checkpointTime": "2026-09-25T00:00:00Z"}}}}
+		sourceStatus["sourceFences"] = []any{map[string]any{"podName": "db-0", "sourcePodUID": "source-id", "observedGeneration": 1, "phase": "SourceGone", "message": "gone", "deleteRequestedAt": "2026-09-25T00:00:00Z", "goneObservedAt": "2026-09-25T00:01:00Z"}}
 		target["status"].(map[string]any)["pods"] = []any{map[string]any{"name": "db-0", "uid": "target-id", "phase": "Failed", "message": "waiting"}}
 		reports := []any{target, ricItem("unrelated", 1, "Completed"), source}
 		first := ricAggregate(t, name, ricDesired(name), reports)
@@ -307,9 +308,14 @@ func TestRICAggregationKeepsSourceAndTargetSeparateAndDeterministic(t *testing.T
 			if i == 1 {
 				original = target["status"].(map[string]any)
 			}
-			for _, key := range []string{"phase", "message", "observedGeneration", "pods"} {
+			for _, key := range []string{"phase", "message", "observedGeneration", "pods", "sourceFences"} {
 				if !reflect.DeepEqual(cluster[key], ricNormalize(original[key])) {
 					t.Fatalf("%s %s lost fidelity: %#v", want, key, cluster)
+				}
+			}
+			if i == 0 {
+				if _, exists := first["sourceFences"]; exists {
+					t.Fatalf("source fences must remain cluster-scoped, got top-level status: %#v", first)
 				}
 			}
 		}

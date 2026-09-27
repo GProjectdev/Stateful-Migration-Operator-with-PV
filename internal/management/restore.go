@@ -11,7 +11,6 @@ import (
 	"time"
 
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
-	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/artifact"
 	errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -28,6 +27,8 @@ var checkpointGVK = schema.GroupVersionKind{Group: "fluidcr.dcnlab.com", Version
 var policyGVK = schema.GroupVersionKind{Group: "policy.karmada.io", Version: "v1alpha1", Kind: "PropagationPolicy"}
 var trainingRuntimeGVK = schema.GroupVersionKind{Group: "training.dcnlab.com", Version: "v1alpha1", Kind: "TrainingRuntime"}
 var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+const annotationRestoreOwnedResume = "training.dcnlab.com/restore-owned-resume"
 
 // RestoreReconciler uses only the Karmada control-plane client and reader.
 type RestoreReconciler struct {
@@ -93,7 +94,10 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	if !ready {
 		return finish("AwaitingCheckpoint", "waiting for current source checkpoint aggregation", req.Status.PlanName)
 	}
-	desired := desiredPlan(req)
+	desired, err := desiredPlan(req, cp)
+	if err != nil {
+		return finish("Failed", err.Error(), req.Status.PlanName)
+	}
 	plan := &api.RestorePlan{}
 	err = r.reader().Get(ctx, client.ObjectKeyFromObject(desired), plan)
 	if errors.IsNotFound(err) {
@@ -140,13 +144,24 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 		case "AwaitingArtifacts", "Preparing", "Prepared", "Failed":
 			phase, message = s.Phase, s.Message
 		case "Running":
-			verification, err := r.validateTargetRuntime(ctx, req, plan, s.Pods)
-			if err != nil {
-				phase, message = "Running", s.Message
-			} else {
+			verification, err := r.validateTargetRuntime(ctx, req, plan, s.Pods, s.SourceFences)
+			if err == nil {
 				phase, message = "Verified", "target runtime evidence verified"
 				req.Status.Verification = stableVerification(req, verification)
+				break
 			}
+			if req.Spec.PartialRestore != nil {
+				verification, readyErr := partialRestoreReadyVerification(req, plan, s.Pods, s.SourceFences)
+				if readyErr == nil {
+					if err := r.authorizeRestoreOwnedResume(ctx, cp); err != nil {
+						return ctrl.Result{}, err
+					}
+					phase, message = "RestoreReady", "target native restore and source fence evidence verified; scoped survivor release authorized"
+					req.Status.Verification = stableVerification(req, verification)
+					break
+				}
+			}
+			phase, message = "Running", s.Message
 		}
 	}
 	if matches > 1 {
@@ -155,13 +170,23 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	return finish(phase, message, plan.Name)
 }
 
-func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus) (*api.RestoreVerification, error) {
-	tr := &unstructured.Unstructured{}
-	tr.SetGroupVersionKind(trainingRuntimeGVK)
-	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Spec.TrainingRuntimeRef.Name}, tr); err != nil {
-		if errors.IsNotFound(err) {
-			return nil, fmt.Errorf("waiting for TrainingRuntime telemetry")
-		}
+func (r *RestoreReconciler) authorizeRestoreOwnedResume(ctx context.Context, cp *unstructured.Unstructured) error {
+	if cp.GetAnnotations()[annotationRestoreOwnedResume] == "true" {
+		return nil
+	}
+	before := cp.DeepCopy()
+	annotations := map[string]string{}
+	for k, v := range cp.GetAnnotations() {
+		annotations[k] = v
+	}
+	annotations[annotationRestoreOwnedResume] = "true"
+	cp.SetAnnotations(annotations)
+	return r.Client.Patch(ctx, cp, client.MergeFrom(before))
+}
+
+func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, sourceFences []api.SourcePodFenceStatus) (*api.RestoreVerification, error) {
+	tr, err := r.resolveTrainingRuntime(ctx, req)
+	if err != nil {
 		return nil, err
 	}
 	clusters, found, err := unstructured.NestedSlice(tr.Object, "status", "clusters")
@@ -199,7 +224,72 @@ func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.
 	if err := validateRuntimeStatus(req, plan, targetPods, runtimeStatus, time.Now()); err != nil {
 		return nil, err
 	}
-	return &api.RestoreVerification{RequestUID: string(req.UID), CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: metav1.Now(), TrainingRuntimeRef: api.RuntimeReference{Name: tr.GetName(), UID: string(tr.GetUID())}, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster}, nil
+	verifiedAt := metav1.Now()
+	verification := &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations["training.dcnlab.com/recovery-operation"], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: verifiedAt, TrainingRuntimeRef: api.RuntimeReference{Name: tr.GetName(), UID: string(tr.GetUID())}, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced}
+	if req.Spec.PartialRestore != nil {
+		partial, sourceFence, survivors, err := partialVerification(req, plan, targetPods, sourceFences, verifiedAt.Time.Format(time.RFC3339))
+		if err != nil {
+			return nil, err
+		}
+		verification.PartialRestore = partial
+		verification.SourceFence = sourceFence
+		verification.PreservedSurvivors = append([]api.SurvivorEvidence{}, req.Spec.PartialRestore.PreservedSurvivors...)
+		verification.Survivors = survivors
+	}
+	return verification, nil
+}
+
+func partialRestoreReadyVerification(req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, sourceFences []api.SourcePodFenceStatus) (*api.RestoreVerification, error) {
+	if req.Spec.PartialRestore == nil {
+		return nil, fmt.Errorf("partial restore required")
+	}
+	for _, pod := range targetPods {
+		if pod.UID == "" || pod.Phase != "Running" {
+			return nil, fmt.Errorf("target native restored pod evidence incomplete")
+		}
+	}
+	now := metav1.Now()
+	partial, sourceFence, survivors, err := partialVerification(req, plan, targetPods, sourceFences, now.Time.UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	return &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations["training.dcnlab.com/recovery-operation"], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: now, TrainingRuntimeRef: req.Spec.TrainingRuntimeRef, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced, SourceFence: sourceFence, PartialRestore: partial, PreservedSurvivors: append([]api.SurvivorEvidence{}, req.Spec.PartialRestore.PreservedSurvivors...), Survivors: survivors}, nil
+}
+
+func (r *RestoreReconciler) resolveTrainingRuntime(ctx context.Context, req *api.RestoreRequest) (*unstructured.Unstructured, error) {
+	if req.Spec.TrainingRuntimeRef.Name != "" {
+		tr := &unstructured.Unstructured{}
+		tr.SetGroupVersionKind(trainingRuntimeGVK)
+		if err := r.reader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Spec.TrainingRuntimeRef.Name}, tr); err != nil {
+			if errors.IsNotFound(err) {
+				return nil, fmt.Errorf("waiting for TrainingRuntime telemetry")
+			}
+			return nil, err
+		}
+		return tr, nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(trainingRuntimeGVK.GroupVersion().WithKind("TrainingRuntimeList"))
+	if err := r.reader().List(ctx, list, client.InNamespace(req.Namespace)); err != nil {
+		return nil, err
+	}
+	var match *unstructured.Unstructured
+	for i := range list.Items {
+		item := &list.Items[i]
+		uid, _, _ := unstructured.NestedString(item.Object, "spec", "workloadRef", "uid")
+		if uid != req.Spec.WorkloadRef.UID {
+			continue
+		}
+		if match != nil {
+			return nil, fmt.Errorf("multiple TrainingRuntime objects match workload UID")
+		}
+		copy := item.DeepCopy()
+		match = copy
+	}
+	if match == nil {
+		return nil, fmt.Errorf("waiting for unique TrainingRuntime telemetry")
+	}
+	return match, nil
 }
 
 func stableVerification(req *api.RestoreRequest, next *api.RestoreVerification) *api.RestoreVerification {
@@ -207,12 +297,70 @@ func stableVerification(req *api.RestoreRequest, next *api.RestoreVerification) 
 		return nil
 	}
 	old := req.Status.Verification
-	if req.Status.ObservedGeneration == req.Generation && old != nil && old.RequestUID == next.RequestUID && old.CheckpointID == next.CheckpointID && old.TrainingRuntimeRef == next.TrainingRuntimeRef && old.SourceCluster == next.SourceCluster && old.TargetCluster == next.TargetCluster && !old.VerifiedAt.IsZero() {
+	if req.Status.ObservedGeneration == req.Generation && old != nil && old.RequestUID == next.RequestUID && old.CheckpointID == next.CheckpointID && old.TrainingRuntimeRef == next.TrainingRuntimeRef && old.SourceCluster == next.SourceCluster && old.TargetCluster == next.TargetCluster && old.SourceFenced == next.SourceFenced && reflect.DeepEqual(old.PartialRestore, next.PartialRestore) && reflect.DeepEqual(old.PreservedSurvivors, next.PreservedSurvivors) && !old.VerifiedAt.IsZero() {
 		kept := *old
 		return &kept
 	}
 	return next
 }
+
+func partialVerification(req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, sourceFences []api.SourcePodFenceStatus, observedAt string) (*api.PartialRestoreVerification, api.SourceFenceEvidence, []api.SurvivorStateEvidence, error) {
+	operation := req.Annotations["training.dcnlab.com/recovery-operation"]
+	targetUIDs := map[string]string{}
+	for _, pod := range targetPods {
+		if pod.UID != "" {
+			targetUIDs[pod.Name] = pod.UID
+		}
+	}
+	fences := map[string]api.SourcePodFenceStatus{}
+	for _, fence := range sourceFences {
+		if fence.ObservedGeneration == plan.Generation && fence.SourcePodUID != "" {
+			fences[fence.PodName] = fence
+		}
+	}
+	partial := &api.PartialRestoreVerification{PreventPeriodicResume: true, TargetRanks: make([]api.PartialRestoreTargetEvidence, 0, len(plan.Spec.Pods))}
+	sourceFence := api.SourceFenceEvidence{Fenced: true, Operation: operation, ObservedAt: observedAt}
+	for _, mapping := range plan.Spec.Pods {
+		fence, ok := fences[mapping.TargetPod]
+		if !ok || fence.Phase != "SourceGone" || fence.GoneObservedAt == nil || fence.DeleteRequestedAt == nil || fence.SourcePodUID != mapping.SourcePodUID {
+			return nil, api.SourceFenceEvidence{}, nil, fmt.Errorf("waiting for source fence evidence")
+		}
+		if sourceFence.EvidenceID == "" || fence.SourcePodUID < sourceFence.EvidenceID {
+			sourceFence.EvidenceID = fence.SourcePodUID + "-gone"
+			if fence.GoneObservedAt != nil {
+				sourceFence.ObservedAt = fence.GoneObservedAt.Time.UTC().Format(time.RFC3339)
+			}
+		}
+		if len(mapping.Archives) != 1 || restoreArchiveEvidence(mapping.Archives[0]) == "" {
+			return nil, api.SourceFenceEvidence{}, nil, fmt.Errorf("target rank archive evidence incomplete")
+		}
+		uid := targetUIDs[mapping.TargetPod]
+		if uid == "" {
+			return nil, api.SourceFenceEvidence{}, nil, fmt.Errorf("target pod UID evidence missing")
+		}
+		partial.TargetRanks = append(partial.TargetRanks, api.PartialRestoreTargetEvidence{Rank: mapping.Rank, TargetPodUID: uid, CheckpointID: req.Spec.CheckpointRef.CheckpointID, ArchiveEvidenceID: restoreArchiveEvidence(mapping.Archives[0])})
+	}
+	survivors := make([]api.SurvivorStateEvidence, 0, len(req.Spec.PartialRestore.PreservedSurvivors))
+	for _, survivor := range req.Spec.PartialRestore.PreservedSurvivors {
+		seenAt := firstNonEmpty(survivor.ObservedAt, observedAt)
+		survivors = append(survivors, api.SurvivorStateEvidence{Rank: survivor.Rank, PodUID: survivor.PodUID, StateEvidence: api.StateEvidence{Kind: "pause-lock", ObservedAt: seenAt}})
+	}
+	return partial, sourceFence, survivors, nil
+}
+
+func restoreArchiveEvidence(a api.Archive) string {
+	if strings.TrimSpace(a.ArchiveEvidenceID) != "" {
+		return a.ArchiveEvidenceID
+	}
+	if strings.TrimSpace(a.DurableRef) != "" {
+		return a.DurableRef
+	}
+	if strings.TrimSpace(a.SHA256) != "" {
+		return "sha256:" + a.SHA256
+	}
+	return ""
+}
+
 func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, status map[string]interface{}, now time.Time) error {
 	if status["phase"] != "Running" {
 		return fmt.Errorf("target runtime is not Running")
@@ -223,8 +371,12 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 	if status["workloadUID"] != req.Spec.WorkloadRef.UID {
 		return fmt.Errorf("target runtime workloadUID mismatch")
 	}
+	expectedWorld := len(plan.Spec.Pods)
+	if plan.Spec.PartialRestore != nil {
+		expectedWorld += len(plan.Spec.PartialRestore.PreservedSurvivors)
+	}
 	world, ok := intFrom(status["worldSize"])
-	if !ok || world <= 0 || world != len(plan.Spec.Pods) {
+	if !ok || world <= 0 || world != expectedWorld {
 		return fmt.Errorf("target runtime worldSize mismatch")
 	}
 	ready, ok := intFrom(status["readyRanks"])
@@ -245,11 +397,18 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 			allowed[p.Name] = p.UID
 		}
 	}
-	if len(allowed) != world {
+	if len(allowed) != len(plan.Spec.Pods) {
 		return fmt.Errorf("target pod identity status is incomplete")
+	}
+	survivors := map[string]api.SurvivorEvidence{}
+	if plan.Spec.PartialRestore != nil {
+		for _, survivor := range plan.Spec.PartialRestore.PreservedSurvivors {
+			survivors[survivor.PodName] = survivor
+		}
 	}
 	seenRanks := map[int]bool{}
 	seenNames := map[string]bool{}
+	seenTargets, seenSurvivors := 0, 0
 	minStep := int64(0)
 	for _, raw := range pods {
 		pod, ok := raw.(map[string]interface{})
@@ -262,14 +421,24 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 			return fmt.Errorf("duplicate target runtime pod sample")
 		}
 		seenNames[name] = true
-		if allowed[name] == "" || allowed[name] != uid {
-			return fmt.Errorf("target runtime pod identity mismatch")
-		}
 		rank, ok := intFrom(pod["rank"])
 		if !ok || rank < 0 || rank >= world || seenRanks[rank] {
 			return fmt.Errorf("target runtime rank set is invalid")
 		}
 		seenRanks[rank] = true
+		if wantUID := allowed[name]; wantUID != "" {
+			if wantUID != uid {
+				return fmt.Errorf("target runtime pod identity mismatch")
+			}
+			seenTargets++
+		} else if survivor, ok := survivors[name]; ok {
+			if survivor.PodUID != uid || survivor.Rank != int64(rank) {
+				return fmt.Errorf("target runtime survivor identity mismatch")
+			}
+			seenSurvivors++
+		} else {
+			return fmt.Errorf("target runtime pod identity mismatch")
+		}
 		if pod["checkpointID"] != req.Spec.CheckpointRef.CheckpointID {
 			return fmt.Errorf("target runtime pod checkpointID mismatch")
 		}
@@ -299,6 +468,9 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 	globalStep, ok := int64From(status["globalStep"])
 	if !ok || globalStep != minStep {
 		return fmt.Errorf("target runtime globalStep does not match rank minimum")
+	}
+	if seenTargets != len(allowed) || seenSurvivors != len(survivors) {
+		return fmt.Errorf("target runtime partial rank set is incomplete")
 	}
 	return nil
 }
@@ -358,15 +530,154 @@ func ownerReference(req *api.RestoreRequest) []metav1.OwnerReference {
 	yes := true
 	return []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "RestoreRequest", Name: req.Name, UID: req.UID, Controller: &yes}}
 }
-func desiredPlan(req *api.RestoreRequest) *api.RestorePlan {
+func desiredPlan(req *api.RestoreRequest, cps ...*unstructured.Unstructured) (*api.RestorePlan, error) {
 	sum := sha256.Sum256([]byte(req.UID))
 	s := req.DeepCopy().Spec
-	return &api.RestorePlan{TypeMeta: metav1.TypeMeta{APIVersion: api.GroupVersion.String(), Kind: "RestorePlan"}, ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("restore-%x", sum[:20]), Namespace: req.Namespace, OwnerReferences: ownerReference(req)}, Spec: api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods}}
+	if s.SourceCluster == s.TargetCluster && len(cps) > 0 && cps[0] != nil {
+		pods, err := enrichPartialArchives(req, cps[0])
+		if err != nil {
+			return nil, err
+		}
+		s.Pods = pods
+	}
+	return &api.RestorePlan{TypeMeta: metav1.TypeMeta{APIVersion: api.GroupVersion.String(), Kind: "RestorePlan"}, ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("restore-%x", sum[:20]), Namespace: req.Namespace, OwnerReferences: ownerReference(req)}, Spec: api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods, PartialRestore: s.PartialRestore}}, nil
+}
+
+func mustDesiredPlan(req *api.RestoreRequest) *api.RestorePlan {
+	plan, err := desiredPlan(req)
+	if err != nil {
+		panic(err)
+	}
+	return plan
+}
+
+func enrichPartialArchives(req *api.RestoreRequest, cp *unstructured.Unstructured) ([]api.RestorePod, error) {
+	out := restoreCopyPods(req.Spec.Pods)
+	sourcePods, err := checkpointSourcePods(req, cp)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		mapping := &out[i]
+		status := sourcePods[mapping.SourcePod]
+		if status == nil {
+			return nil, fmt.Errorf("checkpoint status missing source pod %s", mapping.SourcePod)
+		}
+		if got, _, _ := unstructured.NestedString(status, "podUID"); got != mapping.SourcePodUID {
+			return nil, fmt.Errorf("checkpoint source pod UID mismatch")
+		}
+		files, _, err := unstructured.NestedSlice(status, "checkpointFiles")
+		if err != nil || len(files) != 1 || len(mapping.Archives) != 1 {
+			return nil, fmt.Errorf("same-cluster partial restore requires exactly one checkpoint file per target rank")
+		}
+		file, ok := files[0].(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid checkpoint file evidence")
+		}
+		archive := mapping.Archives[0]
+		container, _, _ := unstructured.NestedString(file, "containerName")
+		filePath, _, _ := unstructured.NestedString(file, "filePath")
+		sha, _, _ := unstructured.NestedString(file, "sha256")
+		durable, _, _ := unstructured.NestedString(file, "durableRef")
+		if archive.SHA256 != "" && sha != "" && archive.SHA256 != sha {
+			return nil, fmt.Errorf("checkpoint archive sha256 mismatch")
+		}
+		if archive.DurableRef != "" && durable != "" && archive.DurableRef != durable {
+			return nil, fmt.Errorf("checkpoint archive durableRef mismatch")
+		}
+		if container == "" || filePath == "" || sha == "" {
+			return nil, fmt.Errorf("checkpoint archive container/path/sha evidence incomplete")
+		}
+		archive.ContainerName = firstNonEmpty(archive.ContainerName, container)
+		archive.SourcePath = firstNonEmpty(archive.SourcePath, filePath)
+		archive.SHA256 = firstNonEmpty(archive.SHA256, sha)
+		archive.TargetPath = firstNonEmpty(archive.TargetPath, deterministicRestoreTargetPath(sha))
+		archive.DurableRef = firstNonEmpty(archive.DurableRef, durable)
+		if archive.ArchiveEvidenceID == "" {
+			archive.ArchiveEvidenceID, _, _ = unstructured.NestedString(file, "archiveEvidenceID")
+		}
+		if archive.ArchiveEvidenceID == "" && sha != "" {
+			archive.ArchiveEvidenceID = "sha256:" + sha
+		}
+		if archive.DurableRef == "" || archive.ContainerName != container || archive.SourcePath != filePath || !validRestoreTargetPath(archive.TargetPath, sha) {
+			return nil, fmt.Errorf("same-cluster archive evidence is incomplete")
+		}
+		mapping.Archives[0] = archive
+	}
+	return out, nil
+}
+
+func deterministicRestoreTargetPath(sha string) string {
+	if sha == "" {
+		return ""
+	}
+	return "/var/lib/kubelet/checkpoints/" + sha + ".tar"
+}
+
+func validRestoreTargetPath(pathValue, sha string) bool {
+	if !strings.HasPrefix(pathValue, "/var/lib/kubelet/checkpoints/") || !validPath(pathValue) {
+		return false
+	}
+	if sha == "" {
+		return true
+	}
+	return pathValue == deterministicRestoreTargetPath(sha)
+}
+
+func restoreCopyPods(in []api.RestorePod) []api.RestorePod {
+	out := append([]api.RestorePod{}, in...)
+	for i := range out {
+		out[i].Archives = append([]api.Archive{}, in[i].Archives...)
+	}
+	return out
+}
+
+func checkpointSourcePods(req *api.RestoreRequest, cp *unstructured.Unstructured) (map[string]map[string]interface{}, error) {
+	clusters, _, err := unstructured.NestedSlice(cp.Object, "status", "clusters")
+	if err != nil {
+		return nil, fmt.Errorf("invalid checkpoint cluster aggregation")
+	}
+	for _, entry := range clusters {
+		cluster, ok := entry.(map[string]interface{})
+		if !ok || cluster["clusterName"] != req.Spec.SourceCluster {
+			continue
+		}
+		pods, _, err := unstructured.NestedSlice(cluster, "pods")
+		if err != nil {
+			return nil, fmt.Errorf("invalid checkpoint pod aggregation")
+		}
+		out := map[string]map[string]interface{}{}
+		for _, raw := range pods {
+			pod, ok := raw.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid checkpoint pod status")
+			}
+			name, _, _ := unstructured.NestedString(pod, "podName")
+			if name != "" {
+				out[name] = pod
+			}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("source checkpoint cluster status missing")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 func desiredPolicy(req *api.RestoreRequest, name string) *unstructured.Unstructured {
+	clusters := []interface{}{req.Spec.SourceCluster}
+	if req.Spec.TargetCluster != req.Spec.SourceCluster {
+		clusters = append(clusters, req.Spec.TargetCluster)
+	}
 	p := &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{
 		"resourceSelectors": []interface{}{map[string]interface{}{"apiVersion": api.GroupVersion.String(), "kind": "RestorePlan", "namespace": req.Namespace, "name": name}},
-		"placement":         map[string]interface{}{"clusterAffinity": map[string]interface{}{"clusterNames": []interface{}{req.Spec.SourceCluster, req.Spec.TargetCluster}}},
+		"placement":         map[string]interface{}{"clusterAffinity": map[string]interface{}{"clusterNames": clusters}},
 	}}}
 	p.SetGroupVersionKind(policyGVK)
 	p.SetName(name)
@@ -442,18 +753,73 @@ func policyMatches(actual, desired *unstructured.Unstructured) bool {
 func validPath(s string) bool {
 	return strings.HasPrefix(s, "/") && s != "/" && path.Clean(s) == s && !strings.ContainsAny(s, "\\\x00\r\n")
 }
+
+func validatePartialRestore(p *api.PartialRestoreSpec, sourceFenced bool, podCount int) (map[int64]bool, map[string]api.SurvivorEvidence, error) {
+	if p == nil {
+		return nil, nil, fmt.Errorf("same-cluster restore requires partialRestore")
+	}
+	if sourceFenced {
+		return nil, nil, fmt.Errorf("same-cluster partial restore requires sourceFenced=false and UID-bound pod evidence")
+	}
+	if !p.PreventPeriodicResume {
+		return nil, nil, fmt.Errorf("same-cluster partial restore must prevent periodic resume interference")
+	}
+	if len(p.TargetRanks) == 0 || len(p.TargetRanks) != podCount || len(p.PreservedSurvivors) == 0 {
+		return nil, nil, fmt.Errorf("partialRestore target ranks and preserved survivors are required")
+	}
+	targets := map[int64]bool{}
+	for _, rank := range p.TargetRanks {
+		if rank < 0 || targets[rank] {
+			return nil, nil, fmt.Errorf("partialRestore target ranks must be unique non-negative values")
+		}
+		targets[rank] = true
+	}
+	survivors := map[string]api.SurvivorEvidence{}
+	seenSurvivorRanks := map[int64]bool{}
+	for _, survivor := range p.PreservedSurvivors {
+		if survivor.Rank < 0 || targets[survivor.Rank] || seenSurvivorRanks[survivor.Rank] {
+			return nil, nil, fmt.Errorf("partialRestore survivor ranks must be unique and outside target ranks")
+		}
+		if !validName(survivor.PodName) || !validName(survivor.NodeName) || strings.TrimSpace(survivor.PodUID) == "" || survivor.Generation <= 0 || !validPath(survivor.PauseLockPath) || path.Base(survivor.PauseLockPath) != "pause-lock" {
+			return nil, nil, fmt.Errorf("partialRestore survivor evidence is incomplete")
+		}
+		seenSurvivorRanks[survivor.Rank] = true
+		survivors[survivor.PodName] = survivor
+	}
+	if len(survivors) != len(p.PreservedSurvivors) {
+		return nil, nil, fmt.Errorf("partialRestore survivor pod names must be unique")
+	}
+	return targets, survivors, nil
+}
+
 func validateRequest(req *api.RestoreRequest) error {
 	s := req.Spec
 	if req.UID == "" || !validName(s.CheckpointRef.Name) || strings.TrimSpace(s.CheckpointRef.UID) == "" || strings.TrimSpace(s.CheckpointRef.CheckpointID) == "" || s.CheckpointRef.Generation <= 0 {
 		return fmt.Errorf("checkpoint reference, stable checkpointID and request UID are required")
 	}
-	if !s.SourceFenced || !s.VolumesReady {
-		return fmt.Errorf("sourceFenced and volumesReady must be true")
+	if !s.VolumesReady {
+		return fmt.Errorf("volumesReady must be true")
 	}
-	if !validName(s.SourceCluster) || !validName(s.TargetCluster) || s.SourceCluster == s.TargetCluster {
-		return fmt.Errorf("distinct valid source and target clusters are required")
+	if !validName(s.SourceCluster) || !validName(s.TargetCluster) {
+		return fmt.Errorf("valid source and target clusters are required")
 	}
-	if !validName(s.WorkloadRef.Name) || strings.TrimSpace(s.WorkloadRef.UID) == "" || !validName(s.TrainingRuntimeRef.Name) || !((s.WorkloadRef.Kind == "StatefulSet" && s.WorkloadRef.APIVersion == "apps/v1") || (s.WorkloadRef.Kind == "Pod" && s.WorkloadRef.APIVersion == "v1")) {
+	sameCluster := s.SourceCluster == s.TargetCluster
+	var partialTargets map[int64]bool
+	if sameCluster {
+		var err error
+		partialTargets, _, err = validatePartialRestore(s.PartialRestore, s.SourceFenced, len(s.Pods))
+		if err != nil {
+			return err
+		}
+	} else {
+		if !s.SourceFenced {
+			return fmt.Errorf("sourceFenced must be true for cross-cluster restore")
+		}
+		if s.PartialRestore != nil {
+			return fmt.Errorf("partialRestore is only supported for same-cluster restore")
+		}
+	}
+	if !validName(s.WorkloadRef.Name) || strings.TrimSpace(s.WorkloadRef.UID) == "" || (!sameCluster && !validName(s.TrainingRuntimeRef.Name)) || (s.TrainingRuntimeRef.Name != "" && !validName(s.TrainingRuntimeRef.Name)) || !((s.WorkloadRef.Kind == "StatefulSet" && s.WorkloadRef.APIVersion == "apps/v1") || (s.WorkloadRef.Kind == "Pod" && s.WorkloadRef.APIVersion == "v1")) {
 		return fmt.Errorf("only stable StatefulSet or Pod identities with management UID are supported")
 	}
 	if len(s.Pods) == 0 {
@@ -466,6 +832,13 @@ func validateRequest(req *api.RestoreRequest) error {
 		if !validName(p.SourcePod) || p.SourcePod != p.TargetPod || seen[p.SourcePod] || !validName(p.SourceNode) || !validName(p.TargetNode) {
 			return fmt.Errorf("pod mappings must have unique stable identities, source nodes and target nodes")
 		}
+		if sameCluster {
+			if !partialTargets[p.Rank] || strings.TrimSpace(p.SourcePodUID) == "" {
+				return fmt.Errorf("same-cluster partial restore requires explicit target rank and sourcePodUID evidence")
+			}
+		} else if strings.TrimSpace(p.SourcePodUID) != "" {
+			return fmt.Errorf("sourcePodUID is reserved for same-cluster partial restore")
+		}
 		seen[p.SourcePod] = true
 		if (s.WorkloadRef.Kind == "Pod" && p.SourcePod != s.WorkloadRef.Name) || (s.WorkloadRef.Kind == "StatefulSet" && !ordinal.MatchString(p.SourcePod)) {
 			return fmt.Errorf("pod identity does not match workload")
@@ -474,7 +847,16 @@ func validateRequest(req *api.RestoreRequest) error {
 			return fmt.Errorf("each FluidCR pod must map its single selected container archive")
 		}
 		for _, a := range p.Archives {
-			if len(validation.IsDNS1123Label(a.ContainerName)) != 0 || a.ContainerName == "" || !validPath(a.SourcePath) || !validPath(a.TargetPath) || !strings.HasPrefix(a.TargetPath, "/var/lib/kubelet/checkpoints/") || !digestPattern.MatchString(a.SHA256) {
+			if !digestPattern.MatchString(a.SHA256) {
+				return fmt.Errorf("invalid archive SHA256")
+			}
+			if sameCluster && (a.ContainerName == "" || a.SourcePath == "" || a.TargetPath == "") {
+				if strings.TrimSpace(a.DurableRef) == "" {
+					return fmt.Errorf("same-cluster minimal archive evidence requires durableRef")
+				}
+				continue
+			}
+			if len(validation.IsDNS1123Label(a.ContainerName)) != 0 || a.ContainerName == "" || !validPath(a.SourcePath) || !validPath(a.TargetPath) || !strings.HasPrefix(a.TargetPath, "/var/lib/kubelet/checkpoints/") {
 				return fmt.Errorf("invalid archive container, path or SHA256")
 			}
 			key := p.TargetNode + "\x00" + a.TargetPath
@@ -491,9 +873,21 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 	if string(cp.GetUID()) != s.CheckpointRef.UID || cp.GetGeneration() != s.CheckpointRef.Generation || !cp.GetDeletionTimestamp().IsZero() {
 		return false, fmt.Errorf("checkpoint UID or generation mismatch, or checkpoint deleting")
 	}
-	_, found, err := unstructured.NestedBool(cp.Object, "spec", "resume")
+	resume, found, err := unstructured.NestedBool(cp.Object, "spec", "resume")
 	if err != nil || !found {
 		return false, fmt.Errorf("checkpoint spec.resume must be explicit")
+	}
+	partialTargets := map[int64]bool(nil)
+	survivors := map[string]api.SurvivorEvidence(nil)
+	if s.SourceCluster == s.TargetCluster {
+		var vErr error
+		partialTargets, survivors, vErr = validatePartialRestore(s.PartialRestore, s.SourceFenced, len(s.Pods))
+		if vErr != nil {
+			return false, vErr
+		}
+		if resume {
+			return false, fmt.Errorf("same-cluster partial checkpoint must set spec.resume=false")
+		}
 	}
 	if cp.GetAnnotations()["training.dcnlab.com/checkpoint-id"] != s.CheckpointRef.CheckpointID {
 		return false, fmt.Errorf("checkpoint annotation checkpoint-id mismatch")
@@ -541,7 +935,7 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 		return false, nil
 	}
 	pods, found, err := unstructured.NestedSlice(source, "pods")
-	if err != nil || !found || len(pods) != len(s.Pods) {
+	if err != nil || !found || len(pods) < len(s.Pods)+len(survivors) {
 		return false, fmt.Errorf("source pod mappings are incomplete")
 	}
 	mapped := map[string]api.RestorePod{}
@@ -549,6 +943,7 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 		mapped[p.SourcePod] = p
 	}
 	seen := map[string]bool{}
+	seenSurvivors := map[string]bool{}
 	for _, entry := range pods {
 		p, ok := entry.(map[string]interface{})
 		if !ok {
@@ -556,11 +951,32 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 		}
 		name, _, _ := unstructured.NestedString(p, "podName")
 		mapping, ok := mapped[name]
-		if !ok || seen[name] {
+		if !ok {
+			if survivor, ok := survivors[name]; ok {
+				if seenSurvivors[name] {
+					return false, fmt.Errorf("duplicate survivor pod evidence")
+				}
+				if err := validateSurvivorCheckpointEvidence(p, survivor); err != nil {
+					return false, err
+				}
+				seenSurvivors[name] = true
+				continue
+			}
+			return false, fmt.Errorf("source pod mappings are not a bijection")
+		}
+		if seen[name] {
 			return false, fmt.Errorf("source pod mappings are not a bijection")
 		}
 		seen[name] = true
-		if p["phase"] != "ContainerCheckpointed" && p["phase"] != "Resumed" {
+		if len(partialTargets) > 0 {
+			if !partialTargets[mapping.Rank] || p["phase"] != "ContainerCheckpointed" {
+				return false, fmt.Errorf("target rank lacks stopped container checkpoint evidence")
+			}
+			podUID, _, _ := unstructured.NestedString(p, "podUID")
+			if podUID == "" || podUID != mapping.SourcePodUID {
+				return false, fmt.Errorf("source pod UID precondition mismatch")
+			}
+		} else if p["phase"] != "ContainerCheckpointed" && p["phase"] != "Resumed" {
 			return false, fmt.Errorf("source pod is not checkpointed or resumed from an immutable checkpoint")
 		}
 		files, _, err := unstructured.NestedSlice(p, "checkpointFiles")
@@ -576,21 +992,60 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 		if nodeName != mapping.SourceNode {
 			return false, fmt.Errorf("source pod node mismatch")
 		}
-		if file["containerName"] != a.ContainerName || file["filePath"] != a.SourcePath {
+		fileContainer, _ := file["containerName"].(string)
+		filePath, _ := file["filePath"].(string)
+		if fileContainer == "" || filePath == "" {
+			return false, fmt.Errorf("source container or checkpoint path missing")
+		}
+		if (a.ContainerName != "" && fileContainer != a.ContainerName) || (a.SourcePath != "" && filePath != a.SourcePath) {
 			return false, fmt.Errorf("source container or checkpoint path mismatch")
 		}
 		if fileSHA, ok := file["sha256"].(string); ok && fileSHA != "" && fileSHA != a.SHA256 {
 			return false, fmt.Errorf("source checkpoint sha256 mismatch")
 		}
 		if durableRef, ok := file["durableRef"].(string); ok && durableRef != "" {
-			key, err := artifact.DigestKey(req.Namespace, a.SHA256)
-			if err != nil {
-				return false, err
-			}
-			if durableRef != "file-store:"+key {
+			if a.DurableRef != "" && durableRef != a.DurableRef {
 				return false, fmt.Errorf("source checkpoint durableRef mismatch")
 			}
 		}
 	}
+	if len(seen) != len(s.Pods) || len(seenSurvivors) != len(survivors) {
+		return false, fmt.Errorf("source pod mappings are incomplete")
+	}
 	return true, nil
+}
+
+func validateSurvivorCheckpointEvidence(p map[string]interface{}, want api.SurvivorEvidence) error {
+	if p["phase"] != "SurvivorPaused" && p["phase"] != "Resumed" {
+		return fmt.Errorf("survivor pod is not paused or restore-resumed")
+	}
+	rank, ok := intFrom(p["rank"])
+	if !ok || int64(rank) != want.Rank {
+		return fmt.Errorf("survivor rank mismatch")
+	}
+	for field, expected := range map[string]string{"podUID": want.PodUID, "nodeName": want.NodeName} {
+		got, _, _ := unstructured.NestedString(p, field)
+		if got != expected {
+			return fmt.Errorf("survivor %s mismatch", field)
+		}
+	}
+	evidence, found, err := unstructured.NestedMap(p, "survivorEvidence")
+	if err != nil || !found {
+		return fmt.Errorf("survivor evidence missing")
+	}
+	generation, ok := int64From(evidence["generation"])
+	if !ok || generation != want.Generation {
+		return fmt.Errorf("survivor generation mismatch")
+	}
+	if evidence["pauseLockPath"] != want.PauseLockPath {
+		return fmt.Errorf("survivor pause-lock path mismatch")
+	}
+	pid, ok := int64From(evidence["pauseLockPID"])
+	if !ok || pid <= 0 {
+		return fmt.Errorf("survivor pause-lock PID missing")
+	}
+	if observed, ok := evidence["observedAt"].(string); !ok || strings.TrimSpace(observed) == "" {
+		return fmt.Errorf("survivor observedAt missing")
+	}
+	return nil
 }

@@ -60,7 +60,7 @@ func truth(o map[string]interface{}, fields ...string) bool {
 	return b
 }
 func ready(phase string) bool {
-	return phase == "Prepared" || phase == "Running" || phase == "Verified"
+	return phase == "Prepared" || phase == "Running" || phase == "RestoreReady" || phase == "Verified"
 }
 
 // A conflict restarts all checks using uncached reads, not just the final patch.
@@ -183,7 +183,7 @@ func check(ctx context.Context, reader client.Reader, rb *unstructured.Unstructu
 		return err
 	}
 	owner := metav1.GetControllerOf(plan)
-	want := api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods}
+	want := api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods, PartialRestore: s.PartialRestore}
 	if plan.UID == "" || plan.Generation <= 0 || !plan.DeletionTimestamp.IsZero() || owner == nil || owner.UID != req.UID || owner.Name != req.Name ||
 		owner.Kind != "RestoreRequest" || owner.APIVersion != api.GroupVersion.String() || !reflect.DeepEqual(plan.Spec, want) {
 		return fail("plan ownership or spec mismatch")

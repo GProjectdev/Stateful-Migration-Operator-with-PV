@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,6 +29,9 @@ func testClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	if err := api.AddToScheme(scheme); err != nil {
@@ -140,6 +144,62 @@ func TestAdmissionFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSameClusterPartialPlanAllowedWithEvidence(t *testing.T) {
+	plan, pod, node := fixture()
+	plan.Spec.SourceCluster = "spot-cluster"
+	plan.Spec.TargetCluster = "spot-cluster"
+	plan.Spec.SourceFenced = false
+	plan.Spec.Pods[0].Rank = 1
+	plan.Spec.Pods[0].SourcePodUID = "source-pod-uid"
+	plan.Spec.PartialRestore = &api.PartialRestoreSpec{TargetRanks: []int64{1}, PreventPeriodicResume: true, PreservedSurvivors: []api.SurvivorEvidence{{Rank: 0, PodName: "survivor-0", PodUID: "survivor-uid", NodeName: "node-survivor", Generation: 9, PauseLockPath: "/checkpoint/rank0/pause-lock"}}}
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	plan.Spec.PartialRestore.PreservedSurvivors[0].PodUID = ""
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err == nil {
+		t.Fatal("same-cluster partial without survivor UID accepted")
+	}
+}
+
+func TestUnlabelledPartialAdmissionRequiresUniqueActivePlanAndWorkloadUID(t *testing.T) {
+	plan, pod, node := fixture()
+	plan.Spec.SourceCluster = "spot-cluster"
+	plan.Spec.TargetCluster = "spot-cluster"
+	plan.Spec.SourceFenced = false
+	plan.Spec.WorkloadRef = api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "workload-uid"}
+	plan.Spec.Pods[0].SourcePod, plan.Spec.Pods[0].TargetPod, pod.Name = "trainer-1", "trainer-1", "trainer-1"
+	plan.Spec.Pods[0].Rank = 1
+	plan.Spec.Pods[0].SourcePodUID = "source-uid"
+	plan.Spec.PartialRestore = &api.PartialRestoreSpec{TargetRanks: []int64{1}, PreventPeriodicResume: true, PreservedSurvivors: []api.SurvivorEvidence{{Rank: 0, PodName: "trainer-0", PodUID: "survivor-uid", NodeName: "node-survivor", Generation: 9, PauseLockPath: "/checkpoint/rank0/pause-lock"}}}
+	pod.Labels = map[string]string{WorkloadUIDLabel: "workload-uid"}
+	controller := true
+	pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "workload-uid", Controller: &controller}}
+	unlabelled := pod.DeepCopy()
+	plan.Status.Phase = "Running"
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Labels[api.PlanLabel] != plan.Name || pod.Annotations[PlanUIDAnnotation] != string(plan.UID) {
+		t.Fatal("unlabelled partial Pod was not bound to the running plan")
+	}
+	terminal := plan.DeepCopy()
+	terminal.Status.Phase = "Verified"
+	if err := NewWebhook(testClient(t, terminal, node), "spot-cluster").Apply(context.Background(), unlabelled); err == nil {
+		t.Fatal("terminal partial plan matched an unlabelled replacement Pod")
+	}
+	pod.Labels = map[string]string{WorkloadUIDLabel: "other-workload"}
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err == nil {
+		t.Fatal("wrong workload UID matched active partial plan")
+	}
+	pod.Labels = map[string]string{WorkloadUIDLabel: "workload-uid"}
+	other := plan.DeepCopy()
+	other.Name = "restore-other"
+	other.UID = "plan-other"
+	if err := NewWebhook(testClient(t, plan, other, node), "spot-cluster").Apply(context.Background(), pod); err == nil {
+		t.Fatal("ambiguous active partial plans accepted")
+	}
+}
+
 func TestStatefulSetOwnerAndExistingPod(t *testing.T) {
 	plan, pod, node := fixture()
 	plan.Spec.WorkloadRef = api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "worker"}
@@ -236,6 +296,7 @@ func TestHandleCreateScopeAndNamespace(t *testing.T) {
 		t.Fatal("unexpected UPDATE interception")
 	}
 	req.Operation = admissionv1.Create
+	req.Namespace = "jobs"
 	pod.Labels = nil
 	req.Object.Raw, _ = json.Marshal(pod)
 	if !w.Handle(context.Background(), req).Allowed {

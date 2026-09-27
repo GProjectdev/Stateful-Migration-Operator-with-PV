@@ -1,5 +1,6 @@
 """Tests the payload overlay without importing torch or a FluidCR installation."""
 import importlib.util
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -97,7 +98,12 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self.tmp_path, ignore_errors=True))
         self.distributed = types.ModuleType("fluidcr.distributed")
         self.distributed.bump_generation = Mock()
+        self.distributed.bump_generation.return_value = 123
         self.distributed.write_manifest = Mock()
+        self.distributed._base_dir = lambda: str(self.tmp_path)
+        self.distributed.manifest_path = lambda: str(self.tmp_path / "migration-manifest.json")
+        self.distributed.read_manifest = Mock(return_value={})
+        self.distributed.read_survivor_proof = Mock(return_value={})
         patches = [
             patch.dict(sys.modules, {"fluidcr.distributed": self.distributed}),
             patch.dict(os.environ, {"FLUIDCR_CHECKPOINT_PATH": ""}),
@@ -146,7 +152,9 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         self.assertEqual(ctrl.checkpoint_ranks_and_wait("all", 0.1),
                          {101: "checkpoint-ready"})
         self.distributed.bump_generation.assert_called_once()
-        self.distributed.write_manifest.assert_called_once_with("all")
+        self.distributed.write_manifest.assert_called_once_with(
+            "all", checkpoint_id=None, restore_owned_resume=False
+        )
         self.kill.assert_called_once_with(101, ctrl.signal.SIGUSR1)
 
     def test_timeout_does_not_become_ready(self):
@@ -211,6 +219,13 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         handler._handle_checkpoint()
         return handler._send_json.call_args.args
 
+    def resume_request(self, payload):
+        handler = ctrl._CtrlRequestHandler.__new__(ctrl._CtrlRequestHandler)
+        handler._read_json = Mock(return_value=payload)
+        handler._send_json = Mock()
+        handler._handle_resume()
+        return handler._send_json.call_args.args
+
     def test_http_wait_returns_confirmed_result(self):
         self.kill.side_effect = self.create_lock
         self.assertEqual(self.request({"all": True, "wait": True, "timeoutSeconds": 0.1}),
@@ -228,6 +243,79 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         self.assertEqual(status["state"], "CheckpointReady")
         self.assertNotIn("iterationTimeSeconds", status)
         self.assertIn("checkpointDurationSeconds", status)
+
+    def test_partial_wait_returns_target_checkpoint_evidence(self):
+        make_dir(self.tmp_path / "11" / "rounds" / "round-001")
+        self.kill.side_effect = self.create_checkpoint_and_lock
+        with patch.dict(os.environ, {
+            "FLUIDCR_CONTAINER_NAME": "trainer",
+            "FLUIDCR_NODE_NAME": "node-a",
+            "FLUIDCR_POD_NAME": "trainer-1",
+            "FLUIDCR_POD_UID": "uid-target",
+            "RANK": "1",
+            "WORLD_SIZE": "2",
+        }), patch.object(ctrl, "registered_worker_pids", return_value={11: 101}):
+            response = ctrl.checkpoint_ranks_and_wait(
+                [1], 0.1, checkpoint_id="round-001", restore_owned_resume=True, contract=True,
+            )
+
+        artifact = self.tmp_path / "11" / "rounds" / "round-001" / "latest.pt"
+        self.assertEqual(response["checkpointID"], "round-001")
+        self.assertEqual(response["targetRanks"], [1])
+        self.assertTrue(response["partial"])
+        self.assertTrue(response["restoreOwnedResume"])
+        self.assertTrue(response["noPeriodicResume"])
+        evidence = response["appCheckpointEvidence"]["1"]
+        self.assertEqual(evidence["podUID"], "uid-target")
+        self.assertEqual(evidence["phase"], "AppCheckpointReady")
+        self.assertEqual(evidence["appArtifact"]["path"], str(artifact))
+        self.assertTrue(evidence["appArtifact"]["sha256"])
+        self.assertNotIn("durableRef", evidence)
+        self.distributed.write_manifest.assert_called_with(
+            [1], checkpoint_id="round-001", restore_owned_resume=True, generation=123
+        )
+
+    def test_partial_rank0_target_fails_closed(self):
+        with patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "2"}):
+            with self.assertRaisesRegex(ValueError, "rank0 target"):
+                ctrl.checkpoint_ranks_and_wait(
+                    [0], 0.1, checkpoint_id="round-rank0", restore_owned_resume=True
+                )
+        self.distributed.bump_generation.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_partial_wait_replay_recovers_after_worker_exit_99_unregistered(self):
+        marker = self.tmp_path / "rounds" / "round-007" / ".triggered"
+        make_dir(marker.parent)
+        marker.write_text("already")
+        checkpoint = self.tmp_path / "rank1" / "latest.pt"
+        make_dir(checkpoint.parent)
+        checkpoint.write_bytes(b"exited-worker-state")
+        (checkpoint.parent / "lock").write_text("ready")
+        self.distributed.read_manifest.return_value = {
+            "checkpointID": "round-007",
+            "restoreOwnedResume": True,
+            "targets": [1],
+        }
+        with patch.object(ctrl, "registered_worker_pids", return_value={}), \
+             patch.dict(os.environ, {
+                 "FLUIDCR_CHECKPOINT_PATH": str(checkpoint),
+                 "FLUIDCR_NODE_NAME": "node-a",
+                 "FLUIDCR_POD_NAME": "trainer-1",
+                 "FLUIDCR_POD_UID": "uid-target",
+                 "RANK": "1",
+                 "WORLD_SIZE": "2",
+             }):
+            response = ctrl.checkpoint_ranks_and_wait(
+                [1], 0.1, checkpoint_id="round-007", restore_owned_resume=True, contract=True,
+            )
+        artifact = checkpoint.parent / "rounds" / "round-007" / "latest.pt"
+        self.assertEqual(response["results"], {"replay": "checkpoint-ready"})
+        self.assertEqual(response["appCheckpointEvidence"]["1"]["phase"], "AppCheckpointReady")
+        self.assertEqual(response["appCheckpointEvidence"]["1"]["appArtifact"]["path"], str(artifact))
+        self.assertEqual(artifact.read_bytes(), b"exited-worker-state")
+        self.kill.assert_not_called()
+        self.distributed.bump_generation.assert_not_called()
 
     def test_checkpoint_id_is_immutable(self):
         artifact = self.tmp_path / "11" / "rounds" / "round-001" / "latest.pt"
@@ -279,6 +367,45 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         self.assertEqual(body["state"], "Running")
         self.assertEqual(body["iterationTimeSeconds"], 1.25)
         self.assertEqual(body["observedAt"], observed_at)
+
+    def test_http_runtime_returns_survivor_pause_evidence(self):
+        checkpoint = self.tmp_path / "rank0" / "latest.pt"
+        pause_lock = self.tmp_path / "rank0" / "pause-lock"
+        make_dir(checkpoint.parent)
+        pause_lock.write_text("parked")
+        self.distributed.read_survivor_proof = Mock(return_value={
+            "state": "SurvivorPaused",
+            "rank": 0,
+            "podUID": "survivor-pod-uid",
+            "checkpointID": "round-survivor",
+            "generation": 7,
+            "pauseLockPath": str(pause_lock),
+            "pauseLockPID": 1234,
+            "observedAt": "survivor-observed",
+        })
+        ctrl._write_status(str(checkpoint), {"globalStep": 42, "state": "Running", "checkpointID": "round-survivor"})
+        with patch.dict(os.environ, {
+            "FLUIDCR_CHECKPOINT_PATH": str(checkpoint),
+            "FLUIDCR_NODE_NAME": "node-survivor",
+            "FLUIDCR_POD_NAME": "trainer-0",
+            "FLUIDCR_POD_UID": "survivor-pod-uid",
+            "RANK": "0",
+            "WORLD_SIZE": "2",
+        }), patch.object(ctrl, "registered_worker_pids", return_value={11: 101}):
+            handler = ctrl._CtrlRequestHandler.__new__(ctrl._CtrlRequestHandler)
+            handler.path = "/runtime"
+            handler._send_json = Mock()
+            handler.do_GET()
+        status, body = handler._send_json.call_args.args
+        self.assertEqual(status, 200)
+        self.assertEqual(body["survivorEvidence"], {
+            "generation": 7,
+            "pauseLockPath": str(pause_lock),
+            "pauseLockPID": 1234,
+            "observedAt": "survivor-observed",
+        })
+        self.assertEqual(body["phase"], "SurvivorPaused")
+        self.assertEqual(body["checkpointID"], "round-survivor")
 
     def test_http_runtime_unavailable_without_rank_world_or_live_worker(self):
         checkpoint = self.tmp_path / "rank0" / "latest.pt"
@@ -392,6 +519,90 @@ class ConfirmedCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "pinned restore checkpoint"):
                 backend._checkpoint_load_path()
 
+    def test_restore_owned_partial_manifest_rejects_ordinary_resume_all(self):
+        pause_lock = self.tmp_path / "rank0" / "pause-lock"
+        make_dir(pause_lock.parent)
+        pause_lock.write_text("parked")
+        self.distributed.read_manifest.return_value = {
+            "checkpointID": "round-resume",
+            "generation": 123,
+            "restoreOwnedResume": True,
+            "targets": [1],
+        }
+        with self.assertRaisesRegex(ValueError, "explicit restore resume"):
+            ctrl.resume_all_pending()
+        self.assertTrue(pause_lock.exists())
+
+    def test_restore_owned_partial_manifest_rejects_unscoped_ppid_resume(self):
+        lock = self.tmp_path / "11" / "lock"
+        make_dir(lock.parent)
+        lock.write_text("parked-target")
+        self.distributed.read_manifest.return_value = {
+            "checkpointID": "round-resume",
+            "generation": 123,
+            "restoreOwnedResume": True,
+            "targets": [1],
+        }
+        with self.assertRaisesRegex(ValueError, "scoped restore resume"):
+            ctrl.resume_ppids([11])
+        self.assertTrue(lock.exists())
+
+    def test_restore_owned_resume_requires_matching_checkpoint_and_generation(self):
+        pause_lock = self.tmp_path / "rank0" / "pause-lock"
+        make_dir(pause_lock.parent)
+        pause_lock.write_text("parked")
+        self.distributed.read_manifest.return_value = {
+            "checkpointID": "round-resume",
+            "generation": 123,
+            "restoreOwnedResume": True,
+            "targets": [1],
+        }
+        with self.assertRaisesRegex(ValueError, "generation mismatch"):
+            ctrl.resume_all_pending(
+                checkpoint_id="round-resume",
+                generation=124,
+                restore_owned_resume=True,
+            )
+        results = ctrl.resume_all_pending(
+            checkpoint_id="round-resume",
+            generation=123,
+            restore_owned_resume=True,
+        )
+        self.assertEqual(results[str(pause_lock)], "removed")
+
+    def test_http_restore_owned_resume_rejects_plain_all_and_accepts_scoped_release(self):
+        pause_lock = self.tmp_path / "rank0" / "pause-lock"
+        make_dir(pause_lock.parent)
+        pause_lock.write_text("parked")
+        self.distributed.read_manifest.return_value = {
+            "checkpointID": "round-http-resume",
+            "generation": 123,
+            "restoreOwnedResume": True,
+            "targets": [1],
+        }
+        status, body = self.resume_request({"all": True})
+        self.assertEqual(status, 400)
+        self.assertIn("explicit restore resume", body["error"])
+        self.assertTrue(pause_lock.exists())
+
+        status, body = self.resume_request({
+            "all": True,
+            "checkpointID": "round-http-resume",
+            "generation": 123,
+            "restoreOwnedResume": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(body["results"][str(pause_lock)], "removed")
+
+    def test_restore_owned_resume_is_idempotent_after_manifest_removed(self):
+        self.distributed.read_manifest.return_value = {}
+        results = ctrl.resume_all_pending(
+            checkpoint_id="round-resume",
+            generation=123,
+            restore_owned_resume=True,
+        )
+        self.assertEqual(results[self.distributed.manifest_path()], "already-complete")
+
     def test_http_default_preserves_async_protocol(self):
         self.assertEqual(self.request({"all": True}),
                          (200, {"results": {101: "checkpoint-signalled"}}))
@@ -406,6 +617,33 @@ class ConfirmedCheckpointTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertEqual(self.request(payload)[0], 400)
         self.distributed.bump_generation.assert_not_called()
+
+
+class FluidCRPayloadParityTests(unittest.TestCase):
+    EXPECTED_SHA256 = {
+        # My_FluidCR-work frozen upstream snapshot d1c72a8.
+        "ctrl.py": "00e122673af316d01e1c281912811802cc7a4e3a757583e6786070020fb14cb5",
+        "distributed.py": "4d1d344ef4ec13ddcecff948cb0ccf6eab3c48f84072ded387ccfa039dc63298",
+    }
+
+    def test_stateful_overlay_matches_pinned_fluidcr_payload_hashes(self):
+        repo = Path(__file__).resolve().parents[1]
+        for name, expected in self.EXPECTED_SHA256.items():
+            with self.subTest(name=name):
+                actual = hashlib.sha256((repo / "fluidcr" / name).read_bytes()).hexdigest()
+                self.assertEqual(actual, expected)
+
+    def test_stateful_overlay_matches_local_fluidcr_source_when_available(self):
+        repo = Path(__file__).resolve().parents[1]
+        source = repo.parents[1] / "My_FluidCR-work" / "fluidcr"
+        if not source.exists():
+            self.skipTest("local My_FluidCR-work source tree is not available")
+        for name in ("ctrl.py", "distributed.py"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    (repo / "fluidcr" / name).read_bytes().replace(b"\r\n", b"\n"),
+                    (source / name).read_bytes().replace(b"\r\n", b"\n"),
+                )
 
 
 if __name__ == "__main__":

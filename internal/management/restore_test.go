@@ -6,6 +6,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -18,8 +19,8 @@ import (
 func fixture() (*api.RestoreRequest, *unstructured.Unstructured) {
 	req := &api.RestoreRequest{ObjectMeta: metav1.ObjectMeta{Name: "restore", Namespace: "default", UID: "request-uid", Generation: 1}, Spec: api.RestoreRequestSpec{
 		CheckpointRef: api.CheckpointReference{Name: "checkpoint", UID: "checkpoint-uid", Generation: 2, CheckpointID: "round-001"}, WorkloadRef: api.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db", UID: "workload-uid"}, TrainingRuntimeRef: api.RuntimeReference{Name: "db-runtime"}, SourceCluster: "source", TargetCluster: "target", SourceFenced: true, VolumesReady: true,
-		Pods: []api.RestorePod{{SourcePod: "db-0", SourceNode: "source-node", TargetPod: "db-0", TargetNode: "node-a", Archives: []api.Archive{{ContainerName: "db", SourcePath: "/checkpoints/db.tar", TargetPath: "/var/lib/kubelet/checkpoints/db.tar", SHA256: strings.Repeat("a", 64)}}}}}}
-	cp := &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{"resume": false, "workloadRef": map[string]interface{}{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "db", "namespace": "default", "uid": "workload-uid"}}, "status": map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": "source", "observedGeneration": int64(2), "phase": "Completed", "pods": []interface{}{map[string]interface{}{"podName": "db-0", "nodeName": "source-node", "phase": "ContainerCheckpointed", "checkpointFiles": []interface{}{map[string]interface{}{"containerName": "db", "filePath": "/checkpoints/db.tar", "sha256": strings.Repeat("a", 64), "durableRef": "file-store:default/sha256/" + strings.Repeat("a", 64)}}}}}}}}}
+		Pods: []api.RestorePod{{SourcePod: "db-0", SourceNode: "source-node", TargetPod: "db-0", TargetNode: "node-a", Archives: []api.Archive{{ContainerName: "db", SourcePath: "/var/lib/kubelet/checkpoints/db.tar", TargetPath: "/var/lib/kubelet/checkpoints/" + strings.Repeat("a", 64) + ".tar", SHA256: strings.Repeat("a", 64)}}}}}}
+	cp := &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{"resume": false, "workloadRef": map[string]interface{}{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "db", "namespace": "default", "uid": "workload-uid"}}, "status": map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": "source", "observedGeneration": int64(2), "phase": "Completed", "pods": []interface{}{map[string]interface{}{"podName": "db-0", "nodeName": "source-node", "phase": "ContainerCheckpointed", "checkpointFiles": []interface{}{map[string]interface{}{"containerName": "db", "filePath": "/var/lib/kubelet/checkpoints/db.tar", "sha256": strings.Repeat("a", 64), "durableRef": "file-store:default/sha256/" + strings.Repeat("a", 64)}}}}}}}}}
 	cp.SetGroupVersionKind(checkpointGVK)
 	cp.SetName("checkpoint")
 	cp.SetNamespace("default")
@@ -82,6 +83,32 @@ func source(cp *unstructured.Unstructured) map[string]interface{} {
 func sourcePod(cp *unstructured.Unstructured) map[string]interface{} {
 	return source(cp)["pods"].([]interface{})[0].(map[string]interface{})
 }
+func survivorPodEvidence() map[string]interface{} {
+	return map[string]interface{}{
+		"podName":  "db-1",
+		"podUID":   "survivor-uid",
+		"nodeName": "source-node-survivor",
+		"rank":     int64(0),
+		"phase":    "SurvivorPaused",
+		"survivorEvidence": map[string]interface{}{
+			"generation":    int64(7),
+			"pauseLockPath": "/checkpoint/rank0/pause-lock",
+			"pauseLockPID":  int64(1234),
+			"observedAt":    "2026-09-27T00:00:00Z",
+		},
+	}
+}
+func makeSameClusterPartial(req *api.RestoreRequest, cp *unstructured.Unstructured) {
+	req.Spec.TargetCluster = req.Spec.SourceCluster
+	req.Spec.SourceFenced = false
+	req.Spec.Pods[0].Rank = 1
+	req.Spec.Pods[0].SourcePodUID = "target-source-uid"
+	req.Spec.PartialRestore = &api.PartialRestoreSpec{TargetRanks: []int64{1}, PreventPeriodicResume: true, PreservedSurvivors: []api.SurvivorEvidence{{Rank: 0, PodName: "db-1", PodUID: "survivor-uid", NodeName: "source-node-survivor", Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock"}}}
+	cp.Object["spec"].(map[string]interface{})["resume"] = false
+	sourcePod(cp)["rank"] = int64(1)
+	sourcePod(cp)["podUID"] = "target-source-uid"
+	source(cp)["pods"] = append(source(cp)["pods"].([]interface{}), survivorPodEvidence())
+}
 func testClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -89,6 +116,43 @@ func testClient(t *testing.T, objects ...client.Object) client.Client {
 		t.Fatal(err)
 	}
 	return fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&api.RestoreRequest{}, &api.RestorePlan{}).WithObjects(objects...).Build()
+}
+
+func TestSameClusterPartialRestoreContract(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		req, cp := fixture()
+		makeSameClusterPartial(req, cp)
+		got := reconcile(t, testClient(t, req, cp), req)
+		if got.Status.Phase != "Preparing" {
+			t.Fatal(got.Status)
+		}
+	})
+	for _, tt := range []struct {
+		name   string
+		mutate func(*api.RestoreRequest, *unstructured.Unstructured)
+	}{
+		{"checkpoint auto-resume", func(_ *api.RestoreRequest, c *unstructured.Unstructured) {
+			c.Object["spec"].(map[string]interface{})["resume"] = true
+		}},
+		{"missing survivor", func(_ *api.RestoreRequest, c *unstructured.Unstructured) {
+			source(c)["pods"] = source(c)["pods"].([]interface{})[:1]
+		}},
+		{"source uid mismatch", func(_ *api.RestoreRequest, c *unstructured.Unstructured) { sourcePod(c)["podUID"] = "other" }},
+		{"survivor boolean only", func(_ *api.RestoreRequest, c *unstructured.Unstructured) {
+			survivorPodEvidence := source(c)["pods"].([]interface{})[1].(map[string]interface{})
+			survivorPodEvidence["survivorEvidence"] = map[string]interface{}{"paused": true}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req, cp := fixture()
+			makeSameClusterPartial(req, cp)
+			tt.mutate(req, cp)
+			got := reconcile(t, testClient(t, req, cp), req)
+			if got.Status.Phase != "Failed" {
+				t.Fatalf("phase %s: %s", got.Status.Phase, got.Status.Message)
+			}
+		})
+	}
 }
 func reconcile(t *testing.T, c client.Client, req *api.RestoreRequest) *api.RestoreRequest {
 	t.Helper()
@@ -240,7 +304,7 @@ func TestConflictsNeverAdoptOrMutate(t *testing.T) {
 	for _, kind := range []string{"foreign plan", "plan drift", "foreign policy", "policy drift"} {
 		t.Run(kind, func(t *testing.T) {
 			req, cp := fixture()
-			p := desiredPlan(req)
+			p := mustDesiredPlan(req)
 			pp := desiredPolicy(req, p.Name)
 			switch kind {
 			case "foreign plan":
@@ -283,7 +347,7 @@ func TestStablePod(t *testing.T) {
 
 func TestAwaitingArtifactsReflection(t *testing.T) {
 	req, cp := fixture()
-	plan := desiredPlan(req)
+	plan := mustDesiredPlan(req)
 	plan.Generation = 1
 	plan.Status.Clusters = []api.ClusterStatus{{ClusterName: "target", ObservedGeneration: 1, Phase: "AwaitingArtifacts", Message: "awaiting node reports"}}
 	got := reconcile(t, testClient(t, req, cp, plan), req)
@@ -305,9 +369,27 @@ func trainingRuntime(req *api.RestoreRequest, podUID string, observed metav1.Tim
 	return tr
 }
 
+func partialTrainingRuntime(req *api.RestoreRequest, targetUID string, observed metav1.Time) *unstructured.Unstructured {
+	previous := observed.Time.Add(-time.Second).Format(time.RFC3339)
+	current := observed.Time.Format(time.RFC3339)
+	tr := &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{"workloadRef": map[string]interface{}{"uid": req.Spec.WorkloadRef.UID}}, "status": map[string]interface{}{"clusters": []interface{}{map[string]interface{}{"clusterName": req.Spec.TargetCluster, "observedGeneration": int64(1), "status": map[string]interface{}{
+		"phase": "Running", "globalStep": int64(12), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "readyRanks": int64(2), "worldSize": int64(2), "workloadUID": req.Spec.WorkloadRef.UID, "memberWorkloadUID": "member-workload", "observedAt": current,
+		"pods": []interface{}{
+			map[string]interface{}{"name": "db-0", "uid": targetUID, "rank": int64(1), "globalStep": int64(12), "previousGlobalStep": int64(11), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "previousObservedAt": previous, "observedAt": current},
+			map[string]interface{}{"name": "db-1", "uid": "survivor-uid", "rank": int64(0), "globalStep": int64(13), "previousGlobalStep": int64(12), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "previousObservedAt": previous, "observedAt": current},
+		},
+	}}}}}}
+	tr.SetGroupVersionKind(trainingRuntimeGVK)
+	tr.SetName(req.Spec.TrainingRuntimeRef.Name)
+	tr.SetNamespace(req.Namespace)
+	tr.SetUID("training-runtime-uid")
+	tr.SetGeneration(1)
+	return tr
+}
+
 func TestRuntimeTelemetryGatesVerifiedStatus(t *testing.T) {
 	req, cp := fixture()
-	plan := desiredPlan(req)
+	plan := mustDesiredPlan(req)
 	plan.Generation = 1
 	plan.Status.Clusters = []api.ClusterStatus{{ClusterName: "target", ObservedGeneration: 1, Phase: "Running", Message: "pods ready", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}}}
 	got := reconcile(t, testClient(t, req, cp, plan), req)
@@ -326,5 +408,46 @@ func TestRuntimeTelemetryGatesVerifiedStatus(t *testing.T) {
 	got = reconcile(t, testClient(t, req, cp, plan, trainingRuntime(req, "wrong-pod-uid", metav1.Now())), req)
 	if got.Status.Phase != "Running" {
 		t.Fatalf("wrong pod runtime evidence accepted: %+v", got.Status)
+	}
+}
+
+func TestPartialRestoreAuthorizesReleaseThenVerifiesAfterSurvivorResume(t *testing.T) {
+	req, cp := fixture()
+	makeSameClusterPartial(req, cp)
+	plan, err := desiredPlan(req, cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Generation = 1
+	now := metav1.Now()
+	gone := metav1.NewTime(now.Time.Add(-time.Second))
+	fences := []api.SourcePodFenceStatus{{PodName: "db-0", SourcePodUID: "target-source-uid", ObservedGeneration: 1, Phase: "SourceGone", DeleteRequestedAt: &gone, GoneObservedAt: &gone}}
+	plan.Status.Clusters = []api.ClusterStatus{{ClusterName: req.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Running", Message: "target restored", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}, SourceFences: fences}}
+	c := testClient(t, req, cp, plan)
+
+	got := reconcile(t, c, req)
+	if got.Status.Phase != "RestoreReady" {
+		t.Fatalf("phase = %q: %+v", got.Status.Phase, got.Status)
+	}
+	var annotated unstructured.Unstructured
+	annotated.SetGroupVersionKind(checkpointGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: cp.GetNamespace(), Name: cp.GetName()}, &annotated); err != nil {
+		t.Fatal(err)
+	}
+	if annotated.GetAnnotations()[annotationRestoreOwnedResume] != "true" {
+		t.Fatalf("restore-owned release annotation missing: %v", annotated.GetAnnotations())
+	}
+	source(&annotated)["phase"] = "Completed"
+	survivor := source(&annotated)["pods"].([]interface{})[1].(map[string]interface{})
+	survivor["phase"] = "Resumed"
+	if err := c.Update(context.Background(), &annotated); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), partialTrainingRuntime(req, "target-pod-uid", now)); err != nil {
+		t.Fatal(err)
+	}
+	got = reconcile(t, c, req)
+	if got.Status.Phase != "Verified" {
+		t.Fatalf("phase after release/runtime = %q: %+v", got.Status.Phase, got.Status)
 	}
 }

@@ -30,38 +30,58 @@ type CheckpointReference struct {
 	CheckpointID string `json:"checkpointID"`
 }
 type Archive struct {
-	ContainerName string `json:"containerName"`
-	SourcePath    string `json:"sourcePath"`
-	TargetPath    string `json:"targetPath"`
-	SHA256        string `json:"sha256"`
+	ArchiveEvidenceID string `json:"archiveEvidenceID,omitempty"`
+	DurableRef        string `json:"durableRef,omitempty"`
+	ContainerName     string `json:"containerName,omitempty"`
+	SourcePath        string `json:"sourcePath,omitempty"`
+	TargetPath        string `json:"targetPath,omitempty"`
+	SHA256            string `json:"sha256"`
 }
 type RestorePod struct {
-	SourcePod  string    `json:"sourcePod"`
-	SourceNode string    `json:"sourceNode"`
-	TargetPod  string    `json:"targetPod"`
-	TargetNode string    `json:"targetNode"`
-	Archives   []Archive `json:"archives"`
+	Rank         int64     `json:"rank,omitempty"`
+	SourcePod    string    `json:"sourcePod"`
+	SourcePodUID string    `json:"sourcePodUID,omitempty"`
+	SourceNode   string    `json:"sourceNode"`
+	TargetPod    string    `json:"targetPod"`
+	TargetNode   string    `json:"targetNode"`
+	Archives     []Archive `json:"archives"`
+}
+type SurvivorEvidence struct {
+	Rank          int64  `json:"rank"`
+	PodName       string `json:"podName"`
+	PodUID        string `json:"podUID"`
+	NodeName      string `json:"nodeName"`
+	Generation    int64  `json:"generation"`
+	PauseLockPath string `json:"pauseLockPath"`
+	ObservedAt    string `json:"observedAt,omitempty"`
+}
+type PartialRestoreSpec struct {
+	TargetRanks           []int64            `json:"targetRanks"`
+	PreservedSurvivors    []SurvivorEvidence `json:"preservedSurvivors"`
+	PreventPeriodicResume bool               `json:"preventPeriodicResume"`
 }
 type RestoreRequestSpec struct {
 	CheckpointRef      CheckpointReference `json:"checkpointRef"`
 	WorkloadRef        WorkloadReference   `json:"workloadRef"`
-	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef"`
+	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef,omitempty"`
 	SourceCluster      string              `json:"sourceCluster"`
 	TargetCluster      string              `json:"targetCluster"`
 	SourceFenced       bool                `json:"sourceFenced"`
 	VolumesReady       bool                `json:"volumesReady"`
 	Pods               []RestorePod        `json:"pods"`
+	PartialRestore     *PartialRestoreSpec `json:"partialRestore,omitempty"`
 }
 type RestorePlanSpec struct {
 	RequestUID         string              `json:"requestUID"`
 	CheckpointRef      CheckpointReference `json:"checkpointRef"`
 	WorkloadRef        WorkloadReference   `json:"workloadRef"`
-	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef"`
+	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef,omitempty"`
 	SourceCluster      string              `json:"sourceCluster"`
 	TargetCluster      string              `json:"targetCluster"`
 	SourceFenced       bool                `json:"sourceFenced"`
 	VolumesReady       bool                `json:"volumesReady"`
 	Pods               []RestorePod        `json:"pods"`
+	PartialRestore     *PartialRestoreSpec `json:"partialRestore,omitempty"`
 }
 type ArtifactStatus struct {
 	NodeName           string      `json:"nodeName"`
@@ -78,33 +98,75 @@ type PodStatus struct {
 	Message string `json:"message,omitempty"`
 }
 type ClusterStatus struct {
-	ClusterName        string      `json:"clusterName"`
-	ObservedGeneration int64       `json:"observedGeneration,omitempty"`
-	Phase              string      `json:"phase,omitempty"`
-	Message            string      `json:"message,omitempty"`
-	Pods               []PodStatus `json:"pods,omitempty"`
+	ClusterName        string                 `json:"clusterName"`
+	ObservedGeneration int64                  `json:"observedGeneration,omitempty"`
+	Phase              string                 `json:"phase,omitempty"`
+	Message            string                 `json:"message,omitempty"`
+	Pods               []PodStatus            `json:"pods,omitempty"`
+	SourceFences       []SourcePodFenceStatus `json:"sourceFences,omitempty"`
+}
+type SourcePodFenceStatus struct {
+	PodName            string       `json:"podName"`
+	SourcePodUID       string       `json:"sourcePodUID"`
+	ObservedGeneration int64        `json:"observedGeneration"`
+	Phase              string       `json:"phase"`
+	Message            string       `json:"message,omitempty"`
+	DeleteRequestedAt  *metav1.Time `json:"deleteRequestedAt,omitempty"`
+	GoneObservedAt     *metav1.Time `json:"goneObservedAt,omitempty"`
+}
+type SourceFenceEvidence struct {
+	Fenced     bool   `json:"fenced"`
+	Operation  string `json:"operation,omitempty"`
+	EvidenceID string `json:"evidenceID,omitempty"`
+	ObservedAt string `json:"observedAt,omitempty"`
 }
 type RuntimeReference struct {
 	Name string `json:"name"`
 	UID  string `json:"uid,omitempty"`
 }
+type PartialRestoreTargetEvidence struct {
+	Rank              int64  `json:"rank"`
+	TargetPodUID      string `json:"targetPodUID"`
+	CheckpointID      string `json:"checkpointID"`
+	ArchiveEvidenceID string `json:"archiveEvidenceID"`
+}
+type StateEvidence struct {
+	Kind       string `json:"kind"`
+	ObservedAt string `json:"observedAt"`
+}
+type SurvivorStateEvidence struct {
+	Rank          int64         `json:"rank"`
+	PodUID        string        `json:"podUID"`
+	StateEvidence StateEvidence `json:"stateEvidence"`
+}
+type PartialRestoreVerification struct {
+	PreventPeriodicResume bool                           `json:"preventPeriodicResume"`
+	TargetRanks           []PartialRestoreTargetEvidence `json:"targetRanks"`
+}
 type RestoreVerification struct {
-	RequestUID         string           `json:"requestUID"`
-	CheckpointID       string           `json:"checkpointID"`
-	VerifiedAt         metav1.Time      `json:"verifiedAt"`
-	TrainingRuntimeRef RuntimeReference `json:"trainingRuntimeRef"`
-	SourceCluster      string           `json:"sourceCluster"`
-	TargetCluster      string           `json:"targetCluster"`
+	RequestUID         string                      `json:"requestUID"`
+	Operation          string                      `json:"operation,omitempty"`
+	CheckpointID       string                      `json:"checkpointID"`
+	VerifiedAt         metav1.Time                 `json:"verifiedAt"`
+	TrainingRuntimeRef RuntimeReference            `json:"trainingRuntimeRef"`
+	SourceCluster      string                      `json:"sourceCluster"`
+	TargetCluster      string                      `json:"targetCluster"`
+	SourceFenced       bool                        `json:"sourceFenced"`
+	SourceFence        SourceFenceEvidence         `json:"sourceFence,omitempty"`
+	PartialRestore     *PartialRestoreVerification `json:"partialRestore,omitempty"`
+	PreservedSurvivors []SurvivorEvidence          `json:"preservedSurvivors,omitempty"`
+	Survivors          []SurvivorStateEvidence     `json:"survivors,omitempty"`
 }
 type RestoreStatus struct {
-	ObservedGeneration int64                `json:"observedGeneration,omitempty"`
-	Phase              string               `json:"phase,omitempty"`
-	Message            string               `json:"message,omitempty"`
-	PlanName           string               `json:"planName,omitempty"`
-	Artifacts          []ArtifactStatus     `json:"artifacts,omitempty"`
-	Pods               []PodStatus          `json:"pods,omitempty"`
-	Clusters           []ClusterStatus      `json:"clusters,omitempty"`
-	Verification       *RestoreVerification `json:"verification,omitempty"`
+	ObservedGeneration int64                  `json:"observedGeneration,omitempty"`
+	Phase              string                 `json:"phase,omitempty"`
+	Message            string                 `json:"message,omitempty"`
+	PlanName           string                 `json:"planName,omitempty"`
+	Artifacts          []ArtifactStatus       `json:"artifacts,omitempty"`
+	Pods               []PodStatus            `json:"pods,omitempty"`
+	SourceFences       []SourcePodFenceStatus `json:"sourceFences,omitempty"`
+	Clusters           []ClusterStatus        `json:"clusters,omitempty"`
+	Verification       *RestoreVerification   `json:"verification,omitempty"`
 }
 type RestoreRequest struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -141,10 +203,46 @@ func copyPods(in []RestorePod) []RestorePod {
 	}
 	return out
 }
+func copyPartial(in *PartialRestoreSpec) *PartialRestoreSpec {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.TargetRanks != nil {
+		out.TargetRanks = append([]int64{}, in.TargetRanks...)
+	}
+	if in.PreservedSurvivors != nil {
+		out.PreservedSurvivors = append([]SurvivorEvidence{}, in.PreservedSurvivors...)
+	}
+	return &out
+}
+
+func copyPartialVerification(in *PartialRestoreVerification) *PartialRestoreVerification {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.TargetRanks != nil {
+		out.TargetRanks = append([]PartialRestoreTargetEvidence{}, in.TargetRanks...)
+	}
+	return &out
+}
+
+func CopyPartialRestoreForStatus(in *PartialRestoreSpec) *PartialRestoreSpec {
+	return copyPartial(in)
+}
+
 func copyStatus(in RestoreStatus) RestoreStatus {
 	out := in
 	if in.Verification != nil {
 		verification := *in.Verification
+		verification.PartialRestore = copyPartialVerification(in.Verification.PartialRestore)
+		if in.Verification.PreservedSurvivors != nil {
+			verification.PreservedSurvivors = append([]SurvivorEvidence{}, in.Verification.PreservedSurvivors...)
+		}
+		if in.Verification.Survivors != nil {
+			verification.Survivors = append([]SurvivorStateEvidence{}, in.Verification.Survivors...)
+		}
 		out.Verification = &verification
 	}
 	if in.Artifacts != nil {
@@ -153,11 +251,17 @@ func copyStatus(in RestoreStatus) RestoreStatus {
 	if in.Pods != nil {
 		out.Pods = append([]PodStatus{}, in.Pods...)
 	}
+	if in.SourceFences != nil {
+		out.SourceFences = append([]SourcePodFenceStatus{}, in.SourceFences...)
+	}
 	if in.Clusters != nil {
 		out.Clusters = append([]ClusterStatus{}, in.Clusters...)
 		for i := range out.Clusters {
 			if in.Clusters[i].Pods != nil {
 				out.Clusters[i].Pods = append([]PodStatus{}, in.Clusters[i].Pods...)
+			}
+			if in.Clusters[i].SourceFences != nil {
+				out.Clusters[i].SourceFences = append([]SourcePodFenceStatus{}, in.Clusters[i].SourceFences...)
 			}
 		}
 	}
@@ -171,6 +275,7 @@ func (x *RestoreRequest) DeepCopy() *RestoreRequest {
 	*out = *x
 	out.ObjectMeta = *x.ObjectMeta.DeepCopy()
 	out.Spec.Pods = copyPods(x.Spec.Pods)
+	out.Spec.PartialRestore = copyPartial(x.Spec.PartialRestore)
 	out.Status = copyStatus(x.Status)
 	return out
 }
@@ -203,6 +308,7 @@ func (x *RestorePlan) DeepCopy() *RestorePlan {
 	*out = *x
 	out.ObjectMeta = *x.ObjectMeta.DeepCopy()
 	out.Spec.Pods = copyPods(x.Spec.Pods)
+	out.Spec.PartialRestore = copyPartial(x.Spec.PartialRestore)
 	out.Status = copyStatus(x.Status)
 	return out
 }

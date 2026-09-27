@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -89,6 +90,31 @@ func TestCheckpointAndResume(t *testing.T) {
 		if all, ok := b["all"].(bool); !ok || !all {
 			t.Errorf("request body = %v, want {\"all\":true}", b)
 		}
+	}
+}
+
+func TestResumeOwnedPayload(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/resume" {
+			t.Fatalf("path = %s, want /resume", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":{"lock":"removed"}}`))
+	}))
+	defer srv.Close()
+
+	host, port := listenerHostPort(t, srv.URL)
+	if _, err := NewClient().ResumeOwned(context.Background(), host, port, time.Second, "round-123", 77); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"all": true, "checkpointID": "round-123", "generation": float64(77), "restoreOwnedResume": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("payload = %#v, want %#v", got, want)
 	}
 }
 

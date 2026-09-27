@@ -35,7 +35,6 @@ spec:
             required:
             - checkpointRef
             - workloadRef
-            - trainingRuntimeRef
             - sourceCluster
             - targetCluster
             - sourceFenced
@@ -144,6 +143,13 @@ spec:
                       type: string
                       minLength: 1
                       maxLength: 253
+                    sourcePodUID:
+                      type: string
+                      maxLength: 128
+                    rank:
+                      type: integer
+                      format: int64
+                      minimum: 0
                     sourceNode:
                       type: string
                       minLength: 1
@@ -160,29 +166,27 @@ spec:
                       type: array
                       minItems: 1
                       maxItems: 1
-                      x-kubernetes-list-type: map
-                      x-kubernetes-list-map-keys:
-                      - containerName
+                      x-kubernetes-list-type: atomic
                       items:
                         type: object
                         required:
-                        - containerName
-                        - sourcePath
-                        - targetPath
                         - sha256
                         properties:
+                          archiveEvidenceID:
+                            type: string
+                            maxLength: 253
+                          durableRef:
+                            type: string
+                            maxLength: 1024
                           containerName:
                             type: string
-                            minLength: 1
                             maxLength: 253
                           sourcePath:
                             type: string
-                            minLength: 2
                             maxLength: 1024
                             pattern: ^/([A-Za-z0-9._:+-]*[A-Za-z0-9_:+-][A-Za-z0-9._:+-]*/)*[A-Za-z0-9._:+-]*[A-Za-z0-9_:+-][A-Za-z0-9._:+-]*$
                           targetPath:
                             type: string
-                            minLength: 30
                             maxLength: 1024
                             pattern: ^/var/lib/kubelet/checkpoints/([A-Za-z0-9._:+-]*[A-Za-z0-9_:+-][A-Za-z0-9._:+-]*/)*[A-Za-z0-9._:+-]*[A-Za-z0-9_:+-][A-Za-z0-9._:+-]*$
                           sha256:
@@ -190,6 +194,69 @@ spec:
                             minLength: 64
                             maxLength: 64
                             pattern: ^[0-9a-f]{64}$
+              partialRestore:
+                type: object
+                required:
+                - targetRanks
+                - preservedSurvivors
+                - preventPeriodicResume
+                properties:
+                  targetRanks:
+                    type: array
+                    minItems: 1
+                    maxItems: 64
+                    x-kubernetes-list-type: set
+                    items:
+                      type: integer
+                      format: int64
+                      minimum: 0
+                  preservedSurvivors:
+                    type: array
+                    minItems: 1
+                    maxItems: 64
+                    x-kubernetes-list-type: map
+                    x-kubernetes-list-map-keys:
+                    - podName
+                    items:
+                      type: object
+                      required:
+                      - rank
+                      - podName
+                      - podUID
+                      - nodeName
+                      - generation
+                      - pauseLockPath
+                      properties:
+                        rank:
+                          type: integer
+                          format: int64
+                          minimum: 0
+                        podName:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        podUID:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                        nodeName:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        generation:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                        pauseLockPath:
+                          type: string
+                          minLength: 2
+                          maxLength: 1024
+                          pattern: ^/.*pause-lock$
+                        observedAt:
+                          type: string
+                          maxLength: 64
+                  preventPeriodicResume:
+                    type: boolean
           status:
             type: object
             properties:
@@ -265,6 +332,45 @@ spec:
                     message:
                       type: string
                       maxLength: 4096
+              sourceFences:
+                type: array
+                maxItems: 512
+                x-kubernetes-list-type: map
+                x-kubernetes-list-map-keys:
+                - podName
+                items:
+                  type: object
+                  required:
+                  - podName
+                  - sourcePodUID
+                  - observedGeneration
+                  - phase
+                  properties:
+                    podName:
+                      type: string
+                      minLength: 1
+                      maxLength: 253
+                    sourcePodUID:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    observedGeneration:
+                      type: integer
+                      format: int64
+                      minimum: 0
+                    phase:
+                      type: string
+                      minLength: 1
+                      maxLength: 64
+                    message:
+                      type: string
+                      maxLength: 4096
+                    deleteRequestedAt:
+                      type: string
+                      format: date-time
+                    goneObservedAt:
+                      type: string
+                      format: date-time
               verification:
                 type: object
                 required:
@@ -274,11 +380,15 @@ spec:
                 - trainingRuntimeRef
                 - sourceCluster
                 - targetCluster
+                - sourceFenced
                 properties:
                   requestUID:
                     type: string
                     minLength: 1
                     maxLength: 128
+                  operation:
+                    type: string
+                    maxLength: 253
                   checkpointID:
                     type: string
                     minLength: 1
@@ -306,6 +416,132 @@ spec:
                     type: string
                     minLength: 1
                     maxLength: 253
+                  sourceFenced:
+                    type: boolean
+                  sourceFence:
+                    type: object
+                    required:
+                    - fenced
+                    properties:
+                      fenced:
+                        type: boolean
+                      operation:
+                        type: string
+                        maxLength: 253
+                      evidenceID:
+                        type: string
+                        maxLength: 253
+                      observedAt:
+                        type: string
+                        maxLength: 64
+                  partialRestore:
+                    type: object
+                    required:
+                    - targetRanks
+                    - preventPeriodicResume
+                    properties:
+                      preventPeriodicResume:
+                        type: boolean
+                      targetRanks:
+                        type: array
+                        minItems: 1
+                        maxItems: 1024
+                        items:
+                          type: object
+                          required:
+                          - rank
+                          - targetPodUID
+                          - checkpointID
+                          - archiveEvidenceID
+                          properties:
+                            rank:
+                              type: integer
+                              format: int64
+                              minimum: 0
+                            targetPodUID:
+                              type: string
+                              minLength: 1
+                              maxLength: 128
+                            checkpointID:
+                              type: string
+                              minLength: 1
+                              maxLength: 253
+                            archiveEvidenceID:
+                              type: string
+                              minLength: 1
+                              maxLength: 253
+                  preservedSurvivors:
+                    type: array
+                    maxItems: 1024
+                    items:
+                      type: object
+                      required:
+                      - rank
+                      - podName
+                      - podUID
+                      - nodeName
+                      - generation
+                      - pauseLockPath
+                      properties:
+                        rank:
+                          type: integer
+                          format: int64
+                          minimum: 0
+                        podName:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        podUID:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                        nodeName:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                        generation:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                        pauseLockPath:
+                          type: string
+                          minLength: 1
+                          maxLength: 4096
+                        observedAt:
+                          type: string
+                          maxLength: 64
+                  survivors:
+                    type: array
+                    maxItems: 1024
+                    items:
+                      type: object
+                      required:
+                      - rank
+                      - podUID
+                      - stateEvidence
+                      properties:
+                        rank:
+                          type: integer
+                          format: int64
+                          minimum: 0
+                        podUID:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                        stateEvidence:
+                          type: object
+                          required:
+                          - kind
+                          - observedAt
+                          properties:
+                            kind:
+                              type: string
+                              minLength: 1
+                              maxLength: 64
+                            observedAt:
+                              type: string
+                              minLength: 1
+                              maxLength: 64
               clusters:
                 type: array
                 maxItems: 64
@@ -357,3 +593,42 @@ spec:
                           message:
                             type: string
                             maxLength: 4096
+                    sourceFences:
+                      type: array
+                      maxItems: 512
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys:
+                      - podName
+                      items:
+                        type: object
+                        required:
+                        - podName
+                        - sourcePodUID
+                        - observedGeneration
+                        - phase
+                        properties:
+                          podName:
+                            type: string
+                            minLength: 1
+                            maxLength: 253
+                          sourcePodUID:
+                            type: string
+                            minLength: 1
+                            maxLength: 128
+                          observedGeneration:
+                            type: integer
+                            format: int64
+                            minimum: 0
+                          phase:
+                            type: string
+                            minLength: 1
+                            maxLength: 64
+                          message:
+                            type: string
+                            maxLength: 4096
+                          deleteRequestedAt:
+                            type: string
+                            format: date-time
+                          goneObservedAt:
+                            type: string
+                            format: date-time

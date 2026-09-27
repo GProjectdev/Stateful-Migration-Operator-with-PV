@@ -3,10 +3,15 @@ package member
 import (
 	"context"
 	"fmt"
+	"strconv"
+
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/artifact"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -15,6 +20,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"time"
 )
+
+const WebhookServiceName = "stateful-restore-webhook"
+const WebhookServiceNamespace = "stateful-migration-system"
 
 type Reconciler struct {
 	Client      client.Client
@@ -62,13 +70,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return nil
 		}
 		before := plan.DeepCopy().Status
-		phase, message, pods, err := r.evaluate(ctx, &plan)
+		phase, message, pods, sourceFences, err := r.evaluate(ctx, &plan)
 		if err != nil {
 			return err
 		}
 		// Each retry starts with a fresh object, retaining independent node reports.
 		plan.Status.ObservedGeneration = plan.Generation
 		plan.Status.Phase, plan.Status.Message, plan.Status.Pods = phase, message, pods
+		plan.Status.SourceFences = sourceFences
 		if reflect.DeepEqual(before, plan.Status) {
 			return nil
 		}
@@ -77,40 +86,68 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 }
 
-func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (string, string, []api.PodStatus, error) {
+func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (string, string, []api.PodStatus, []api.SourcePodFenceStatus, error) {
 	if err := validatePlan(plan, r.ClusterName); err != nil {
-		return "Failed", err.Error(), nil, nil
+		return "Failed", err.Error(), nil, nil, nil
 	}
 	prepared, running := true, true
 	failure := ""
 	statuses := make([]api.PodStatus, 0, len(plan.Spec.Pods))
+	sourceFences := []api.SourcePodFenceStatus(nil)
+	partial := plan.Spec.PartialRestore != nil
 	for _, mapping := range plan.Spec.Pods {
+		mappingReady := true
 		var node corev1.Node
 		if err := r.Reader.Get(ctx, client.ObjectKey{Name: mapping.TargetNode}, &node); err != nil {
 			if !apierrors.IsNotFound(err) {
-				return "", "", nil, err
+				return "", "", nil, nil, err
 			}
 			failure = "target node does not exist"
+			mappingReady = false
 		} else if node.Labels[RuntimeCapabilityLabel] != "true" {
 			failure = "target node lacks admin-certified restore-from-file capability"
+			mappingReady = false
 		}
 		if !artifact.Fresh(plan, mapping.TargetNode, time.Now()) {
 			prepared = false
+			mappingReady = false
 		}
 		for _, report := range plan.Status.Artifacts {
 			if report.NodeName == mapping.TargetNode && report.ObservedGeneration == plan.Generation && !report.Verified {
 				failure = "target archive verification failed"
+				mappingReady = false
 			}
 		}
 		var pod corev1.Pod
 		err := r.Reader.Get(ctx, client.ObjectKey{Namespace: plan.Namespace, Name: mapping.TargetPod}, &pod)
+		if partial {
+			fence, fenced, fail, err := r.ensureSourceFenced(ctx, plan, &mapping, mappingReady, previousSourceFence(plan, &mapping), &pod, err)
+			sourceFences = append(sourceFences, fence)
+			if err != nil {
+				return "", "", nil, nil, err
+			}
+			if fail != "" {
+				status := api.PodStatus{Name: mapping.TargetPod, Phase: "Failed", Message: fail}
+				if err == nil {
+					status.UID = string(pod.UID)
+				}
+				statuses = append(statuses, status)
+				failure = fail
+				continue
+			}
+			if !fenced {
+				running = false
+				statuses = append(statuses, api.PodStatus{Name: mapping.TargetPod, Phase: "SourceFencing", Message: fence.Message})
+				continue
+			}
+		}
 		if apierrors.IsNotFound(err) {
 			running = false
 			statuses = append(statuses, api.PodStatus{Name: mapping.TargetPod, Phase: "Pending", Message: "waiting for externally created Pod"})
 			continue
 		}
 		if err != nil {
-			return "", "", nil, err
+			return "", "", nil, nil, err
 		}
 		status := api.PodStatus{Name: pod.Name, UID: string(pod.UID), Phase: string(pod.Status.Phase)}
 		if err := verifyBoundPod(plan, &mapping, &pod, true); err != nil {
@@ -143,13 +180,164 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		statuses = append(statuses, status)
 	}
 	if failure != "" {
-		return "Failed", failure, statuses, nil
+		return "Failed", failure, statuses, sourceFences, nil
 	}
 	if !prepared {
-		return "AwaitingArtifacts", "waiting for fresh current-generation node archive reports", statuses, nil
+		return "AwaitingArtifacts", "waiting for fresh current-generation node archive reports", statuses, sourceFences, nil
 	}
 	if running {
-		return "Running", "all planned Pods are Running and Ready; CRIU restore success is not attested", statuses, nil
+		return "Running", "all planned Pods are Running and Ready; CRIU restore success is not attested", statuses, sourceFences, nil
 	}
-	return "Prepared", "target archives verified; waiting for planned Pods to become Running and Ready", statuses, nil
+	return "Prepared", "target archives verified; waiting for planned Pods to become Running and Ready", statuses, sourceFences, nil
+}
+
+func previousSourceFence(plan *api.RestorePlan, mapping *api.RestorePod) *api.SourcePodFenceStatus {
+	for i := range plan.Status.SourceFences {
+		fence := &plan.Status.SourceFences[i]
+		if fence.PodName == mapping.TargetPod && fence.SourcePodUID == mapping.SourcePodUID && fence.ObservedGeneration == plan.Generation {
+			return fence
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) ensureSourceFenced(ctx context.Context, plan *api.RestorePlan, mapping *api.RestorePod, staged bool, previous *api.SourcePodFenceStatus, pod *corev1.Pod, podErr error) (api.SourcePodFenceStatus, bool, string, error) {
+	fence := api.SourcePodFenceStatus{PodName: mapping.TargetPod, SourcePodUID: mapping.SourcePodUID, ObservedGeneration: plan.Generation, Phase: "Pending", Message: "waiting for fresh archive, survivor evidence, certified target node, and ready source node before source Pod deletion"}
+	if previous != nil {
+		fence.DeleteRequestedAt = previous.DeleteRequestedAt
+		fence.GoneObservedAt = previous.GoneObservedAt
+	}
+	if mapping.SourcePodUID == "" {
+		fence.Phase, fence.Message = "Refused", "partial restore mapping is missing sourcePodUID"
+		return fence, false, fence.Message, nil
+	}
+	if apierrors.IsNotFound(podErr) {
+		if previous == nil || previous.DeleteRequestedAt == nil {
+			fence.Phase, fence.Message = "Refused", "source Pod name is absent without a controller-owned delete request"
+			return fence, false, fence.Message, nil
+		}
+		if fence.GoneObservedAt == nil {
+			now := metav1.Now()
+			fence.GoneObservedAt = &now
+		}
+		fence.Phase, fence.Message = "SourceGone", "source Pod UID is gone after controller-owned UID-precondition delete"
+		return fence, true, "", nil
+	}
+	if podErr != nil {
+		return fence, false, "", podErr
+	}
+	if string(pod.UID) == mapping.SourcePodUID {
+		if !staged {
+			return fence, false, "", nil
+		}
+		if err := validateSourcePodForDeletion(ctx, r.Reader, plan, mapping, pod); err != nil {
+			fence.Phase, fence.Message = "Refused", err.Error()
+			return fence, false, fence.Message, nil
+		}
+		if !pod.DeletionTimestamp.IsZero() {
+			fence.Phase, fence.Message = "DeleteRequested", "source Pod UID is already deleting after controller-owned request"
+			return fence, false, "", nil
+		}
+		uid := types.UID(mapping.SourcePodUID)
+		grace := int64(30)
+		if err := r.Client.Delete(ctx, pod, client.GracePeriodSeconds(grace), client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+			return fence, false, "", err
+		}
+		now := metav1.Now()
+		fence.Phase, fence.Message, fence.DeleteRequestedAt = "DeleteRequested", "UID-precondition graceful delete requested for source Pod", &now
+		return fence, false, "", nil
+	}
+	if pod.Annotations[PlanUIDAnnotation] == string(plan.UID) && pod.Annotations[PlanGenerationAnnotation] == strconv.FormatInt(plan.Generation, 10) {
+		if previous == nil || previous.DeleteRequestedAt == nil {
+			fence.Phase, fence.Message = "Refused", "replacement Pod appeared before a controller-owned source delete request"
+			return fence, false, fence.Message, nil
+		}
+		if fence.GoneObservedAt == nil {
+			now := metav1.Now()
+			fence.GoneObservedAt = &now
+		}
+		fence.Phase, fence.Message = "SourceGone", "replacement Pod is bound to current restore plan after old source UID was deleted"
+		return fence, true, "", nil
+	}
+	fence.Phase, fence.Message = "Refused", "mapped Pod UID collision before source UID was fenced"
+	return fence, false, fence.Message, nil
+}
+
+func validateSourcePodForDeletion(ctx context.Context, reader client.Reader, plan *api.RestorePlan, mapping *api.RestorePod, pod *corev1.Pod) error {
+	if pod.Spec.NodeName == "" {
+		return fmt.Errorf("source Pod is not bound to a node")
+	}
+	if mapping.SourceNode != "" && pod.Spec.NodeName != mapping.SourceNode {
+		return fmt.Errorf("source Pod node does not match checkpoint evidence")
+	}
+	if !sourcePodOwnedByWorkload(plan, pod) {
+		return fmt.Errorf("source Pod owner does not match restore workload UID")
+	}
+	if err := validateAdmissionReady(ctx, reader, plan); err != nil {
+		return err
+	}
+	var node corev1.Node
+	if err := reader.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("source Pod node does not exist")
+		}
+		return err
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+			return nil
+		}
+	}
+	return fmt.Errorf("source Pod node is not Ready")
+}
+
+func validateAdmissionReady(ctx context.Context, reader client.Reader, plan *api.RestorePlan) error {
+	if plan.Spec.WorkloadRef.Kind != "StatefulSet" {
+		return nil
+	}
+	var sts appsv1.StatefulSet
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: plan.Namespace, Name: plan.Spec.WorkloadRef.Name}, &sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("restore workload StatefulSet does not exist")
+		}
+		return err
+	}
+	if string(sts.UID) != plan.Spec.WorkloadRef.UID || !sts.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("restore workload StatefulSet UID mismatch or deleting")
+	}
+	if sts.Spec.Template.Labels[WorkloadUIDLabel] != plan.Spec.WorkloadRef.UID {
+		return fmt.Errorf("StatefulSet template lacks workload UID label required by partial restore admission")
+	}
+	if sts.Spec.Template.Annotations[InjectAnnotation] != "true" {
+		return fmt.Errorf("StatefulSet template lacks fluidcr inject opt-in required before source deletion")
+	}
+	var endpoints corev1.Endpoints
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: WebhookServiceNamespace, Name: WebhookServiceName}, &endpoints); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("restore webhook endpoints are not available")
+		}
+		return err
+	}
+	for _, subset := range endpoints.Subsets {
+		if len(subset.Addresses) == 0 || len(subset.Ports) == 0 {
+			continue
+		}
+		for _, port := range subset.Ports {
+			if port.Port == 9443 || port.Name == "webhook" || port.Port == 443 {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("restore webhook endpoints have no ready webhook backend")
+}
+
+func sourcePodOwnedByWorkload(plan *api.RestorePlan, pod *corev1.Pod) bool {
+	if plan.Spec.WorkloadRef.Kind == "Pod" {
+		return pod.Name == plan.Spec.WorkloadRef.Name && len(pod.OwnerReferences) == 0
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.APIVersion != plan.Spec.WorkloadRef.APIVersion || owner.Kind != plan.Spec.WorkloadRef.Kind || owner.Name != plan.Spec.WorkloadRef.Name {
+		return false
+	}
+	return plan.Spec.WorkloadRef.UID == "" || string(owner.UID) == plan.Spec.WorkloadRef.UID
 }

@@ -70,14 +70,14 @@ func TestRestoreCRDsAreStructuralAndValidateObjects(t *testing.T) {
 					want: "Duplicate value",
 				},
 				{
-					name: "archives are keyed by containerName",
+					name: "only one selected archive per pod",
 					edit: func(obj map[string]any) {
 						archives := restoreSlice(t, obj, "spec", "pods", "archives")
 						archive := restoreCloneMap(t, archives[0].(map[string]any))
 						archive["sourcePath"] = "/var/lib/checkpoints/other.tar"
 						restoreMap(t, restoreSlice(t, obj, "spec", "pods")[0].(map[string]any))["archives"] = append(archives, archive)
 					},
-					want: "Duplicate value",
+					want: "must have at most 1 items",
 				},
 				{
 					name: "lowercase sha256 hex64",
@@ -302,7 +302,7 @@ func restoreObject(file string) map[string]any {
 	spec["targetCluster"] = "target"
 	spec["sourceFenced"] = true
 	spec["volumesReady"] = true
-	spec["pods"] = []any{map[string]any{"sourcePod": "database-0", "sourceNode": "source-node", "targetPod": "database-0-restore", "targetNode": "node-a", "archives": []any{map[string]any{"containerName": "app", "sourcePath": "/var/lib/checkpoints/checkpoint.tar", "targetPath": "/var/lib/kubelet/checkpoints/checkpoint.tar", "sha256": strings.Repeat("a", 64)}}}}
+	spec["pods"] = []any{map[string]any{"sourcePod": "database-0", "sourceNode": "source-node", "targetPod": "database-0-restore", "targetNode": "node-a", "archives": []any{map[string]any{"archiveEvidenceID": "archive-1", "durableRef": "file-store:default/sha256/" + strings.Repeat("a", 64), "containerName": "app", "sourcePath": "/var/lib/checkpoints/checkpoint.tar", "targetPath": "/var/lib/kubelet/checkpoints/checkpoint.tar", "sha256": strings.Repeat("a", 64)}}}}
 	return map[string]any{"apiVersion": "migration.dcnlab.com/v1alpha1", "kind": kind, "metadata": map[string]any{"name": name, "namespace": "default"}, "spec": spec, "status": restoreStatus()}
 }
 

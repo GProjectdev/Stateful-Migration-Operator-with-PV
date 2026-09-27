@@ -51,10 +51,13 @@ func NewClient() *Client {
 
 // allRequest is the request body that targets every GPU-using worker in the pod.
 type allRequest struct {
-	All            bool    `json:"all"`
-	Wait           bool    `json:"wait,omitempty"`
-	TimeoutSeconds float64 `json:"timeoutSeconds,omitempty"`
-	CheckpointID   string  `json:"checkpointID,omitempty"`
+	All                bool    `json:"all"`
+	Ranks              []int64 `json:"ranks,omitempty"`
+	Wait               bool    `json:"wait,omitempty"`
+	TimeoutSeconds     float64 `json:"timeoutSeconds,omitempty"`
+	CheckpointID       string  `json:"checkpointID,omitempty"`
+	Generation         int64   `json:"generation,omitempty"`
+	RestoreOwnedResume bool    `json:"restoreOwnedResume,omitempty"`
 }
 
 // response models the control-API JSON response.
@@ -67,16 +70,118 @@ type response struct {
 // pod and blocks (server-side) until the checkpoint locks are ready or the
 // in-pod timeout elapses. It returns the per-worker result map.
 func (c *Client) Checkpoint(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string) (map[string]string, error) {
-	return c.post(ctx, podIP, port, "/checkpoint", timeout, checkpointID)
+	return c.post(ctx, podIP, port, "/checkpoint", timeout, checkpointID, nil)
+}
+
+// CheckpointRanks triggers a manifest-driven partial checkpoint for the exact
+// target ranks. It does not wait for all ranks to produce application locks;
+// the FluidCR runtime role split makes target ranks exit and survivors park.
+func (c *Client) CheckpointRanks(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string, ranks []int64) (map[string]string, error) {
+	if len(ranks) == 0 {
+		return nil, fmt.Errorf("partial checkpoint requires target ranks")
+	}
+	return c.post(ctx, podIP, port, "/checkpoint", timeout, checkpointID, append([]int64{}, ranks...))
 }
 
 // Resume releases all pending checkpoint locks in the pod so the workers
 // continue. It is idempotent: pods without a pending lock report no-op.
 func (c *Client) Resume(ctx context.Context, podIP string, port int, timeout time.Duration) (map[string]string, error) {
-	return c.post(ctx, podIP, port, "/resume", timeout, "")
+	return c.post(ctx, podIP, port, "/resume", timeout, "", nil)
 }
 
-func (c *Client) post(ctx context.Context, podIP string, port int, path string, timeout time.Duration, checkpointID string) (map[string]string, error) {
+// ResumeOwned releases restore-owned survivor locks after a partial same-cluster
+// target replacement has native restore proof. The payload is intentionally
+// scoped so ordinary periodic/full-world resume calls cannot release survivors.
+func (c *Client) ResumeOwned(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string, generation int64) (map[string]string, error) {
+	if strings.TrimSpace(checkpointID) == "" {
+		return nil, fmt.Errorf("restore-owned resume requires checkpointID")
+	}
+	if generation <= 0 {
+		return nil, fmt.Errorf("restore-owned resume requires generation")
+	}
+	return c.postResumeOwned(ctx, podIP, port, timeout, checkpointID, generation)
+}
+
+type RuntimeStatus struct {
+	Rank             int64            `json:"rank"`
+	WorldSize        int64            `json:"worldSize"`
+	State            string           `json:"state"`
+	CheckpointID     string           `json:"checkpointID"`
+	SurvivorEvidence SurvivorEvidence `json:"survivorEvidence"`
+}
+
+type SurvivorEvidence struct {
+	Generation    int64  `json:"generation"`
+	PauseLockPath string `json:"pauseLockPath"`
+	PauseLockPID  int64  `json:"pauseLockPID"`
+	ObservedAt    string `json:"observedAt"`
+}
+
+// Runtime reads the in-pod runtime status endpoint used to prove survivor pause evidence.
+func (c *Client) Runtime(ctx context.Context, podIP string, port int, timeout time.Duration) (RuntimeStatus, error) {
+	var zero RuntimeStatus
+	if net.ParseIP(podIP) == nil {
+		return zero, fmt.Errorf("pod IP is empty")
+	}
+	if port <= 0 {
+		port = DefaultCtrlPort
+	}
+	if port > 65535 {
+		return zero, fmt.Errorf("invalid control port")
+	}
+	if timeout <= 0 || timeout > 300*time.Second {
+		timeout = 300 * time.Second
+	}
+	url := fmt.Sprintf("http://%s/runtime", net.JoinHostPort(podIP, strconv.Itoa(port)))
+	reqCtx, cancel := context.WithTimeout(ctx, timeout+10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return zero, fmt.Errorf("build runtime request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return zero, fmt.Errorf("call runtime API: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return zero, fmt.Errorf("read runtime response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return zero, fmt.Errorf("runtime API status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var parsed RuntimeStatus
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return zero, fmt.Errorf("parse runtime response %q: %w", strings.TrimSpace(string(body)), err)
+	}
+	return parsed, nil
+}
+
+func (c *Client) post(ctx context.Context, podIP string, port int, path string, timeout time.Duration, checkpointID string, ranks []int64) (map[string]string, error) {
+	return c.postJSON(ctx, podIP, port, path, timeout, func() ([]byte, error) {
+		payloadData := allRequest{All: true}
+		if path == "/checkpoint" {
+			if len(ranks) == 0 {
+				payloadData.Wait = true
+				payloadData.TimeoutSeconds = timeout.Seconds()
+			} else {
+				payloadData.All = false
+				payloadData.Ranks = ranks
+			}
+			payloadData.CheckpointID = checkpointID
+		}
+		return json.Marshal(payloadData)
+	}, ranks)
+}
+
+func (c *Client) postResumeOwned(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string, generation int64) (map[string]string, error) {
+	return c.postJSON(ctx, podIP, port, "/resume", timeout, func() ([]byte, error) {
+		return json.Marshal(allRequest{All: true, CheckpointID: checkpointID, Generation: generation, RestoreOwnedResume: true})
+	}, nil)
+}
+
+func (c *Client) postJSON(ctx context.Context, podIP string, port int, path string, timeout time.Duration, buildPayload func() ([]byte, error), ranks []int64) (map[string]string, error) {
 	if net.ParseIP(podIP) == nil {
 		return nil, fmt.Errorf("pod IP is empty")
 	}
@@ -91,13 +196,7 @@ func (c *Client) post(ctx context.Context, podIP string, port int, path string, 
 	}
 	url := fmt.Sprintf("http://%s%s", net.JoinHostPort(podIP, strconv.Itoa(port)), path)
 
-	payloadData := allRequest{All: true}
-	if path == "/checkpoint" {
-		payloadData.Wait = true
-		payloadData.TimeoutSeconds = timeout.Seconds()
-		payloadData.CheckpointID = checkpointID
-	}
-	payload, err := json.Marshal(payloadData)
+	payload, err := buildPayload()
 	if err != nil {
 		return nil, fmt.Errorf("marshal control-API request: %w", err)
 	}
@@ -137,6 +236,9 @@ func (c *Client) post(ctx context.Context, podIP string, port int, path string, 
 	}
 	for worker, result := range parsed.Results {
 		ok := result == "checkpoint-ready"
+		if path == "/checkpoint" && len(ranks) > 0 {
+			ok = result == "checkpoint-signalled" || result == "survivor-parked"
+		}
 		if path == "/resume" {
 			ok = result == "removed" || result == "already-gone" || result == "lock-removed" || result == "no-lock"
 		}
