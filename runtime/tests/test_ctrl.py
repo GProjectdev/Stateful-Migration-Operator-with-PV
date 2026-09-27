@@ -30,6 +30,34 @@ def load_ctrl():
 ctrl = load_ctrl()
 
 
+class RoundPublicationTests(unittest.TestCase):
+    def test_follower_waits_for_atomic_publication(self):
+        distributed = types.ModuleType("fluidcr.distributed")
+        expected = {"checkpointID": "new", "targets": "all"}
+        distributed.read_manifest = Mock(side_effect=[
+            {"checkpointID": "old"}, {}, expected,
+        ])
+        with patch.dict(sys.modules, {"fluidcr.distributed": distributed}), \
+             patch.object(ctrl.time, "sleep") as sleep:
+            self.assertEqual(ctrl._wait_for_round_manifest("new", 1), expected)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_stale_marker_cannot_authorize_another_round(self):
+        distributed = types.ModuleType("fluidcr.distributed")
+        distributed.read_manifest = Mock(return_value={"checkpointID": "old"})
+        with patch.dict(sys.modules, {"fluidcr.distributed": distributed}):
+            with self.assertRaisesRegex(ValueError, "publication timed out"):
+                ctrl._wait_for_round_manifest("new", 0)
+
+    def test_matching_round_does_not_wait(self):
+        distributed = types.ModuleType("fluidcr.distributed")
+        distributed.read_manifest = Mock(return_value={"checkpointID": "new"})
+        with patch.dict(sys.modules, {"fluidcr.distributed": distributed}), \
+             patch.object(ctrl.time, "sleep") as sleep:
+            ctrl._wait_for_round_manifest("new", 0)
+        sleep.assert_not_called()
+
+
 def load_launcher(checkpoint_path):
     package = types.ModuleType("fluidcr")
     package.__path__ = []
@@ -621,8 +649,8 @@ class ConfirmedCheckpointTests(unittest.TestCase):
 
 class FluidCRPayloadParityTests(unittest.TestCase):
     EXPECTED_SHA256 = {
-        # My_FluidCR-work frozen upstream snapshot d1c72a8.
-        "ctrl.py": "00e122673af316d01e1c281912811802cc7a4e3a757583e6786070020fb14cb5",
+        # Paired payload update: bounded manifest-publication wait.
+        "ctrl.py": "ad9fe80d0467865be63db8a9bd69f2aa5bfcd22dfc24b6934f64e618c0dd0928",
         "distributed.py": "4d1d344ef4ec13ddcecff948cb0ccf6eab3c48f84072ded387ccfa039dc63298",
     }
 

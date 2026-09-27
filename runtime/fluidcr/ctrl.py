@@ -335,6 +335,21 @@ def _try_claim_round_trigger(checkpoint_id: str) -> bool:
     return True
 
 
+def _wait_for_round_manifest(checkpoint_id: str, timeout: float):
+    from fluidcr.distributed import read_manifest
+
+    # Claim creation precedes atomic manifest publication on the shared store.
+    deadline = time.monotonic() + timeout
+    while True:
+        manifest = read_manifest()
+        if manifest.get("checkpointID") == checkpoint_id:
+            return manifest
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("checkpointID manifest publication timed out")
+        time.sleep(min(0.05, remaining))
+
+
 def _targets_equal(left, right) -> bool:
     if left == "all" or right == "all":
         return left == right
@@ -946,9 +961,7 @@ def checkpoint_ranks_and_wait(
             if partial and rank in targets and checkpoint_id and round_already_claimed:
                 from fluidcr.distributed import read_manifest
 
-                manifest = read_manifest()
-                if manifest.get("checkpointID") != checkpoint_id:
-                    raise ValueError("checkpointID round marker conflicts with manifest")
+                manifest = _wait_for_round_manifest(checkpoint_id, timeout)
                 if not _targets_equal(manifest.get("targets", "all"), targets):
                     raise ValueError("checkpointID round marker conflicts with targets")
                 if not manifest.get("restoreOwnedResume"):
@@ -1017,9 +1030,9 @@ def checkpoint_ranks_and_wait(
         else:
             from fluidcr.distributed import read_manifest
 
-            manifest = read_manifest()
-            if manifest.get("checkpointID") != checkpoint_id:
-                raise ValueError("checkpointID round marker conflicts with manifest")
+            manifest = _wait_for_round_manifest(
+                checkpoint_id, max(0.0, timeout - (time.monotonic() - started))
+            )
             if not _targets_equal(manifest.get("targets", "all"), targets):
                 raise ValueError("checkpointID round marker conflicts with targets")
             if partial and not manifest.get("restoreOwnedResume"):
