@@ -80,6 +80,7 @@ type FluidCRMigrationReconciler struct {
 	Scheme        *runtime.Scheme
 	CtrlClient    CtrlAPI
 	KubeletClient KubeletAPI
+	PodExecutor   PodExecutor
 	// APIReader should be mgr.GetAPIReader() for uncached identity checks.
 	APIReader client.Reader
 }
@@ -102,6 +103,7 @@ var statefulOrdinal = regexp.MustCompile(`^(.*)-([0-9]+)$`)
 // +kubebuilder:rbac:groups=fluidcr.dcnlab.com,resources=fluidcrmigrations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=fluidcr.dcnlab.com,resources=fluidcrmigrations/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=nodes/checkpoint,verbs=create
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
@@ -471,7 +473,7 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 			if err := r.saveStatus(ctx, m); err != nil {
 				return ctrl.Result{}, err
 			}
-			outcomes := r.resume(ctx, resumeTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds))
+			outcomes := r.resume(ctx, m, resumeTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds))
 			for _, t := range resumeTargets {
 				ps := getPodStatus(m, t.podName)
 				if err := outcomes[t.podName]; err != nil {
@@ -537,7 +539,7 @@ func (r *FluidCRMigrationReconciler) reconcileDelete(ctx context.Context, m *flu
 				}
 				if len(resumeTargets) > 0 {
 					log.Info("best-effort resume on delete", "pods", len(resumeTargets))
-					for pod, err := range r.resume(ctx, resumeTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds)) {
+					for pod, err := range r.resume(ctx, m, resumeTargets, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds)) {
 						if err != nil {
 							return ctrl.Result{}, fmt.Errorf("resume on delete %s: %w", pod, err)
 						}
@@ -695,7 +697,7 @@ func (r *FluidCRMigrationReconciler) containerCheckpoint(ctx context.Context, ta
 }
 
 // resume releases the checkpoint locks on every target concurrently.
-func (r *FluidCRMigrationReconciler) resume(ctx context.Context, targets []target, timeout time.Duration) map[string]error {
+func (r *FluidCRMigrationReconciler) resume(ctx context.Context, m *fluidcrv1alpha1.FluidCRMigration, targets []target, timeout time.Duration) map[string]error {
 	out := make(map[string]error, len(targets))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -705,8 +707,14 @@ func (r *FluidCRMigrationReconciler) resume(ctx context.Context, targets []targe
 		go func() {
 			defer wg.Done()
 			err := r.validateTarget(ctx, t)
+			if !shouldResume(m) || m.Spec.PartialCheckpoint != nil {
+				err = fmt.Errorf("generic resume is forbidden for retained or partial checkpoints")
+			}
 			if err == nil {
 				_, err = r.CtrlClient.Resume(ctx, t.podIP, t.port, timeout)
+				if isConnectionRefused(err) && r.PodExecutor != nil {
+					err = r.resumeWithExec(ctx, m, t, timeout)
+				}
 			}
 			mu.Lock()
 			out[t.podName] = err
@@ -963,6 +971,13 @@ func (r *FluidCRMigrationReconciler) saveStatus(ctx context.Context, m *fluidcrv
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *FluidCRMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.PodExecutor == nil {
+		var err error
+		r.PodExecutor, err = newPodExecutor(mgr.GetConfig())
+		if err != nil {
+			return err
+		}
+	}
 	if r.KubeletClient == nil {
 		return fmt.Errorf("member checkpoint mode requires a kubelet client")
 	}

@@ -40,7 +40,8 @@
         ""
       ],
       "resources": [
-        "nodes/checkpoint"
+        "nodes/checkpoint",
+        "pods/exec"
       ],
       "verbs": [
         "create"
