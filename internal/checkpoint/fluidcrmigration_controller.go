@@ -607,14 +607,31 @@ func (r *FluidCRMigrationReconciler) partialAppCheckpoint(ctx context.Context, t
 	if len(targets) == 0 {
 		return out
 	}
-	trigger := targets[0]
+	// The shared round marker deduplicates signalling, but readiness is local
+	// to each target Pod. Never treat signal delivery as checkpoint completion.
+	var results map[string]string
+	var err error
 	for _, t := range targets {
-		if t.rank == ranks[0] {
-			trigger = t
+		isTarget := false
+		for _, rank := range ranks {
+			isTarget = isTarget || t.rank == rank
+		}
+		if !isTarget {
+			continue
+		}
+		results, err = r.CtrlClient.CheckpointRanks(ctx, t.podIP, t.port, timeout, checkpointID, ranks)
+		if err == nil && len(results) == 0 {
+			err = fmt.Errorf("target %s returned no checkpoint readiness", t.podName)
+		}
+		for _, result := range results {
+			if err == nil && result != "checkpoint-ready" {
+				err = fmt.Errorf("target %s is not checkpoint-ready: %s", t.podName, result)
+			}
+		}
+		if err != nil {
 			break
 		}
 	}
-	results, err := r.CtrlClient.CheckpointRanks(ctx, trigger.podIP, trigger.port, timeout, checkpointID, ranks)
 	summary := ctrlapi.SummarizeResults(results)
 	for _, t := range targets {
 		out[t.podName] = appOutcome{summary: summary, err: err}

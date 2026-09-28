@@ -93,6 +93,32 @@ func TestCheckpointAndResume(t *testing.T) {
 	}
 }
 
+func TestPartialCheckpointRequiresReady(t *testing.T) {
+	for _, status := range []string{"checkpoint-ready", "checkpoint-signalled", "survivor-parked", "timeout-waiting-lock"} {
+		t.Run(status, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["wait"] != true || body["timeoutSeconds"] != float64(2) || body["checkpointID"] != "round-1" || body["all"] == true {
+					t.Errorf("partial request lacks bounded target wait: %v", body)
+				}
+				if !reflect.DeepEqual(body["ranks"], []any{float64(1)}) {
+					t.Errorf("ranks: %v", body)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"results": map[string]string{"123": status}})
+			}))
+			defer srv.Close()
+			host, port := listenerHostPort(t, srv.URL)
+			_, err := NewClient().CheckpointRanks(context.Background(), host, port, 2*time.Second, "round-1", []int64{1})
+			if (err == nil) != (status == "checkpoint-ready") {
+				t.Fatalf("status %s: %v", status, err)
+			}
+		})
+	}
+}
+
 func TestResumeOwnedPayload(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -74,8 +74,8 @@ func (c *Client) Checkpoint(ctx context.Context, podIP string, port int, timeout
 }
 
 // CheckpointRanks triggers a manifest-driven partial checkpoint for the exact
-// target ranks. It does not wait for all ranks to produce application locks;
-// the FluidCR runtime role split makes target ranks exit and survivors park.
+// target ranks, waiting for the contacted target's checkpoint lock and artifact.
+// Call each target Pod; survivors are checked separately via Runtime.
 func (c *Client) CheckpointRanks(ctx context.Context, podIP string, port int, timeout time.Duration, checkpointID string, ranks []int64) (map[string]string, error) {
 	if len(ranks) == 0 {
 		return nil, fmt.Errorf("partial checkpoint requires target ranks")
@@ -162,10 +162,9 @@ func (c *Client) post(ctx context.Context, podIP string, port int, path string, 
 	return c.postJSON(ctx, podIP, port, path, timeout, func() ([]byte, error) {
 		payloadData := allRequest{All: true}
 		if path == "/checkpoint" {
-			if len(ranks) == 0 {
-				payloadData.Wait = true
-				payloadData.TimeoutSeconds = timeout.Seconds()
-			} else {
+			payloadData.Wait = true
+			payloadData.TimeoutSeconds = timeout.Seconds()
+			if len(ranks) > 0 {
 				payloadData.All = false
 				payloadData.Ranks = ranks
 			}
@@ -236,9 +235,6 @@ func (c *Client) postJSON(ctx context.Context, podIP string, port int, path stri
 	}
 	for worker, result := range parsed.Results {
 		ok := result == "checkpoint-ready"
-		if path == "/checkpoint" && len(ranks) > 0 {
-			ok = result == "checkpoint-signalled" || result == "survivor-parked"
-		}
 		if path == "/resume" {
 			ok = result == "removed" || result == "already-gone" || result == "lock-removed" || result == "no-lock"
 		}

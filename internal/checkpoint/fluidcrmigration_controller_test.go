@@ -52,6 +52,7 @@ type fakeCtrl struct {
 	resumeOwnedErr          map[string]error
 	runtime                 map[string]ctrlapi.RuntimeStatus
 	runtimeSequence         map[string][]ctrlapi.RuntimeStatus
+	partialResult           string
 }
 
 func (f *fakeCtrl) Checkpoint(_ context.Context, podIP string, _ int, _ time.Duration, checkpointID string) (map[string]string, error) {
@@ -73,7 +74,10 @@ func (f *fakeCtrl) CheckpointRanks(_ context.Context, podIP string, _ int, _ tim
 	if err := f.checkpointErr[podIP]; err != nil {
 		return nil, err
 	}
-	return map[string]string{"1234": "checkpoint-signalled"}, nil
+	if f.partialResult != "" {
+		return map[string]string{"1234": f.partialResult}, nil
+	}
+	return map[string]string{"1234": "checkpoint-ready"}, nil
 }
 
 func (f *fakeCtrl) Runtime(_ context.Context, podIP string, _ int, _ time.Duration) (ctrlapi.RuntimeStatus, error) {
@@ -344,6 +348,51 @@ func TestReconcile_PartialCheckpointTargetsOnlySelectedRank(t *testing.T) {
 	target := podStatusByName(got.Status.Pods, "trainer-1")
 	if target == nil || target.Phase != fluidcrv1alpha1.PodPhaseContainerCheckpointed || len(target.CheckpointFiles) != 1 {
 		t.Fatalf("target status = %+v", target)
+	}
+}
+
+func TestPartialCheckpointConfirmsEveryTarget(t *testing.T) {
+	fc := &fakeCtrl{}
+	r := &FluidCRMigrationReconciler{CtrlClient: fc}
+	targets := []target{{podName: "p0", podIP: "10.0.0.1", rank: 0}, {podName: "p1", podIP: "10.0.0.2", rank: 1}, {podName: "p2", podIP: "10.0.0.3", rank: 2}}
+	out := r.partialAppCheckpoint(context.Background(), targets, time.Second, "round", []int64{0, 2})
+	if len(fc.partialCalls) != 2 || fc.partialCalls[0] != "10.0.0.1" || fc.partialCalls[1] != "10.0.0.3" {
+		t.Fatalf("calls: %v", fc.partialCalls)
+	}
+	for _, result := range out {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+	}
+	fc.checkpointErr = map[string]error{"10.0.0.3": context.DeadlineExceeded}
+	out = r.partialAppCheckpoint(context.Background(), targets, time.Second, "round-next", []int64{0, 2})
+	for _, result := range out {
+		if result.err == nil {
+			t.Fatal("later target timeout must reject the entire round")
+		}
+	}
+}
+
+func TestPartialCheckpointRejectsUnreadyTargetBeforeCRIU(t *testing.T) {
+	for _, result := range []string{"checkpoint-signalled", "survivor-parked", "timeout-waiting-lock"} {
+		t.Run(result, func(t *testing.T) {
+			s := newTestScheme(t)
+			mig := newTestMigration()
+			noResume := false
+			mig.Spec.Resume = &noResume
+			mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+			mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+			fc := &fakeCtrl{partialResult: result}
+			fk := &fakeKubelet{}
+			c := fake.NewClientBuilder().WithScheme(s).
+				WithObjects(newTestStatefulSet(), newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+				WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+			r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: fk}
+			got := reconcileToCompletion(t, r, c)
+			if got.Status.Phase != fluidcrv1alpha1.PhaseFailed || fk.count() != 0 {
+				t.Fatalf("phase=%s CRIU calls=%d", got.Status.Phase, fk.count())
+			}
+		})
 	}
 }
 
