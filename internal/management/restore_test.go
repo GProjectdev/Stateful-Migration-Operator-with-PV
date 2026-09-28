@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"fmt"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -411,43 +412,111 @@ func TestRuntimeTelemetryGatesVerifiedStatus(t *testing.T) {
 	}
 }
 
-func TestPartialRestoreAuthorizesReleaseThenVerifiesAfterSurvivorResume(t *testing.T) {
-	req, cp := fixture()
-	makeSameClusterPartial(req, cp)
-	plan, err := desiredPlan(req, cp)
-	if err != nil {
-		t.Fatal(err)
+func TestStagedPartialEvidenceRejectsUnsafeTargets(t *testing.T) {
+	for _, mode := range []string{"missing", "duplicate", "source-uid", "wrong-name", "pending", "probe-failed", "no-fence", "stale-fence"} {
+		t.Run(mode, func(t *testing.T) {
+			req, cp := fixture()
+			makeSameClusterPartial(req, cp)
+			plan, err := desiredPlan(req, cp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.Generation = 1
+			now := metav1.Now()
+			pods := []api.PodStatus{{Name: "db-0", UID: "replacement", Phase: "Staged"}}
+			fences := []api.SourcePodFenceStatus{{PodName: "db-0", SourcePodUID: "target-source-uid", ObservedGeneration: 1, Phase: "SourceGone", DeleteRequestedAt: &now, GoneObservedAt: &now}}
+			switch mode {
+			case "missing":
+				pods = nil
+			case "duplicate":
+				pods = append(pods, pods[0])
+			case "source-uid":
+				pods[0].UID = "target-source-uid"
+			case "wrong-name":
+				pods[0].Name = "other"
+			case "pending":
+				pods[0].Phase = "Pending"
+			case "probe-failed":
+				pods[0].Message = "wrong checkpoint"
+			case "no-fence":
+				fences = nil
+			case "stale-fence":
+				fences[0].ObservedGeneration = 2
+			}
+			plan.Status.Clusters = []api.ClusterStatus{{ClusterName: req.Spec.TargetCluster, ObservedGeneration: 1, Phase: "StagedReady", Pods: pods, SourceFences: fences}}
+			c := testClient(t, req, cp, plan)
+			got := reconcile(t, c, req)
+			if got.Status.Phase == "RestoreReady" || got.Status.Phase == "Verified" {
+				t.Fatal("invalid staging authorized")
+			}
+			var current unstructured.Unstructured
+			current.SetGroupVersionKind(checkpointGVK)
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(cp), &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.GetAnnotations()[annotationRestoreOwnedResume] == "true" {
+				t.Fatal("unsafe release annotation written")
+			}
+		})
 	}
-	plan.Generation = 1
-	now := metav1.Now()
-	gone := metav1.NewTime(now.Time.Add(-time.Second))
-	fences := []api.SourcePodFenceStatus{{PodName: "db-0", SourcePodUID: "target-source-uid", ObservedGeneration: 1, Phase: "SourceGone", DeleteRequestedAt: &gone, GoneObservedAt: &gone}}
-	plan.Status.Clusters = []api.ClusterStatus{{ClusterName: req.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Running", Message: "target restored", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}, SourceFences: fences}}
-	c := testClient(t, req, cp, plan)
+}
 
-	got := reconcile(t, c, req)
-	if got.Status.Phase != "RestoreReady" {
-		t.Fatalf("phase = %q: %+v", got.Status.Phase, got.Status)
-	}
-	var annotated unstructured.Unstructured
-	annotated.SetGroupVersionKind(checkpointGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: cp.GetNamespace(), Name: cp.GetName()}, &annotated); err != nil {
-		t.Fatal(err)
-	}
-	if annotated.GetAnnotations()[annotationRestoreOwnedResume] != "true" {
-		t.Fatalf("restore-owned release annotation missing: %v", annotated.GetAnnotations())
-	}
-	source(&annotated)["phase"] = "Completed"
-	survivor := source(&annotated)["pods"].([]interface{})[1].(map[string]interface{})
-	survivor["phase"] = "Resumed"
-	if err := c.Update(context.Background(), &annotated); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Create(context.Background(), partialTrainingRuntime(req, "target-pod-uid", now)); err != nil {
-		t.Fatal(err)
-	}
-	got = reconcile(t, c, req)
-	if got.Status.Phase != "Verified" {
-		t.Fatalf("phase after release/runtime = %q: %+v", got.Status.Phase, got.Status)
+func TestPartialRestoreAuthorizesReleaseThenVerifiesAfterSurvivorResume(t *testing.T) {
+	for _, staged := range []bool{false, true} {
+		t.Run(fmt.Sprintf("staged=%v", staged), func(t *testing.T) {
+			req, cp := fixture()
+			makeSameClusterPartial(req, cp)
+			plan, err := desiredPlan(req, cp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.Generation = 1
+			now := metav1.Now()
+			gone := metav1.NewTime(now.Time.Add(-time.Second))
+			fences := []api.SourcePodFenceStatus{{PodName: "db-0", SourcePodUID: "target-source-uid", ObservedGeneration: 1, Phase: "SourceGone", DeleteRequestedAt: &gone, GoneObservedAt: &gone}}
+			plan.Status.Clusters = []api.ClusterStatus{{ClusterName: req.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Running", Message: "target restored", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}, SourceFences: fences}}
+			if staged {
+				plan.Status.Clusters[0].Phase = "StagedReady"
+				plan.Status.Clusters[0].Pods[0].Phase = "Staged"
+			}
+			c := testClient(t, req, cp, plan)
+
+			got := reconcile(t, c, req)
+			if got.Status.Phase != "RestoreReady" {
+				t.Fatalf("phase = %q: %+v", got.Status.Phase, got.Status)
+			}
+			var annotated unstructured.Unstructured
+			annotated.SetGroupVersionKind(checkpointGVK)
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: cp.GetNamespace(), Name: cp.GetName()}, &annotated); err != nil {
+				t.Fatal(err)
+			}
+			if annotated.GetAnnotations()[annotationRestoreOwnedResume] != "true" {
+				t.Fatalf("restore-owned release annotation missing: %v", annotated.GetAnnotations())
+			}
+			source(&annotated)["phase"] = "Completed"
+			survivor := source(&annotated)["pods"].([]interface{})[1].(map[string]interface{})
+			survivor["phase"] = "Resumed"
+			if err := c.Update(context.Background(), &annotated); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Create(context.Background(), partialTrainingRuntime(req, "target-pod-uid", now)); err != nil {
+				t.Fatal(err)
+			}
+			if staged {
+				var current api.RestorePlan
+				if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &current); err != nil {
+					t.Fatal(err)
+				}
+				current.Status.Clusters[0].Phase = "Running"
+				current.Status.Clusters[0].Pods[0].Phase = "Running"
+				if err := c.Status().Update(context.Background(), &current); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got = reconcile(t, c, req)
+			if got.Status.Phase != "Verified" {
+				t.Fatalf("phase after release/runtime = %q: %+v", got.Status.Phase, got.Status)
+			}
+		})
 	}
 }

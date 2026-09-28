@@ -82,5 +82,5 @@ spec:
           if type(status) ~= "table" or type(generation) ~= "number" or generation < 1 then
             return false
           end
-          return status.observedGeneration == generation and (status.phase == "Prepared" or status.phase == "Running")
+          return status.observedGeneration == generation and (status.phase == "Prepared" or status.phase == "StagedReady" or status.phase == "Running")
         end

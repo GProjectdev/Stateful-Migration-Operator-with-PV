@@ -26,6 +26,7 @@ const WebhookServiceName = "stateful-restore-webhook"
 const WebhookServiceNamespace = "stateful-migration-system"
 
 type Reconciler struct {
+	StageProbe        func(context.Context, *corev1.Pod, string, []string) error
 	GroupControlImage string
 	Client            client.Client
 	Reader            client.Reader
@@ -38,6 +39,13 @@ func NewReconciler(c client.Client, reader client.Reader, clusterName string) *R
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Client == nil || r.Reader == nil || r.ClusterName == "" {
 		return fmt.Errorf("local client, uncached reader and cluster name required")
+	}
+	if r.StageProbe == nil {
+		probe, err := newStageProbe(mgr.GetConfig())
+		if err != nil {
+			return err
+		}
+		r.StageProbe = probe
 	}
 	return ctrl.NewControllerManagedBy(mgr).Named("member-restore").For(&api.RestorePlan{}).Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.plansForPod)).Complete(r)
 }
@@ -132,6 +140,7 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		}
 	}
 	prepared, running := true, true
+	staged := plan.Spec.PartialRestore != nil
 	failure := ""
 	statuses := make([]api.PodStatus, 0, len(plan.Spec.Pods))
 	sourceFences := []api.SourcePodFenceStatus(nil)
@@ -227,6 +236,13 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		if pod.Status.Phase != corev1.PodRunning || !ready || pod.Spec.NodeName != mapping.TargetNode {
 			running = false
 		}
+		if staged && !ready && failure == "" && mappingReady {
+			if err := r.probeStagedTarget(ctx, plan, &mapping, &pod, sourceFences); err != nil {
+				status.Message = "waiting for staged launcher evidence: " + err.Error()
+			} else {
+				status.Phase = "Staged"
+			}
+		}
 		statuses = append(statuses, status)
 	}
 	if failure != "" {
@@ -234,6 +250,9 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 	}
 	if !prepared {
 		return "AwaitingArtifacts", "waiting for fresh current-generation node archive reports", statuses, sourceFences, nil
+	}
+	if staged && !running && allTargetsStaged(plan, statuses) {
+		return "StagedReady", "restored launchers staged; waiting for restore-owned round release", statuses, sourceFences, nil
 	}
 	if running {
 		if plan.Spec.GroupRestore != nil {

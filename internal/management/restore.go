@@ -157,6 +157,16 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 			if req.Spec.GroupRestore != nil {
 				req.Status.GroupControl = s.GroupControl
 			}
+		case "StagedReady":
+			phase, message = "StagedReady", s.Message
+			verification, err := partialRestoreReadyVerification(req, plan, s.Pods, s.SourceFences)
+			if err == nil {
+				if err := r.authorizeRestoreOwnedResume(ctx, cp); err != nil {
+					return ctrl.Result{}, err
+				}
+				phase, message = "RestoreReady", "staged launcher and source fence evidence checked; restore-owned round release authorized"
+				req.Status.Verification = stableVerification(req, verification)
+			}
 		case "Running":
 			if req.Spec.GroupRestore != nil {
 				req.Status.GroupControl = s.GroupControl
@@ -322,9 +332,24 @@ func partialRestoreReadyVerification(req *api.RestoreRequest, plan *api.RestoreP
 	if req.Spec.PartialRestore == nil {
 		return nil, fmt.Errorf("partial restore required")
 	}
+	if len(targetPods) != len(plan.Spec.Pods) || len(targetPods) == 0 {
+		return nil, fmt.Errorf("target staged evidence set incomplete")
+	}
+	seen := map[string]bool{}
 	for _, pod := range targetPods {
-		if pod.UID == "" || pod.Phase != "Running" {
+		if pod.UID == "" || seen[pod.Name] || pod.Message != "" || (pod.Phase != "Running" && pod.Phase != "Staged") {
 			return nil, fmt.Errorf("target native restored pod evidence incomplete")
+		}
+		seen[pod.Name] = true
+	}
+	for _, mapping := range plan.Spec.Pods {
+		if !seen[mapping.TargetPod] {
+			return nil, fmt.Errorf("target mapping absent from staged evidence")
+		}
+		for _, pod := range targetPods {
+			if pod.Name == mapping.TargetPod && pod.UID == mapping.SourcePodUID {
+				return nil, fmt.Errorf("source UID cannot be staged replacement")
+			}
 		}
 	}
 	now := metav1.Now()

@@ -5,6 +5,7 @@
     "name": "stateful-member"
   },
   "rules": [
+    {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create"]},
     {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch", "create"]},
     {"apiGroups": ["apps"], "resources": ["statefulsets"], "verbs": ["get"]},
     {"apiGroups": [""], "resources": ["persistentvolumeclaims", "persistentvolumes"], "verbs": ["get", "list", "watch"]},
