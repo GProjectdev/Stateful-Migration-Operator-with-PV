@@ -1,0 +1,18 @@
+diff --git a/server/container_restore.go b/server/container_restore.go
+--- a/server/container_restore.go
++++ b/server/container_restore.go
+@@ -265,1 +265,7 @@
++	// Validate CDI mounts against the current allocation, never the archive.
++	cdiMounts, err := prepareRestoreCDI(createConfig, containerConfig)
++	if err != nil {
++		return "", err
++	}
++
+ 	ignoreMounts := map[string]bool{
+@@ -292,3 +298,5 @@
+-		if ignoreMounts[m.Destination] {
++		// Current-node CDI regenerates its own mounts with their full OCI
++		// options, hooks and devices in createSandboxContainer.
++		if ignoreMounts[m.Destination] || cdiMounts[m.Destination] {
+ 			continue
+ 		}

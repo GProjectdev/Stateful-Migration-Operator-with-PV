@@ -483,7 +483,7 @@ func (r *FluidCRMigrationReconciler) reconcileDelete(ctx context.Context, m *flu
 	log := logf.FromContext(ctx)
 	if controllerutil.ContainsFinalizer(m, FinalizerName) {
 		if shouldResume(m) && len(m.Status.Pods) > 0 {
-			if pods, err := r.resolveTargetPods(ctx, m); err == nil {
+			if pods, err := r.resolveDeletionPods(ctx, m); err == nil {
 				var resumeTargets []target
 				for i := range pods {
 					pod := &pods[i]
@@ -519,6 +519,29 @@ func (r *FluidCRMigrationReconciler) reconcileDelete(ctx context.Context, m *flu
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// Cleanup follows checkpointed identities even when the workload no longer exists.
+func (r *FluidCRMigrationReconciler) resolveDeletionPods(ctx context.Context, m *fluidcrv1alpha1.FluidCRMigration) ([]corev1.Pod, error) {
+	var pods []corev1.Pod
+	for _, recorded := range m.Status.Pods {
+		if recorded.PodUID == "" || recorded.AppCheckpointResult == "" {
+			continue
+		}
+		var pod corev1.Pod
+		err := r.Get(ctx, client.ObjectKey{Namespace: m.Namespace, Name: recorded.PodName}, &pod)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if string(pod.UID) != recorded.PodUID || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		pods = append(pods, pod)
+	}
+	return pods, nil
 }
 
 // appCheckpoint signals the in-pod control API on every target concurrently.

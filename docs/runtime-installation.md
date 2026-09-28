@@ -142,6 +142,10 @@ helper 복사와 hook 패치가 **둘 다** 필요합니다.
 기존 기능이 있는 다른 commit에는 중복 적용하지 마세요.
 독립 helper 테스트는 전체 CRI-O 패키지의 컴파일·통합 테스트를 대신하지 않습니다.
 
+GPU CDI 환경에서는 빌드 전에 [CDI 복원 패치](crio-cdi-restore.md)를 추가로 적용합니다.
+이 패치는 현재 CRI 장치 할당을 보존하고 CDI 마운트를 안전하게 재생성하기 위한 것으로,
+annotation adapter만으로는 GPU archive 복원이 보장되지 않습니다.
+
 ## 6. CRI-O 빌드와 교체
 
 ```bash
