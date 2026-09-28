@@ -161,6 +161,25 @@ func TestSameClusterPartialPlanAllowedWithEvidence(t *testing.T) {
 	}
 }
 
+func TestRankZeroPartialAdmission(t *testing.T) {
+	plan, pod, node := fixture()
+	plan.Spec.SourceCluster, plan.Spec.TargetCluster = "spot-cluster", "spot-cluster"
+	plan.Spec.SourceFenced = false
+	plan.Spec.Pods[0].Rank = 0
+	plan.Spec.Pods[0].SourcePodUID = "rank-zero-source"
+	plan.Spec.PartialRestore = &api.PartialRestoreSpec{
+		TargetRanks: []int64{0}, PreventPeriodicResume: true,
+		PreservedSurvivors: []api.SurvivorEvidence{{Rank: 1, PodName: "survivor-1", PodUID: "survivor-uid", NodeName: "node-survivor", Generation: 9, PauseLockPath: "/checkpoint/rank1/pause-lock"}},
+	}
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	plan.Spec.PartialRestore.PreservedSurvivors[0].Rank = 0
+	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err == nil {
+		t.Fatal("target rank zero must not also be a survivor")
+	}
+}
+
 func TestUnlabelledPartialAdmissionRequiresUniqueActivePlanAndWorkloadUID(t *testing.T) {
 	plan, pod, node := fixture()
 	plan.Spec.SourceCluster = "spot-cluster"

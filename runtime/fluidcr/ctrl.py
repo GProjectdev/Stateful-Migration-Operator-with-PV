@@ -21,6 +21,7 @@ This module provides:
 
 import argparse
 import glob
+import functools
 import hashlib
 import json
 import math
@@ -36,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluidcr._config import EXIT_CODE, log, warn
+from fluidcr import group_restore
 
 # Base directory for checkpoints (mirrors launcher.py behaviour).
 _BASE_DIR: str = os.environ.get("FLUIDCR_CHECKPOINT_DIR", "/checkpoint")
@@ -474,6 +476,9 @@ def bind_restore_checkpoint(
 
 
 def restore_checkpoint_binding(checkpoint_path: Optional[str] = None) -> Optional[Dict[str, str]]:
+    prepared = group_restore.checkpoint_binding(checkpoint_path or _default_checkpoint_path())
+    if prepared:
+        return prepared
     explicit_restore = os.environ.get("FLUIDCR_RESTORE_CHECKPOINT_PATH", "").strip()
     if explicit_restore:
         if not os.path.isfile(explicit_restore):
@@ -558,6 +563,10 @@ def record_runtime_status(
 
 
 def _read_checkpoint_global_step(checkpoint_path: str) -> Optional[int]:
+    """Read telemetry from a trusted producer checkpoint, including NumPy RNG state.
+
+    Group metadata validation must never call this pickle-capable legacy loader.
+    """
     if not os.path.isfile(checkpoint_path):
         return None
     try:
@@ -587,9 +596,20 @@ def _read_checkpoint_global_step(checkpoint_path: str) -> Optional[int]:
 
 
 def _preserve_round_artifact_path(checkpoint_path: str, checkpoint_id: str) -> str:
+    # Serialize the legacy copy with producer publication on the shared volume.
+    with group_restore.control_lock(timeout=300):
+        return _preserve_round_artifact_locked(checkpoint_path, checkpoint_id)
+
+
+def _preserve_round_artifact_locked(checkpoint_path: str, checkpoint_id: str) -> str:
     src = checkpoint_path
     dst = _round_artifact_path(src, checkpoint_id)
     if os.path.exists(dst):
+        bind_restore_checkpoint(src, checkpoint_id, dst)
+        _write_status(src, {
+            "checkpointID": checkpoint_id, "artifactPath": dst,
+            "state": "CheckpointReady",
+        })
         return "artifact-exists"
     if not os.path.isfile(src):
         return "checkpoint-missing"
@@ -717,20 +737,21 @@ def checkpoint_pids(
     # this trigger act as a partial migration (spec: --pid degrades to full).
     from fluidcr.distributed import bump_generation, write_manifest
 
-    bump_generation()
-    write_manifest("all")
+    with group_restore.legacy_control(checkpoint=True):
+        bump_generation()
+        write_manifest("all")
 
-    results: Dict[int, str] = {}
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGUSR1)
-            results[pid] = "signalled"
-        except ProcessLookupError:
-            results[pid] = "no-such-process"
-        except PermissionError:
-            results[pid] = "permission-denied"
-        except Exception as exc:  # pragma: no cover - defensive
-            results[pid] = f"error: {exc}"
+        results: Dict[int, str] = {}
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGUSR1)
+                results[pid] = "signalled"
+            except ProcessLookupError:
+                results[pid] = "no-such-process"
+            except PermissionError:
+                results[pid] = "permission-denied"
+            except Exception as exc:  # pragma: no cover - defensive
+                results[pid] = f"error: {exc}"
 
     # Resolve the Launcher PID for each successfully signalled worker.
     # Prefer the registry mapping when available; fall back to /proc walk.
@@ -773,6 +794,17 @@ def _parse_rank_spec(spec: str):
     return ranks
 
 
+def _group_control_guard(checkpoint=False):
+    def decorate(function):
+        @functools.wraps(function)
+        def guarded(*args, **kwargs):
+            with group_restore.legacy_control(checkpoint=checkpoint):
+                return function(*args, **kwargs)
+        return guarded
+    return decorate
+
+
+@_group_control_guard(checkpoint=True)
 def checkpoint_ranks(
     targets,
     *,
@@ -937,8 +969,6 @@ def checkpoint_ranks_and_wait(
         if not checkpoint_id:
             raise ValueError("partial wait requires checkpointID")
         restore_owned_resume = True
-        if 0 in [int(r) for r in targets]:
-            raise ValueError("partial rank0 target restore is unsupported")
     if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
         raise ValueError("timeoutSeconds must be between 0 and 300")
     if not _checkpoint_lock.acquire(blocking=False):
@@ -1077,7 +1107,7 @@ def checkpoint_ranks_and_wait(
                     artifact_status = preserved.get(parent)
                     results[worker] = (
                         "checkpoint-ready"
-                        if artifact_status == "artifact-preserved"
+                        if artifact_status in ("artifact-preserved", "artifact-exists")
                         else artifact_status or "artifact-missing"
                     )
                 else:
@@ -1175,6 +1205,7 @@ def _restore_owned_manifest_active() -> bool:
         return False
 
 
+@_group_control_guard()
 def resume_ppids(ppids: List[int]) -> Dict[int, str]:
     """Remove lock files for the given PPIDs to allow resume.
 
@@ -1224,11 +1255,13 @@ def _validate_restore_owned_resume(
     return None
 
 
+@_group_control_guard()
 def resume_all_pending(
     *,
     checkpoint_id: Optional[str] = None,
     generation: Optional[int] = None,
     restore_owned_resume: bool = False,
+    full_group_restore: bool = False,
 ) -> Dict[str, str]:
     """Remove every pending lock, pause-lock, and the migration manifest.
 
@@ -1250,6 +1283,11 @@ def resume_all_pending(
     from fluidcr.distributed import manifest_path, read_manifest, _base_dir
 
     manifest = read_manifest()
+    if full_group_restore:
+        if not checkpoint_id or manifest.get("checkpointID") != checkpoint_id:
+            raise ValueError("full-group resume requires matching checkpointID manifest")
+        if manifest.get("targets") != "all":
+            raise ValueError("full-group resume cannot release a partial round")
     if manifest.get("restoreOwnedResume"):
         _validate_restore_owned_resume(
             manifest,
@@ -1257,7 +1295,7 @@ def resume_all_pending(
             generation=generation,
             restore_owned_resume=restore_owned_resume,
         )
-    elif restore_owned_resume and checkpoint_id and generation is not None:
+    elif restore_owned_resume and checkpoint_id and generation is not None and not full_group_restore:
         return {manifest_path(): "already-complete"}
 
     bases: List[str] = []
@@ -1290,6 +1328,11 @@ def resume_all_pending(
 # ---------------------------------------------------------------------------
 
 
+def prepare_group(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepare a producer-verified round under the caller's fencing contract."""
+    return group_restore.prepare_group(payload)
+
+
 class _CtrlRequestHandler(BaseHTTPRequestHandler):
     """Minimal JSON REST handler for FluidCR control."""
 
@@ -1314,12 +1357,28 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/checkpoint":
+        if self.path == "/prepare-group":
+            self._handle_group(prepare_group)
+        elif self.path == "/checkpoint":
             self._handle_checkpoint()
         elif self.path == "/resume":
             self._handle_resume()
+        elif self.path == "/resume-group":
+            self._handle_group(group_restore.resume_group)
         else:
             self._send_json(404, {"error": "not-found"})
+
+    def _handle_group(self, action) -> None:
+        try:
+            result = action(self._read_json())
+        except group_restore.GroupConflict as exc:
+            self._send_json(409, {"error": "group-restore-conflict", "message": str(exc)})
+        except ValueError as exc:
+            self._send_json(400, {"error": "invalid-request", "message": str(exc)})
+        except OSError as exc:
+            self._send_json(500, {"error": "group-restore-io-error", "message": str(exc)})
+        else:
+            self._send_json(200, result)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/runtime":
@@ -1410,6 +1469,13 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
         checkpoint_id = payload.get("checkpointID")
         generation = payload.get("generation")
         restore_owned_resume = bool(payload.get("restoreOwnedResume", False))
+        full_group_restore = payload.get("fullGroupRestore", False)
+        if not isinstance(full_group_restore, bool):
+            self._send_json(400, {"error": "fullGroupRestore must be a boolean"})
+            return
+        if full_group_restore and (payload.get("all") is not True or ppids):
+            self._send_json(400, {"error": "full-group resume requires all=true without ppids"})
+            return
 
         if generation is not None:
             try:
@@ -1432,6 +1498,7 @@ class _CtrlRequestHandler(BaseHTTPRequestHandler):
                     checkpoint_id=checkpoint_id,
                     generation=generation,
                     restore_owned_resume=restore_owned_resume,
+                    full_group_restore=full_group_restore,
                 )
             except ValueError as exc:
                 self._send_json(400, {"error": str(exc)})

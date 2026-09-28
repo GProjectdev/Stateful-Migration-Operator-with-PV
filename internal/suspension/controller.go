@@ -224,8 +224,16 @@ func check(ctx context.Context, reader client.Reader, rb *unstructured.Unstructu
 		if s.SourceCluster == s.TargetCluster {
 			return groupcontract.ValidateFences(plan, report.SourceFences)
 		}
-		_, err := groupcontract.Decode(plan)
-		return err
+		if _, err := groupcontract.Decode(plan); err != nil {
+			return err
+		}
+		if len(sts.Spec.VolumeClaimTemplates) == 0 {
+			return nil
+		}
+		// The shared checkpoint receipt does not cover ordinal data claims.
+		if a[PVAnnotation] == "" || a[PVUIDAnnotation] == "" {
+			return fail("VCT group restore requires PV operation names and UIDs")
+		}
 	}
 	pv := object(api.GroupVersion.String(), "PVMigration")
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: a[PVAnnotation]}, pv); err != nil {

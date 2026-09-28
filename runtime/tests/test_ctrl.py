@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 def load_ctrl():
     package = types.ModuleType("fluidcr")
-    package.__path__ = []
+    package.__path__ = [str(Path(__file__).resolve().parents[1] / "fluidcr")]
     config = types.ModuleType("fluidcr._config")
     config.EXIT_CODE = 75
     config.log = Mock()
@@ -133,6 +133,7 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         self.distributed.read_manifest = Mock(return_value={})
         self.distributed.read_survivor_proof = Mock(return_value={})
         patches = [
+            patch.object(ctrl.group_restore, "_root", return_value=str(self.tmp_path)),
             patch.dict(sys.modules, {"fluidcr.distributed": self.distributed}),
             patch.dict(os.environ, {"FLUIDCR_CHECKPOINT_PATH": ""}),
             patch.object(ctrl, "_BASE_DIR", str(self.tmp_path)),
@@ -303,14 +304,28 @@ class ConfirmedCheckpointTests(unittest.TestCase):
             [1], checkpoint_id="round-001", restore_owned_resume=True, generation=123
         )
 
-    def test_partial_rank0_target_fails_closed(self):
-        with patch.dict(os.environ, {"RANK": "0", "WORLD_SIZE": "2"}):
-            with self.assertRaisesRegex(ValueError, "rank0 target"):
-                ctrl.checkpoint_ranks_and_wait(
-                    [0], 0.1, checkpoint_id="round-rank0", restore_owned_resume=True
-                )
-        self.distributed.bump_generation.assert_not_called()
-        self.kill.assert_not_called()
+    def test_partial_rank0_target_returns_owned_evidence(self):
+        make_dir(self.tmp_path / "11" / "rounds" / "round-rank0")
+        self.kill.side_effect = self.create_checkpoint_and_lock
+        with patch.dict(os.environ, {
+            "RANK": "0", "WORLD_SIZE": "2",
+            "FLUIDCR_POD_NAME": "trainer-0", "FLUIDCR_POD_UID": "rank-zero-uid",
+            "FLUIDCR_NODE_NAME": "node-zero", "FLUIDCR_CONTAINER_NAME": "trainer",
+        }), patch.object(ctrl, "registered_worker_pids", return_value={11: 101}):
+            response = ctrl.checkpoint_ranks_and_wait(
+                [0], 0.1, checkpoint_id="round-rank0",
+                restore_owned_resume=True, contract=True,
+            )
+        self.assertEqual(response["targetRanks"], [0])
+        self.assertTrue(response["noPeriodicResume"])
+        self.assertTrue(response["restoreOwnedResume"])
+        evidence = response["appCheckpointEvidence"]["0"]
+        self.assertEqual(evidence["podUID"], "rank-zero-uid")
+        self.assertEqual(evidence["phase"], "AppCheckpointReady")
+        self.assertTrue(evidence["appArtifact"]["sha256"])
+        self.distributed.write_manifest.assert_called_with(
+            [0], checkpoint_id="round-rank0", restore_owned_resume=True, generation=123
+        )
 
     def test_partial_wait_replay_recovers_after_worker_exit_99_unregistered(self):
         marker = self.tmp_path / "rounds" / "round-007" / ".triggered"
@@ -649,8 +664,9 @@ class ConfirmedCheckpointTests(unittest.TestCase):
 
 class FluidCRPayloadParityTests(unittest.TestCase):
     EXPECTED_SHA256 = {
-        # Paired payload update: bounded manifest-publication wait.
-        "ctrl.py": "ad9fe80d0467865be63db8a9bd69f2aa5bfcd22dfc24b6934f64e618c0dd0928",
+        # Paired payload update: owned rank-zero restore and group-control guards.
+        "ctrl.py": "1dfb91edb0039aaf770bd41db8b86c09fc00e15c58b466739246e9a5cceccc99",
+        "group_restore.py": "0d22ab37c6ed05fcf44d3b5cc5a7b37288de2f57f4ab725bca338dbb3c7917d8",
         "distributed.py": "4d1d344ef4ec13ddcecff948cb0ccf6eab3c48f84072ded387ccfa039dc63298",
     }
 
@@ -658,7 +674,7 @@ class FluidCRPayloadParityTests(unittest.TestCase):
         repo = Path(__file__).resolve().parents[1]
         for name, expected in self.EXPECTED_SHA256.items():
             with self.subTest(name=name):
-                actual = hashlib.sha256((repo / "fluidcr" / name).read_bytes()).hexdigest()
+                actual = hashlib.sha256((repo / "fluidcr" / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
                 self.assertEqual(actual, expected)
 
     def test_stateful_overlay_matches_local_fluidcr_source_when_available(self):
@@ -666,7 +682,7 @@ class FluidCRPayloadParityTests(unittest.TestCase):
         source = repo.parents[1] / "My_FluidCR-work" / "fluidcr"
         if not source.exists():
             self.skipTest("local My_FluidCR-work source tree is not available")
-        for name in ("ctrl.py", "distributed.py"):
+        for name in ("ctrl.py", "distributed.py", "group_restore.py"):
             with self.subTest(name=name):
                 self.assertEqual(
                     (repo / "fluidcr" / name).read_bytes().replace(b"\r\n", b"\n"),
