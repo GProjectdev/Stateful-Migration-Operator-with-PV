@@ -179,7 +179,7 @@ type PodMigrationStatus struct {
 
 	// Rank is the distributed rank observed for this pod.
 	// +optional
-	Rank int64 `json:"rank,omitempty"`
+	Rank int64 `json:"rank"`
 
 	// PodUID binds persisted work to a specific pod incarnation.
 	// +optional
