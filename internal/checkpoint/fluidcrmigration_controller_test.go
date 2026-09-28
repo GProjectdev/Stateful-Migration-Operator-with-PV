@@ -259,8 +259,13 @@ func TestReconcile_HappyPath(t *testing.T) {
 		if ps.Phase != fluidcrv1alpha1.PodPhaseResumed {
 			t.Errorf("pod %s phase = %q, want Resumed", ps.PodName, ps.Phase)
 		}
+		if ps.CheckpointID != "mig-round-001" {
+			t.Errorf("pod %s checkpointID = %q, want mig-round-001", ps.PodName, ps.CheckpointID)
+		}
 		if len(ps.CheckpointFiles) != 1 || ps.CheckpointFiles[0].FilePath == "" {
 			t.Errorf("pod %s checkpoint files = %+v, want one non-empty file", ps.PodName, ps.CheckpointFiles)
+		} else if ps.CheckpointFiles[0].CheckpointID != "mig-round-001" {
+			t.Errorf("pod %s archive checkpointID = %q, want mig-round-001", ps.PodName, ps.CheckpointFiles[0].CheckpointID)
 		}
 	}
 	if cp, rs := fc.counts(); cp != 2 || rs != 2 {

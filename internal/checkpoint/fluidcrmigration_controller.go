@@ -315,6 +315,10 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 	if partial && !targetRanksPresent(targets, partialTargets) {
 		return r.markFailed(ctx, m, "partial checkpoint target ranks do not match eligible pods")
 	}
+	checkpointID, err := checkpointIDFor(m)
+	if err != nil {
+		return r.markFailed(ctx, m, err.Error())
+	}
 
 	if m.Status.StartTime == nil {
 		now := metav1.Now()
@@ -330,10 +334,6 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 		return ps.Phase == fluidcrv1alpha1.PodPhasePending
 	})
 	if len(appTargets) > 0 {
-		checkpointID, err := checkpointIDFor(m)
-		if err != nil {
-			return r.markFailed(ctx, m, err.Error())
-		}
 		m.Status.Phase = fluidcrv1alpha1.PhaseAppCheckpointing
 		m.Status.Message = fmt.Sprintf("signalling application checkpoint on %d pod(s)", len(appTargets))
 		if err := r.saveStatus(ctx, m); err != nil {
@@ -436,7 +436,9 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 					continue
 				}
 				now := metav1.Now()
+				ps.CheckpointID = checkpointID
 				ps.CheckpointFiles = append(ps.CheckpointFiles, fluidcrv1alpha1.CheckpointFile{
+					CheckpointID:   checkpointID,
 					ContainerName:  oc.container,
 					FilePath:       oc.path,
 					CheckpointTime: &now,

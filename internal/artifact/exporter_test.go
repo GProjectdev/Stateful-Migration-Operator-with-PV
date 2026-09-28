@@ -17,7 +17,7 @@ import (
 func exportFixture() *fluidcr.FluidCRMigration {
 	return &fluidcr.FluidCRMigration{
 		ObjectMeta: metav1.ObjectMeta{Name: "round-1", Namespace: "default", UID: "checkpoint-uid", Generation: 1},
-		Status:     fluidcr.FluidCRMigrationStatus{ObservedGeneration: 1, Phase: fluidcr.PhaseCompleted, Pods: []fluidcr.PodMigrationStatus{{PodName: "train-0", PodUID: "pod-uid", NodeName: "source-node", Phase: fluidcr.PodPhaseResumed, CheckpointFiles: []fluidcr.CheckpointFile{{ContainerName: "trainer", FilePath: HostRoot + "/checkpoint.tar"}}}}},
+		Status:     fluidcr.FluidCRMigrationStatus{ObservedGeneration: 1, Phase: fluidcr.PhaseCompleted, Pods: []fluidcr.PodMigrationStatus{{PodName: "train-0", PodUID: "pod-uid", NodeName: "source-node", Phase: fluidcr.PodPhaseResumed, CheckpointID: "round-001", CheckpointFiles: []fluidcr.CheckpointFile{{CheckpointID: "round-001", ContainerName: "trainer", FilePath: HostRoot + "/checkpoint.tar"}}}}},
 	}
 }
 
@@ -42,6 +42,9 @@ func TestExportBeforeRestoreAllowsDownloadAfterSourceLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	archive := m.Status.Pods[0].CheckpointFiles[0]
+	if archive.CheckpointID != "round-001" {
+		t.Fatalf("checkpointID = %q, want round-001", archive.CheckpointID)
+	}
 	key, err := DigestKey(m.Namespace, archive.SHA256)
 	if err != nil {
 		t.Fatal(err)

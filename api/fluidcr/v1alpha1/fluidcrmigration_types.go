@@ -148,6 +148,10 @@ type PartialCheckpointSpec struct {
 
 // CheckpointFile records a CRIU checkpoint archive produced for a container.
 type CheckpointFile struct {
+	// CheckpointID binds this archive to the logical checkpoint request.
+	// +optional
+	CheckpointID string `json:"checkpointID,omitempty"`
+
 	// SHA256 and DurableRef are published only after the member exporter persists the archive.
 	SHA256     string `json:"sha256,omitempty"`
 	DurableRef string `json:"durableRef,omitempty"`
@@ -169,6 +173,10 @@ type CheckpointFile struct {
 
 // PodMigrationStatus tracks the per-pod progress of the workflow.
 type PodMigrationStatus struct {
+	// CheckpointID binds this pod result to the logical checkpoint request.
+	// +optional
+	CheckpointID string `json:"checkpointID,omitempty"`
+
 	// Rank is the distributed rank observed for this pod.
 	// +optional
 	Rank int64 `json:"rank,omitempty"`

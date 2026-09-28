@@ -309,6 +309,10 @@ spec:
                         description: CheckpointFile records a CRIU checkpoint archive
                           produced for a container.
                         properties:
+                          checkpointID:
+                            description: CheckpointID binds this archive to the logical
+                              checkpoint request.
+                            type: string
                           sha256:
                             type: string
                             pattern: '^[a-f0-9]{64}$'
@@ -335,6 +339,10 @@ spec:
                         - filePath
                         type: object
                       type: array
+                    checkpointID:
+                      description: CheckpointID binds this pod result to the logical
+                        checkpoint request.
+                      type: string
                     rank:
                       description: Rank is the distributed rank observed for this
                         pod.
