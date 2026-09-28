@@ -51,6 +51,7 @@ type fakeCtrl struct {
 	checkpointErr           map[string]error
 	resumeOwnedErr          map[string]error
 	runtime                 map[string]ctrlapi.RuntimeStatus
+	runtimeSequence         map[string][]ctrlapi.RuntimeStatus
 }
 
 func (f *fakeCtrl) Checkpoint(_ context.Context, podIP string, _ int, _ time.Duration, checkpointID string) (map[string]string, error) {
@@ -78,6 +79,11 @@ func (f *fakeCtrl) CheckpointRanks(_ context.Context, podIP string, _ int, _ tim
 func (f *fakeCtrl) Runtime(_ context.Context, podIP string, _ int, _ time.Duration) (ctrlapi.RuntimeStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if statuses := f.runtimeSequence[podIP]; len(statuses) > 0 {
+		status := statuses[0]
+		f.runtimeSequence[podIP] = statuses[1:]
+		return status, nil
+	}
 	if f.runtime != nil {
 		if status, ok := f.runtime[podIP]; ok {
 			return status, nil
@@ -333,6 +339,38 @@ func TestReconcile_PartialCheckpointTargetsOnlySelectedRank(t *testing.T) {
 	target := podStatusByName(got.Status.Pods, "trainer-1")
 	if target == nil || target.Phase != fluidcrv1alpha1.PodPhaseContainerCheckpointed || len(target.CheckpointFiles) != 1 {
 		t.Fatalf("target status = %+v", target)
+	}
+}
+
+func TestReconcile_PartialCheckpointWaitsForSurvivorEvidence(t *testing.T) {
+	s := newTestScheme(t)
+	mig := newTestMigration()
+	noResume := false
+	mig.Spec.Resume = &noResume
+	mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+	mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+	fc := &fakeCtrl{runtimeSequence: map[string][]ctrlapi.RuntimeStatus{"10.0.0.1": {
+		{Rank: 0, WorldSize: 2, CheckpointID: "mig-round-001"},
+		{Rank: 0, WorldSize: 2, CheckpointID: "mig-round-001", SurvivorEvidence: ctrlapi.SurvivorEvidence{Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock", PauseLockPID: 1234, ObservedAt: "now"}},
+	}}}
+	fk := &fakeKubelet{}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestStatefulSet(), newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: fk}
+
+	got := reconcileToCompletion(t, r, c)
+
+	if got.Status.Phase != fluidcrv1alpha1.PhaseCompleted {
+		t.Fatalf("phase = %q: %s", got.Status.Phase, got.Status.Message)
+	}
+	if len(fc.partialCalls) != 1 {
+		t.Fatalf("partial checkpoint calls = %d, want one signal", len(fc.partialCalls))
+	}
+	survivor := podStatusByName(got.Status.Pods, "trainer-0")
+	if survivor == nil || survivor.Phase != fluidcrv1alpha1.PodPhaseSurvivorPaused || survivor.SurvivorEvidence == nil {
+		t.Fatalf("survivor status = %+v", survivor)
 	}
 }
 

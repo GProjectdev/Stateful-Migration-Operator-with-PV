@@ -18,6 +18,7 @@ package checkpoint
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -42,6 +43,8 @@ import (
 	fluidcrv1alpha1 "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/fluidcr/v1alpha1"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/ctrlapi"
 )
+
+var errSurvivorEvidencePending = errors.New("survivor pause evidence pending")
 
 const (
 	// FinalizerName guards in-flight migrations so the controller can resume a
@@ -350,12 +353,9 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 				if partialTargets[t.rank] {
 					ps.Phase = fluidcrv1alpha1.PodPhaseAppCheckpointed
 				} else {
-					if err := r.recordSurvivorEvidence(ctx, t, ps, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds)); err != nil {
-						ps.Phase = fluidcrv1alpha1.PodPhaseFailed
-						ps.Message = fmt.Sprintf("survivor evidence: %v", err)
-						continue
-					}
-					ps.Phase = fluidcrv1alpha1.PodPhaseSurvivorPaused
+					ps.Phase = fluidcrv1alpha1.PodPhaseAppCheckpointed
+					ps.Message = "waiting for survivor pause evidence"
+					continue
 				}
 				ps.Message = ""
 			}
@@ -376,6 +376,38 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 		}
 		if err := r.saveStatus(ctx, m); err != nil {
 			return ctrl.Result{}, err
+		}
+	}
+	if partial {
+		waiting := false
+		for _, t := range targets {
+			if partialTargets[t.rank] {
+				continue
+			}
+			ps := getPodStatus(m, t.podName)
+			if ps.Phase != fluidcrv1alpha1.PodPhaseAppCheckpointed {
+				continue
+			}
+			if err := r.recordSurvivorEvidence(ctx, t, ps, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds)); err != nil {
+				if errors.Is(err, errSurvivorEvidencePending) && !appCheckpointTimedOut(m) {
+					ps.Message = fmt.Sprintf("survivor evidence: %v", err)
+					waiting = true
+					continue
+				}
+				ps.Phase = fluidcrv1alpha1.PodPhaseFailed
+				ps.Message = fmt.Sprintf("survivor evidence: %v", err)
+				continue
+			}
+			ps.Phase = fluidcrv1alpha1.PodPhaseSurvivorPaused
+			ps.Message = ""
+		}
+		if waiting {
+			m.Status.Phase = fluidcrv1alpha1.PhaseAppCheckpointing
+			m.Status.Message = "waiting for survivor pause evidence"
+			if err := r.saveStatus(ctx, m); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 	}
 	appFailed := anyPodFailed(m)
@@ -591,14 +623,14 @@ func (r *FluidCRMigrationReconciler) partialAppCheckpoint(ctx context.Context, t
 func (r *FluidCRMigrationReconciler) recordSurvivorEvidence(ctx context.Context, t target, ps *fluidcrv1alpha1.PodMigrationStatus, timeout time.Duration) error {
 	status, err := r.CtrlClient.Runtime(ctx, t.podIP, t.port, timeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: runtime status: %v", errSurvivorEvidencePending, err)
 	}
 	if status.Rank != t.rank {
 		return fmt.Errorf("runtime rank mismatch: got %d want %d", status.Rank, t.rank)
 	}
 	evidence := status.SurvivorEvidence
 	if evidence.Generation <= 0 || strings.TrimSpace(evidence.PauseLockPath) == "" || evidence.PauseLockPID <= 0 || strings.TrimSpace(evidence.ObservedAt) == "" {
-		return fmt.Errorf("survivor pause evidence missing")
+		return fmt.Errorf("%w", errSurvivorEvidencePending)
 	}
 	ps.SurvivorEvidence = &fluidcrv1alpha1.SurvivorEvidence{
 		Generation:    evidence.Generation,
@@ -607,6 +639,13 @@ func (r *FluidCRMigrationReconciler) recordSurvivorEvidence(ctx context.Context,
 		ObservedAt:    evidence.ObservedAt,
 	}
 	return nil
+}
+
+func appCheckpointTimedOut(m *fluidcrv1alpha1.FluidCRMigration) bool {
+	if m.Status.StartTime == nil {
+		return false
+	}
+	return time.Now().After(m.Status.StartTime.Add(timeoutOf(m.Spec.AppCheckpointTimeoutSeconds)))
 }
 
 // containerCheckpoint invokes the kubelet CRIU checkpoint API on every target.
