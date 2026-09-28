@@ -22,6 +22,10 @@ type GroupOperation struct {
 	OperationUID   string
 	SourceWorldUID string
 	EvidenceRef    string
+	WorldSize      int64
+	// Producer generation from the immutable full-group checkpoint metadata,
+	// not the Kubernetes RestorePlan or FluidCRMigration generation.
+	CheckpointGeneration int64
 }
 
 type GroupControlResult struct {
@@ -52,6 +56,9 @@ func (c *Client) groupControl(ctx context.Context, podIP string, port int, timeo
 	if !groupIdentifier.MatchString(op.CheckpointID) || !groupIdentifier.MatchString(op.OperationUID) ||
 		strings.TrimSpace(op.SourceWorldUID) == "" || strings.TrimSpace(op.EvidenceRef) == "" {
 		return zero, fmt.Errorf("full-group control requires checkpoint, operation, source world and fence evidence identities")
+	}
+	if op.WorldSize <= 0 || op.CheckpointGeneration <= 0 {
+		return zero, fmt.Errorf("full-group control requires expected world size and producer checkpoint generation")
 	}
 	if net.ParseIP(podIP) == nil {
 		return zero, fmt.Errorf("invalid pod IP")
@@ -99,7 +106,7 @@ func (c *Client) groupControl(ctx context.Context, podIP string, port int, timeo
 		return zero, fmt.Errorf("invalid group control response: %w", err)
 	}
 	if result.CheckpointID != op.CheckpointID || result.OperationUID != op.OperationUID ||
-		!result.Prepared || result.Generation <= 0 || len(result.CheckpointPointers) == 0 {
+		!result.Prepared || result.Generation != op.CheckpointGeneration || int64(len(result.CheckpointPointers)) != op.WorldSize {
 		return zero, fmt.Errorf("group control response lacks matching operation evidence")
 	}
 	if result.State != "prepared" && result.State != "resuming" && result.State != "completed" {

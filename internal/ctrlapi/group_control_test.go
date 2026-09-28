@@ -10,7 +10,7 @@ import (
 )
 
 func groupOperationFixture() GroupOperation {
-	return GroupOperation{CheckpointID: "round-1", OperationUID: "operation-1", SourceWorldUID: "world-1", EvidenceRef: "fence-1"}
+	return GroupOperation{CheckpointID: "round-1", OperationUID: "operation-1", SourceWorldUID: "world-1", EvidenceRef: "fence-1", WorldSize: 1, CheckpointGeneration: 7}
 }
 
 func groupResponseFixture() GroupControlResult {
@@ -56,6 +56,8 @@ func TestGroupControlRejectsIncompleteOrStaleSuccess(t *testing.T) {
 		"wrong checkpoint":  func(r *GroupControlResult) { r.CheckpointID = "other" },
 		"not prepared":      func(r *GroupControlResult) { r.Prepared = false },
 		"zero generation":   func(r *GroupControlResult) { r.Generation = 0 },
+		"stale generation":  func(r *GroupControlResult) { r.Generation = 6 },
+		"extra rank":        func(r *GroupControlResult) { r.CheckpointPointers["1"] = "/other-rank" },
 		"resume unfinished": func(r *GroupControlResult) { r.State = "prepared" },
 		"missing ranks":     func(r *GroupControlResult) { r.CheckpointPointers = nil },
 		"rank gap":          func(r *GroupControlResult) { r.CheckpointPointers = map[string]string{"1": "/artifact"} },
@@ -70,6 +72,33 @@ func TestGroupControlRejectsIncompleteOrStaleSuccess(t *testing.T) {
 				t.Fatal("invalid success response accepted")
 			}
 		})
+	}
+}
+
+func TestGroupControlRejectsSmallerWorldAndMissingExpectations(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(groupResponseFixture())
+	}))
+	defer server.Close()
+	host, port := listenerHostPort(t, server.URL)
+	op := groupOperationFixture()
+	op.WorldSize = 2
+	if _, err := NewClient().PrepareGroup(context.Background(), host, port, time.Second, op); err == nil {
+		t.Fatal("one-rank response accepted for two-rank world")
+	}
+	op.WorldSize = 0
+	if _, err := NewClient().PrepareGroup(context.Background(), host, port, time.Second, op); err == nil {
+		t.Fatal("missing world size accepted")
+	}
+	op.WorldSize = 2
+	op.CheckpointGeneration = 0
+	if _, err := NewClient().PrepareGroup(context.Background(), host, port, time.Second, op); err == nil {
+		t.Fatal("missing producer generation accepted")
+	}
+	if calls != 1 {
+		t.Fatalf("invalid requests reached control server: %d calls", calls)
 	}
 }
 
