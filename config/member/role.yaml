@@ -5,6 +5,9 @@
     "name": "stateful-member"
   },
   "rules": [
+    {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch", "create"]},
+    {"apiGroups": [""], "resources": ["persistentvolumeclaims", "persistentvolumes"], "verbs": ["get", "list", "watch"]},
+    {"apiGroups": ["ml.dcn.ssu.ac.kr"], "resources": ["nodeprovisions"], "verbs": ["get", "list", "watch"]},
     {
       "apiGroups": ["fluidcr.dcnlab.com"],
       "resources": ["fluidcrmigrations"],

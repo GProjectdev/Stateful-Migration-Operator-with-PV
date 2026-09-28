@@ -50,10 +50,11 @@ func validateOptions(mode, kubeconfig, cluster, node string) error {
 	return nil
 }
 func main() {
-	var mode, cluster, node, root, sourceRoot, storeRoot, certDir, probe, ca string
+	var mode, cluster, node, root, sourceRoot, storeRoot, certDir, probe, ca, groupControlImage string
 	var leader, insecure bool
 	flag.StringVar(&mode, "mode", "", "management, checkpoint, member or artifact")
 	flag.StringVar(&cluster, "cluster-name", "", "Karmada member name")
+	flag.StringVar(&groupControlImage, "group-control-image", "", "trusted independent FluidCR group-control image")
 	flag.StringVar(&node, "node-name", os.Getenv("NODE_NAME"), "local node name (artifact mode)")
 	flag.StringVar(&root, "archive-root", "/host-checkpoints", "mounted kubelet checkpoint archive root")
 	flag.StringVar(&sourceRoot, "source-archive-root", "", "source archive root for upload; defaults to --archive-root")
@@ -103,7 +104,9 @@ func main() {
 			err = (&suspension.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)
 		}
 	case "member":
-		err = member.NewReconciler(mgr.GetClient(), mgr.GetAPIReader(), cluster).SetupWithManager(mgr)
+		memberReconciler := member.NewReconciler(mgr.GetClient(), mgr.GetAPIReader(), cluster)
+		memberReconciler.GroupControlImage = groupControlImage
+		err = memberReconciler.SetupWithManager(mgr)
 		mgr.GetWebhookServer().Register("/mutate-restore", &admission.Webhook{Handler: member.NewWebhook(mgr.GetAPIReader(), cluster)})
 		mgr.GetWebhookServer().Register("/validate-restore", &admission.Webhook{Handler: member.NewValidator(mgr.GetAPIReader(), cluster)})
 	case "artifact":

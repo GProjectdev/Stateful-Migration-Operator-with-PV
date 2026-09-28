@@ -61,6 +61,7 @@ type PartialRestoreSpec struct {
 	PreventPeriodicResume bool               `json:"preventPeriodicResume"`
 }
 type RestoreRequestSpec struct {
+	GroupRestore       *GroupRestoreSpec   `json:"groupRestore,omitempty"`
 	CheckpointRef      CheckpointReference `json:"checkpointRef"`
 	WorkloadRef        WorkloadReference   `json:"workloadRef"`
 	TrainingRuntimeRef RuntimeReference    `json:"trainingRuntimeRef,omitempty"`
@@ -72,6 +73,7 @@ type RestoreRequestSpec struct {
 	PartialRestore     *PartialRestoreSpec `json:"partialRestore,omitempty"`
 }
 type RestorePlanSpec struct {
+	GroupRestore *GroupRestoreSpec `json:"groupRestore,omitempty"`
 	// LocalPodRestore opts into a member-local, UID-fenced standalone Pod restore.
 	LocalPodRestore    bool                `json:"localPodRestore,omitempty"`
 	RequestUID         string              `json:"requestUID"`
@@ -100,6 +102,7 @@ type PodStatus struct {
 	Message string `json:"message,omitempty"`
 }
 type ClusterStatus struct {
+	GroupControl       *GroupControlStatus    `json:"groupControl,omitempty"`
 	ClusterName        string                 `json:"clusterName"`
 	ObservedGeneration int64                  `json:"observedGeneration,omitempty"`
 	Phase              string                 `json:"phase,omitempty"`
@@ -160,6 +163,7 @@ type RestoreVerification struct {
 	Survivors          []SurvivorStateEvidence     `json:"survivors,omitempty"`
 }
 type RestoreStatus struct {
+	GroupControl       *GroupControlStatus    `json:"groupControl,omitempty"`
 	ObservedGeneration int64                  `json:"observedGeneration,omitempty"`
 	Phase              string                 `json:"phase,omitempty"`
 	Message            string                 `json:"message,omitempty"`
@@ -236,6 +240,7 @@ func CopyPartialRestoreForStatus(in *PartialRestoreSpec) *PartialRestoreSpec {
 
 func copyStatus(in RestoreStatus) RestoreStatus {
 	out := in
+	out.GroupControl = copyGroupControl(in.GroupControl)
 	if in.Verification != nil {
 		verification := *in.Verification
 		verification.PartialRestore = copyPartialVerification(in.Verification.PartialRestore)
@@ -259,6 +264,7 @@ func copyStatus(in RestoreStatus) RestoreStatus {
 	if in.Clusters != nil {
 		out.Clusters = append([]ClusterStatus{}, in.Clusters...)
 		for i := range out.Clusters {
+			out.Clusters[i].GroupControl = copyGroupControl(in.Clusters[i].GroupControl)
 			if in.Clusters[i].Pods != nil {
 				out.Clusters[i].Pods = append([]PodStatus{}, in.Clusters[i].Pods...)
 			}
@@ -278,6 +284,7 @@ func (x *RestoreRequest) DeepCopy() *RestoreRequest {
 	out.ObjectMeta = *x.ObjectMeta.DeepCopy()
 	out.Spec.Pods = copyPods(x.Spec.Pods)
 	out.Spec.PartialRestore = copyPartial(x.Spec.PartialRestore)
+	out.Spec.GroupRestore = CopyGroupRestore(x.Spec.GroupRestore)
 	out.Status = copyStatus(x.Status)
 	return out
 }
@@ -311,6 +318,7 @@ func (x *RestorePlan) DeepCopy() *RestorePlan {
 	out.ObjectMeta = *x.ObjectMeta.DeepCopy()
 	out.Spec.Pods = copyPods(x.Spec.Pods)
 	out.Spec.PartialRestore = copyPartial(x.Spec.PartialRestore)
+	out.Spec.GroupRestore = CopyGroupRestore(x.Spec.GroupRestore)
 	out.Status = copyStatus(x.Status)
 	return out
 }

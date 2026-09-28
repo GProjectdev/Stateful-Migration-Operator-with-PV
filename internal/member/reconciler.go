@@ -7,6 +7,7 @@ import (
 
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/artifact"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,9 +26,10 @@ const WebhookServiceName = "stateful-restore-webhook"
 const WebhookServiceNamespace = "stateful-migration-system"
 
 type Reconciler struct {
-	Client      client.Client
-	Reader      client.Reader
-	ClusterName string
+	GroupControlImage string
+	Client            client.Client
+	Reader            client.Reader
+	ClusterName       string
 }
 
 func NewReconciler(c client.Client, reader client.Reader, clusterName string) *Reconciler {
@@ -66,10 +68,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err := r.Reader.Get(ctx, req.NamespacedName, &plan); err != nil {
 			return client.IgnoreNotFound(err)
 		}
-		if plan.Spec.TargetCluster != r.ClusterName || !plan.DeletionTimestamp.IsZero() {
+		if (plan.Spec.TargetCluster != r.ClusterName && !(plan.Spec.GroupRestore != nil && plan.Spec.SourceCluster == r.ClusterName)) || !plan.DeletionTimestamp.IsZero() {
 			return nil
 		}
 		before := plan.DeepCopy().Status
+		if plan.Spec.TargetCluster == r.ClusterName && groupcontract.TargetVerified(&plan) {
+			return nil
+		}
 		phase, message, pods, sourceFences, err := r.evaluate(ctx, &plan)
 		if err != nil {
 			return err
@@ -87,6 +92,37 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 
 func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (string, string, []api.PodStatus, []api.SourcePodFenceStatus, error) {
+	if plan.Spec.GroupRestore != nil {
+		if err := validatePlan(plan, plan.Spec.TargetCluster); err != nil {
+			return "Failed", err.Error(), nil, plan.Status.SourceFences, nil
+		}
+		if err := api.ValidateGroup(plan.Spec.GroupRestore, plan.Spec.PartialRestore, plan.Spec.WorkloadRef, plan.Spec.Pods); err != nil {
+			return "Failed", err.Error(), nil, plan.Status.SourceFences, nil
+		}
+		if plan.Spec.SourceCluster == r.ClusterName {
+			done, fences, err := r.fenceGroup(ctx, plan)
+			if err != nil {
+				return "AwaitingSourceFence", err.Error(), nil, plan.Status.SourceFences, nil
+			}
+			plan.Status.SourceFences = fences
+			if !done {
+				return "SourceFencing", "waiting for every current source UID to be fenced", nil, fences, nil
+			}
+			if plan.Spec.TargetCluster != r.ClusterName {
+				return "SourceFenced", "all current source world UIDs fenced", nil, fences, nil
+			}
+		}
+		if err := groupSourceReceipt(plan); err != nil {
+			return "AwaitingSourceFence", err.Error(), nil, plan.Status.SourceFences, nil
+		}
+		done, err := r.prepareGroup(ctx, plan)
+		if err != nil {
+			return "Preparing", err.Error(), nil, plan.Status.SourceFences, nil
+		}
+		if !done {
+			return "Preparing", "waiting for operation-owned prepare Job", nil, plan.Status.SourceFences, nil
+		}
+	}
 	if err := validatePlan(plan, r.ClusterName); err != nil {
 		return "Failed", err.Error(), nil, nil, nil
 	}
@@ -99,6 +135,9 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 	failure := ""
 	statuses := make([]api.PodStatus, 0, len(plan.Spec.Pods))
 	sourceFences := []api.SourcePodFenceStatus(nil)
+	if plan.Spec.GroupRestore != nil {
+		sourceFences = plan.Status.SourceFences
+	}
 	partial := plan.Spec.PartialRestore != nil || plan.Spec.LocalPodRestore
 	for _, mapping := range plan.Spec.Pods {
 		mappingReady := true
@@ -159,6 +198,12 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 			status.Phase, status.Message = "Failed", err.Error()
 			failure = err.Error()
 		}
+		if plan.Spec.GroupRestore != nil {
+			if err := groupPVCMatches(plan, &pod); err != nil {
+				status.Phase, status.Message = "Failed", err.Error()
+				failure = err.Error()
+			}
+		}
 		if !pod.DeletionTimestamp.IsZero() {
 			status.Phase, status.Message = "Failed", "planned Pod is deleting"
 			failure = status.Message
@@ -191,6 +236,15 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		return "AwaitingArtifacts", "waiting for fresh current-generation node archive reports", statuses, sourceFences, nil
 	}
 	if running {
+		if plan.Spec.GroupRestore != nil {
+			done, err := r.resumeGroup(ctx, plan)
+			if err != nil {
+				return "Resuming", err.Error(), statuses, sourceFences, nil
+			}
+			if !done {
+				return "Resuming", "waiting for operation-owned resume Job", statuses, sourceFences, nil
+			}
+		}
 		return "Running", "all planned Pods are Running and Ready; CRIU restore success is not attested", statuses, sourceFences, nil
 	}
 	return "Prepared", "target archives verified; waiting for planned Pods to become Running and Ready", statuses, sourceFences, nil

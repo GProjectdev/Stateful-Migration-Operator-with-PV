@@ -7,6 +7,7 @@ import (
 	"fmt"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/artifact"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -83,7 +84,14 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 	}
 	sameCluster := p.Spec.SourceCluster == p.Spec.TargetCluster
 	partialTargets := map[int64]bool{}
-	if p.Spec.LocalPodRestore {
+	if p.Spec.GroupRestore != nil {
+		if p.Spec.LocalPodRestore {
+			return fmt.Errorf("groupRestore and localPodRestore are mutually exclusive")
+		}
+		if err := api.ValidateGroup(p.Spec.GroupRestore, p.Spec.PartialRestore, p.Spec.WorkloadRef, p.Spec.Pods); err != nil {
+			return err
+		}
+	} else if p.Spec.LocalPodRestore {
 		if err := validateLocalPodPlan(p); err != nil {
 			return err
 		}
@@ -114,11 +122,11 @@ func validatePlan(p *api.RestorePlan, cluster string) error {
 		if mapping.SourcePod != mapping.TargetPod {
 			return fmt.Errorf("source and target Pod identity must match")
 		}
-		if sameCluster && !p.Spec.LocalPodRestore {
+		if sameCluster && !p.Spec.LocalPodRestore && p.Spec.GroupRestore == nil {
 			if !partialTargets[mapping.Rank] || strings.TrimSpace(mapping.SourcePodUID) == "" {
 				return fmt.Errorf("same-cluster partial restore requires target rank and sourcePodUID")
 			}
-		} else if !p.Spec.LocalPodRestore && strings.TrimSpace(mapping.SourcePodUID) != "" {
+		} else if !p.Spec.LocalPodRestore && p.Spec.GroupRestore == nil && strings.TrimSpace(mapping.SourcePodUID) != "" {
 			return fmt.Errorf("sourcePodUID is reserved for same-cluster partial restore")
 		}
 		if (ref.Kind == "Pod" && mapping.TargetPod != ref.Name) || (ref.Kind == "StatefulSet" && !ordinal.MatchString(mapping.TargetPod)) {
@@ -219,6 +227,23 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
+	if plan.Spec.GroupRestore != nil {
+		if plan.Spec.TargetCluster == w.ClusterName && groupcontract.TargetVerified(&plan) {
+			return fmt.Errorf("group operation already verified; a new recovery operation is required")
+		}
+		if plan.Spec.TargetCluster != w.ClusterName {
+			return fmt.Errorf("source world is fenced by active group restore")
+		}
+		if !groupPrepared(&plan) {
+			return fmt.Errorf("group prepare receipt required before target Pod admission")
+		}
+		if err := groupSourceReceipt(&plan); err != nil {
+			return err
+		}
+		if err := groupPVCMatches(&plan, pod); err != nil {
+			return err
+		}
+	}
 	if err := validatePlan(&plan, w.ClusterName); err != nil {
 		return err
 	}
@@ -304,20 +329,31 @@ func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.Re
 	if pod.Namespace == "" {
 		return api.RestorePlan{}, fmt.Errorf("namespace required")
 	}
-	if name := pod.Labels[api.PlanLabel]; name != "" {
-		var plan api.RestorePlan
-		if err := w.Reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: name}, &plan); err != nil {
-			return api.RestorePlan{}, fmt.Errorf("restore plan unavailable: %w", err)
-		}
-		return plan, nil
-	}
+	explicit := pod.Labels[api.PlanLabel]
 	var plans api.RestorePlanList
 	if err := w.Reader.List(ctx, &plans, client.InNamespace(pod.Namespace)); err != nil {
 		return api.RestorePlan{}, err
 	}
 	var matches []api.RestorePlan
 	for _, plan := range plans.Items {
-		if !activePartialPlan(&plan, w.ClusterName) || !workloadMatchesPod(&plan, pod) {
+		matchesWorkload := workloadMatchesPod(&plan, pod)
+		if plan.Spec.GroupRestore != nil {
+			owner := metav1.GetControllerOf(pod)
+			// Fail closed for the named world even when an outdated template has
+			// not yet received its origin UID label.
+			matchesWorkload = owner != nil && owner.Kind == "StatefulSet" && owner.APIVersion == "apps/v1" && owner.Name == plan.Spec.WorkloadRef.Name
+		}
+		if !activePartialPlan(&plan, w.ClusterName) || !matchesWorkload {
+			continue
+		}
+		if explicit != "" && plan.Spec.GroupRestore == nil {
+			continue
+		}
+		if plan.Spec.GroupRestore != nil {
+			if explicit != "" && explicit != plan.Name {
+				return api.RestorePlan{}, fmt.Errorf("explicit plan cannot bypass active full-world barrier")
+			}
+			matches = append(matches, plan)
 			continue
 		}
 		for _, mapping := range plan.Spec.Pods {
@@ -328,6 +364,13 @@ func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.Re
 		}
 	}
 	if len(matches) == 0 {
+		if explicit != "" {
+			var plan api.RestorePlan
+			if err := w.Reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: explicit}, &plan); err != nil {
+				return api.RestorePlan{}, fmt.Errorf("restore plan unavailable: %w", err)
+			}
+			return plan, nil
+		}
 		return api.RestorePlan{}, errNoRestorePlan
 	}
 	if len(matches) > 1 {
@@ -337,6 +380,12 @@ func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.Re
 }
 
 func activePartialPlan(plan *api.RestorePlan, cluster string) bool {
+	if plan.Spec.GroupRestore != nil {
+		if plan.Spec.TargetCluster == cluster && groupcontract.TargetVerified(plan) {
+			return false
+		}
+		return (plan.Spec.TargetCluster == cluster || plan.Spec.SourceCluster == cluster) && plan.DeletionTimestamp.IsZero()
+	}
 	return (plan.Spec.PartialRestore != nil || plan.Spec.LocalPodRestore) && plan.Spec.TargetCluster == cluster && plan.DeletionTimestamp.IsZero() && plan.Status.Phase != "Verified" && (plan.Spec.LocalPodRestore || plan.Status.Phase != "Failed")
 }
 

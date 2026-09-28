@@ -7,6 +7,7 @@ import (
 	"time"
 
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/management"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -113,7 +114,7 @@ func check(ctx context.Context, reader client.Reader, rb *unstructured.Unstructu
 		}
 	}
 	a := rb.GetAnnotations()
-	if a[RequestUIDAnnotation] == "" || a[PVAnnotation] == "" || a[PVUIDAnnotation] == "" {
+	if a[RequestUIDAnnotation] == "" {
 		return fail("operation names and UIDs required")
 	}
 	req := &api.RestoreRequest{}
@@ -121,6 +122,9 @@ func check(ctx context.Context, reader client.Reader, rb *unstructured.Unstructu
 		return err
 	}
 	s := req.Spec
+	if s.GroupRestore == nil && (a[PVAnnotation] == "" || a[PVUIDAnnotation] == "") {
+		return fail("PV operation names and UIDs required")
+	}
 	if string(req.UID) != a[RequestUIDAnnotation] || !req.DeletionTimestamp.IsZero() || req.Generation <= 0 ||
 		req.Status.ObservedGeneration != req.Generation || !ready(req.Status.Phase) {
 		return fail("current ready RestoreRequest required")
@@ -183,15 +187,25 @@ func check(ctx context.Context, reader client.Reader, rb *unstructured.Unstructu
 		return err
 	}
 	owner := metav1.GetControllerOf(plan)
-	want := api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods, PartialRestore: s.PartialRestore}
+	want := api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods, PartialRestore: s.PartialRestore, GroupRestore: s.GroupRestore}
 	if plan.UID == "" || plan.Generation <= 0 || !plan.DeletionTimestamp.IsZero() || owner == nil || owner.UID != req.UID || owner.Name != req.Name ||
 		owner.Kind != "RestoreRequest" || owner.APIVersion != api.GroupVersion.String() || !reflect.DeepEqual(plan.Spec, want) {
 		return fail("plan ownership or spec mismatch")
 	}
-	if len(plan.Status.Clusters) != 1 {
+	if len(plan.Status.Clusters) != 1 && s.GroupRestore == nil {
 		return fail("one current target plan report required")
 	}
-	report := plan.Status.Clusters[0]
+	var report api.ClusterStatus
+	count := 0
+	for _, c := range plan.Status.Clusters {
+		if c.ClusterName == s.TargetCluster {
+			report = c
+			count++
+		}
+	}
+	if count != 1 {
+		return fail("exactly one target plan report required")
+	}
 	if report.ClusterName != s.TargetCluster || report.ObservedGeneration != plan.Generation || !ready(report.Phase) || report.Phase != req.Status.Phase {
 		return fail("plan target not currently prepared")
 	}
@@ -200,6 +214,17 @@ func check(ctx context.Context, reader client.Reader, rb *unstructured.Unstructu
 		return err
 	}
 	if err := management.ValidateRestoreCheckpoint(req, cp); err != nil {
+		return err
+	}
+	if s.GroupRestore != nil {
+		g := report.GroupControl
+		if g == nil || g.OperationUID != s.GroupRestore.OperationUID || g.CheckpointID != s.CheckpointRef.CheckpointID || g.CheckpointGeneration <= 0 || g.PreparedAt == nil || g.PrepareJobUID == "" || g.VolumeServer == "" || g.VolumePath == "" {
+			return fail("operation-owned group prepare and shared-volume receipt required")
+		}
+		if s.SourceCluster == s.TargetCluster {
+			return groupcontract.ValidateFences(plan, report.SourceFences)
+		}
+		_, err := groupcontract.Decode(plan)
 		return err
 	}
 	pv := object(api.GroupVersion.String(), "PVMigration")

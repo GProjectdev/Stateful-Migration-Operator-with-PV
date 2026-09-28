@@ -34,6 +34,7 @@
             "args": [
               "--mode=member",
               "--cluster-name=aws",
+              "--group-control-image=ghcr.io/gprojectdev/fluidcr-group-control:dev",
               "--webhook-cert-dir=/etc/webhook"
             ],
             "securityContext": {

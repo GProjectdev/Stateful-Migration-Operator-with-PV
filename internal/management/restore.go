@@ -11,6 +11,7 @@ import (
 	"time"
 
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -65,8 +66,8 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
+	before := req.DeepCopy()
 	finish := func(phase, message, plan string) (ctrl.Result, error) {
-		before := req.DeepCopy()
 		req.Status.Phase, req.Status.Message, req.Status.PlanName = phase, message, plan
 		req.Status.ObservedGeneration = req.Generation
 		if !reflect.DeepEqual(before.Status, req.Status) {
@@ -78,6 +79,11 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	}
 	if err := validateRequest(req); err != nil {
 		return finish("Failed", err.Error(), req.Status.PlanName)
+	}
+	// Completion is an operation receipt, not a perpetual health check. A later
+	// failure is a new operation and must not revoke this operation's evidence.
+	if req.Spec.GroupRestore != nil && req.Status.Phase == "Verified" && req.Status.ObservedGeneration == req.Generation && req.Status.Verification != nil && req.Status.Verification.RequestUID == string(req.UID) && req.Status.Verification.Operation == req.Spec.GroupRestore.OperationUID {
+		return ctrl.Result{}, nil
 	}
 	cp := &unstructured.Unstructured{}
 	cp.SetGroupVersionKind(checkpointGVK)
@@ -131,6 +137,11 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 		return finish("Failed", "PropagationPolicy ownership or spec drift", plan.Name)
 	}
 	phase, message := "Preparing", "waiting for current target plan aggregation"
+	if req.Spec.GroupRestore != nil && req.Spec.SourceCluster != req.Spec.TargetCluster {
+		if err := r.authorizeGroupFence(ctx, plan); err != nil {
+			return finish("AwaitingSourceFence", err.Error(), plan.Name)
+		}
+	}
 	matches := 0
 	for _, s := range plan.Status.Clusters {
 		if s.ClusterName != req.Spec.TargetCluster {
@@ -141,9 +152,19 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 			continue
 		}
 		switch s.Phase {
-		case "AwaitingArtifacts", "Preparing", "Prepared", "Failed":
+		case "AwaitingArtifacts", "Preparing", "Prepared", "Failed", "AwaitingSourceFence", "SourceFencing", "Resuming":
 			phase, message = s.Phase, s.Message
+			if req.Spec.GroupRestore != nil {
+				req.Status.GroupControl = s.GroupControl
+			}
 		case "Running":
+			if req.Spec.GroupRestore != nil {
+				req.Status.GroupControl = s.GroupControl
+				if s.GroupControl == nil || s.GroupControl.ResumedAt == nil || s.GroupControl.ResumeJobUID == "" || s.GroupControl.OperationUID != req.Spec.GroupRestore.OperationUID || s.GroupControl.CheckpointID != req.Spec.CheckpointRef.CheckpointID {
+					phase, message = "Resuming", "waiting for operation-bound resume receipt"
+					continue
+				}
+			}
 			verification, err := r.validateTargetRuntime(ctx, req, plan, s.Pods, s.SourceFences)
 			if err == nil {
 				phase, message = "Verified", "target runtime evidence verified"
@@ -167,6 +188,16 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	if matches > 1 {
 		return finish("Failed", "duplicate target cluster aggregation", plan.Name)
 	}
+	if req.Spec.GroupRestore != nil && phase == "Verified" && !groupcontract.TargetVerified(plan) {
+		beforePlan := plan.DeepCopy()
+		if plan.Annotations == nil {
+			plan.Annotations = map[string]string{}
+		}
+		plan.Annotations[groupcontract.TargetVerifiedAnnotation] = string(req.UID)
+		if err := r.Client.Patch(ctx, plan, client.MergeFromWithOptions(beforePlan, client.MergeFromWithOptimisticLock{})); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	return finish(phase, message, plan.Name)
 }
 
@@ -183,8 +214,51 @@ func (r *RestoreReconciler) authorizeRestoreOwnedResume(ctx context.Context, cp 
 	cp.SetAnnotations(annotations)
 	return r.Client.Patch(ctx, cp, client.MergeFrom(before))
 }
+func (r *RestoreReconciler) authorizeGroupFence(ctx context.Context, plan *api.RestorePlan) error {
+	var source *api.ClusterStatus
+	for i := range plan.Status.Clusters {
+		c := &plan.Status.Clusters[i]
+		if c.ClusterName != plan.Spec.SourceCluster {
+			continue
+		}
+		if source != nil {
+			return fmt.Errorf("duplicate source group fence aggregation")
+		}
+		source = c
+	}
+	if source == nil || source.ObservedGeneration != plan.Generation || source.Phase != "SourceFenced" {
+		return fmt.Errorf("waiting for current source member full-world fence receipt")
+	}
+	copy := plan.DeepCopy()
+	copy.Status.GroupControl = source.GroupControl
+	receipt, err := groupcontract.Encode(copy, source.SourceFences)
+	if err != nil {
+		return err
+	}
+	if plan.Annotations[groupcontract.FenceAnnotation] == receipt {
+		return nil
+	}
+	before := plan.DeepCopy()
+	if plan.Annotations == nil {
+		plan.Annotations = map[string]string{}
+	}
+	plan.Annotations[groupcontract.FenceAnnotation] = receipt
+	return r.Client.Patch(ctx, plan, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+}
 
 func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, sourceFences []api.SourcePodFenceStatus) (*api.RestoreVerification, error) {
+	if req.Spec.GroupRestore != nil {
+		if plan.Spec.SourceCluster != plan.Spec.TargetCluster {
+			var err error
+			sourceFences, err = groupcontract.Decode(plan)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := groupcontract.ValidateFences(plan, sourceFences); err != nil {
+			return nil, err
+		}
+	}
 	tr, err := r.resolveTrainingRuntime(ctx, req)
 	if err != nil {
 		return nil, err
@@ -226,6 +300,11 @@ func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.
 	}
 	verifiedAt := metav1.Now()
 	verification := &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations["training.dcnlab.com/recovery-operation"], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: verifiedAt, TrainingRuntimeRef: api.RuntimeReference{Name: tr.GetName(), UID: string(tr.GetUID())}, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced}
+	if req.Spec.GroupRestore != nil {
+		verification.SourceFenced = true
+		verification.Operation = req.Spec.GroupRestore.OperationUID
+		verification.SourceFence = api.SourceFenceEvidence{Fenced: true, Operation: req.Spec.GroupRestore.OperationUID, EvidenceID: req.Spec.GroupRestore.OperationUID, ObservedAt: verifiedAt.Time.Format(time.RFC3339)}
+	}
 	if req.Spec.PartialRestore != nil {
 		partial, sourceFence, survivors, err := partialVerification(req, plan, targetPods, sourceFences, verifiedAt.Time.Format(time.RFC3339))
 		if err != nil {
@@ -387,6 +466,9 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 	if err != nil || stale(rootObserved, now) {
 		return fmt.Errorf("target runtime root observation is stale")
 	}
+	if req.Spec.GroupRestore != nil && (req.Status.GroupControl == nil || req.Status.GroupControl.ResumedAt == nil || !rootObserved.After(req.Status.GroupControl.ResumedAt.Time)) {
+		return fmt.Errorf("waiting for post-resume runtime observation")
+	}
 	pods, ok := status["pods"].([]interface{})
 	if !ok || len(pods) != world {
 		return fmt.Errorf("target runtime pod samples are incomplete")
@@ -453,6 +535,9 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 		previousObserved, err := parseObservedAt(pod["previousObservedAt"])
 		if err != nil || stale(previousObserved, now) {
 			return fmt.Errorf("target runtime previous pod sample is stale")
+		}
+		if req.Spec.GroupRestore != nil && !previousObserved.After(req.Status.GroupControl.ResumedAt.Time) {
+			return fmt.Errorf("both runtime samples must be observed after group resume")
 		}
 		if minStep == 0 || step < minStep {
 			minStep = step
@@ -533,14 +618,14 @@ func ownerReference(req *api.RestoreRequest) []metav1.OwnerReference {
 func desiredPlan(req *api.RestoreRequest, cps ...*unstructured.Unstructured) (*api.RestorePlan, error) {
 	sum := sha256.Sum256([]byte(req.UID))
 	s := req.DeepCopy().Spec
-	if s.SourceCluster == s.TargetCluster && len(cps) > 0 && cps[0] != nil {
+	if s.PartialRestore != nil && s.SourceCluster == s.TargetCluster && len(cps) > 0 && cps[0] != nil {
 		pods, err := enrichPartialArchives(req, cps[0])
 		if err != nil {
 			return nil, err
 		}
 		s.Pods = pods
 	}
-	return &api.RestorePlan{TypeMeta: metav1.TypeMeta{APIVersion: api.GroupVersion.String(), Kind: "RestorePlan"}, ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("restore-%x", sum[:20]), Namespace: req.Namespace, OwnerReferences: ownerReference(req)}, Spec: api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods, PartialRestore: s.PartialRestore}}, nil
+	return &api.RestorePlan{TypeMeta: metav1.TypeMeta{APIVersion: api.GroupVersion.String(), Kind: "RestorePlan"}, ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("restore-%x", sum[:20]), Namespace: req.Namespace, OwnerReferences: ownerReference(req)}, Spec: api.RestorePlanSpec{RequestUID: string(req.UID), CheckpointRef: s.CheckpointRef, WorkloadRef: s.WorkloadRef, TrainingRuntimeRef: s.TrainingRuntimeRef, SourceCluster: s.SourceCluster, TargetCluster: s.TargetCluster, SourceFenced: s.SourceFenced, VolumesReady: s.VolumesReady, Pods: s.Pods, PartialRestore: s.PartialRestore, GroupRestore: s.GroupRestore}}, nil
 }
 
 func mustDesiredPlan(req *api.RestoreRequest) *api.RestorePlan {
@@ -805,7 +890,14 @@ func validateRequest(req *api.RestoreRequest) error {
 	}
 	sameCluster := s.SourceCluster == s.TargetCluster
 	var partialTargets map[int64]bool
-	if sameCluster {
+	if s.GroupRestore != nil {
+		if err := api.ValidateGroup(s.GroupRestore, s.PartialRestore, s.WorkloadRef, s.Pods); err != nil {
+			return err
+		}
+		if s.TrainingRuntimeRef.Name == "" {
+			return fmt.Errorf("group restore requires TrainingRuntime reference")
+		}
+	} else if sameCluster {
 		var err error
 		partialTargets, _, err = validatePartialRestore(s.PartialRestore, s.SourceFenced, len(s.Pods))
 		if err != nil {
@@ -832,11 +924,11 @@ func validateRequest(req *api.RestoreRequest) error {
 		if !validName(p.SourcePod) || p.SourcePod != p.TargetPod || seen[p.SourcePod] || !validName(p.SourceNode) || !validName(p.TargetNode) {
 			return fmt.Errorf("pod mappings must have unique stable identities, source nodes and target nodes")
 		}
-		if sameCluster {
+		if sameCluster && s.GroupRestore == nil {
 			if !partialTargets[p.Rank] || strings.TrimSpace(p.SourcePodUID) == "" {
 				return fmt.Errorf("same-cluster partial restore requires explicit target rank and sourcePodUID evidence")
 			}
-		} else if strings.TrimSpace(p.SourcePodUID) != "" {
+		} else if s.GroupRestore == nil && strings.TrimSpace(p.SourcePodUID) != "" {
 			return fmt.Errorf("sourcePodUID is reserved for same-cluster partial restore")
 		}
 		seen[p.SourcePod] = true
@@ -879,7 +971,7 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 	}
 	partialTargets := map[int64]bool(nil)
 	survivors := map[string]api.SurvivorEvidence(nil)
-	if s.SourceCluster == s.TargetCluster {
+	if s.SourceCluster == s.TargetCluster && s.GroupRestore == nil {
 		var vErr error
 		partialTargets, survivors, vErr = validatePartialRestore(s.PartialRestore, s.SourceFenced, len(s.Pods))
 		if vErr != nil {
@@ -891,6 +983,15 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 	}
 	if cp.GetAnnotations()["training.dcnlab.com/checkpoint-id"] != s.CheckpointRef.CheckpointID {
 		return false, fmt.Errorf("checkpoint annotation checkpoint-id mismatch")
+	}
+	if s.GroupRestore != nil {
+		uid, _, _ := unstructured.NestedString(cp.Object, "spec", "workloadRef", "uid")
+		if uid != s.GroupRestore.SourceWorldUID {
+			return false, fmt.Errorf("group checkpoint source world UID mismatch")
+		}
+		if partial, found, _ := unstructured.NestedMap(cp.Object, "spec", "partialCheckpoint"); found && len(partial) > 0 {
+			return false, fmt.Errorf("group restore cannot use a partial checkpoint")
+		}
 	}
 	for k, want := range map[string]string{"apiVersion": s.WorkloadRef.APIVersion, "kind": s.WorkloadRef.Kind, "name": s.WorkloadRef.Name, "namespace": req.Namespace} {
 		got, _, err := unstructured.NestedString(cp.Object, "spec", "workloadRef", k)
@@ -988,6 +1089,11 @@ func validateCheckpoint(req *api.RestoreRequest, cp *unstructured.Unstructured) 
 			return false, fmt.Errorf("invalid checkpoint file")
 		}
 		a := mapping.Archives[0]
+		if s.GroupRestore != nil {
+			if file["sha256"] != a.SHA256 || file["durableRef"] != a.DurableRef || file["exportedAt"] == nil {
+				return false, fmt.Errorf("group checkpoint must have matching durable export evidence")
+			}
+		}
 		nodeName, _, _ := unstructured.NestedString(p, "nodeName")
 		if nodeName != mapping.SourceNode {
 			return false, fmt.Errorf("source pod node mismatch")

@@ -63,7 +63,7 @@ spec:
             if expected and counts[name] == 1 and type(status) == "table"
                 and status.observedGeneration == generation then
               local report = {clusterName = name}
-              for _, key in ipairs({"observedGeneration", "phase", "message", "pods", "sourceFences"}) do
+              for _, key in ipairs({"observedGeneration", "phase", "message", "pods", "sourceFences", "groupControl"}) do
                 report[key] = copy(status[key])
               end
               table.insert(clusters, report)

@@ -43,6 +43,8 @@ spec:
             x-kubernetes-validations:
             - rule: self == oldSelf
               message: spec is immutable after creation
+            - rule: "!has(self.groupRestore) || !has(self.partialRestore)"
+              message: groupRestore and partialRestore are mutually exclusive
             properties:
               checkpointRef:
                 type: object
@@ -194,6 +196,7 @@ spec:
                             minLength: 64
                             maxLength: 64
                             pattern: ^[0-9a-f]{64}$
+              groupRestore: {"type":"object","required":["operationUID","sourceWorldUID","worldSize","sharedPVC","checkpointRoot","sourcePods"],"properties":{"operationUID":{"type":"string","minLength":1,"maxLength":128},"sourceWorldUID":{"type":"string","minLength":1,"maxLength":128},"worldSize":{"type":"integer","format":"int64","minimum":1,"maximum":64},"sharedPVC":{"type":"string","minLength":1,"maxLength":253},"checkpointRoot":{"type":"string","minLength":1,"maxLength":253,"enum":["/checkpoint"]},"sourcePods":{"type":"array","minItems":1,"maxItems":64,"x-kubernetes-list-type":"map","x-kubernetes-list-map-keys":["rank"],"items":{"type":"object","required":["rank","podName","podUID","nodeName"],"properties":{"rank":{"type":"integer","format":"int64","minimum":0},"podName":{"type":"string","minLength":1,"maxLength":253},"podUID":{"type":"string","minLength":1,"maxLength":128},"nodeName":{"type":"string","minLength":1,"maxLength":253},"nodeProvisionRef":{"type":"object","required":["name","uid","instanceID"],"properties":{"name":{"type":"string","minLength":1,"maxLength":253},"uid":{"type":"string","minLength":1,"maxLength":128},"instanceID":{"type":"string","minLength":1,"maxLength":128}}}}}}}}
               partialRestore:
                 type: object
                 required:
@@ -260,6 +263,7 @@ spec:
           status:
             type: object
             properties:
+              groupControl: {"type":"object","required":["operationUID","checkpointID"],"properties":{"operationUID":{"type":"string","minLength":1,"maxLength":128},"checkpointID":{"type":"string","minLength":1,"maxLength":253},"checkpointGeneration":{"type":"integer","format":"int64","minimum":0},"prepareJobUID":{"type":"string","minLength":1,"maxLength":128},"resumeJobUID":{"type":"string","minLength":1,"maxLength":128},"preparedAt":{"type":"string","format":"date-time"},"resumedAt":{"type":"string","format":"date-time"},"volumeServer":{"type":"string","maxLength":253},"volumePath":{"type":"string","maxLength":4096},"volumePVCUID":{"type":"string","minLength":1,"maxLength":128},"volumePVUID":{"type":"string","minLength":1,"maxLength":128}}}
               observedGeneration:
                 type: integer
                 format: int64
@@ -553,6 +557,7 @@ spec:
                   required:
                   - clusterName
                   properties:
+                    groupControl: {"type":"object","required":["operationUID","checkpointID"],"properties":{"operationUID":{"type":"string","minLength":1,"maxLength":128},"checkpointID":{"type":"string","minLength":1,"maxLength":253},"checkpointGeneration":{"type":"integer","format":"int64","minimum":0},"prepareJobUID":{"type":"string","minLength":1,"maxLength":128},"resumeJobUID":{"type":"string","minLength":1,"maxLength":128},"preparedAt":{"type":"string","format":"date-time"},"resumedAt":{"type":"string","format":"date-time"},"volumeServer":{"type":"string","maxLength":253},"volumePath":{"type":"string","maxLength":4096},"volumePVCUID":{"type":"string","minLength":1,"maxLength":128},"volumePVUID":{"type":"string","minLength":1,"maxLength":128}}}
                     clusterName:
                       type: string
                       minLength: 1
