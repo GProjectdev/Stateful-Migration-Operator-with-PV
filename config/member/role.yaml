@@ -6,6 +6,7 @@
   },
   "rules": [
     {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch", "create"]},
+    {"apiGroups": ["apps"], "resources": ["statefulsets"], "verbs": ["get"]},
     {"apiGroups": [""], "resources": ["persistentvolumeclaims", "persistentvolumes"], "verbs": ["get", "list", "watch"]},
     {"apiGroups": ["ml.dcn.ssu.ac.kr"], "resources": ["nodeprovisions"], "verbs": ["get", "list", "watch"]},
     {

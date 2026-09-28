@@ -85,6 +85,30 @@ func TestSuspensionPermissionsAreControlPlaneOnly(t *testing.T) {
 		t.Fatalf("missing suspension permissions: %v", want)
 	}
 }
+
+func TestMemberCanReadRestoreWorkloadIdentity(t *testing.T) {
+	role := load(t, "member/role.yaml")
+	for _, entry := range role["rules"].([]interface{}) {
+		rule := entry.(map[string]interface{})
+		groups := rule["apiGroups"].([]interface{})
+		resources := rule["resources"].([]interface{})
+		verbs := rule["verbs"].([]interface{})
+		if contains(groups, "apps") && contains(resources, "statefulsets") && contains(verbs, "get") {
+			return
+		}
+	}
+	t.Fatal("stateful-member must get StatefulSets to validate local restore ownership")
+}
+
+func contains(values []interface{}, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestArtifactDaemonMountsOnlyCheckpointAndStoreWritable(t *testing.T) {
 	d := load(t, "member/artifact-daemonset.yaml")
 	spec := d["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})
