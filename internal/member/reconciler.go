@@ -336,11 +336,12 @@ func validateSourcePodForDeletion(ctx context.Context, reader client.Reader, pla
 	if mapping.SourceNode != "" && pod.Spec.NodeName != mapping.SourceNode {
 		return fmt.Errorf("source Pod node does not match checkpoint evidence")
 	}
-	if !sourcePodOwnedByWorkload(plan, pod) {
-		return fmt.Errorf("source Pod owner does not match restore workload UID")
-	}
-	if err := validateAdmissionReady(ctx, reader, plan); err != nil {
+	memberWorkloadUID, err := validateAdmissionReady(ctx, reader, plan)
+	if err != nil {
 		return err
+	}
+	if !sourcePodOwnedByWorkload(plan, pod, memberWorkloadUID) {
+		return fmt.Errorf("source Pod owner does not match restore workload identity")
 	}
 	var node corev1.Node
 	if err := reader.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, &node); err != nil {
@@ -357,32 +358,39 @@ func validateSourcePodForDeletion(ctx context.Context, reader client.Reader, pla
 	return fmt.Errorf("source Pod node is not Ready")
 }
 
-func validateAdmissionReady(ctx context.Context, reader client.Reader, plan *api.RestorePlan) error {
+func validateAdmissionReady(ctx context.Context, reader client.Reader, plan *api.RestorePlan) (string, error) {
 	if plan.Spec.WorkloadRef.Kind != "StatefulSet" {
-		return nil
+		return plan.Spec.WorkloadRef.UID, nil
 	}
 	var sts appsv1.StatefulSet
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: plan.Namespace, Name: plan.Spec.WorkloadRef.Name}, &sts); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("restore workload StatefulSet does not exist")
+			return "", fmt.Errorf("restore workload StatefulSet does not exist")
 		}
-		return err
+		return "", err
 	}
-	if string(sts.UID) != plan.Spec.WorkloadRef.UID || !sts.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("restore workload StatefulSet UID mismatch or deleting")
+	if !sts.DeletionTimestamp.IsZero() {
+		return "", fmt.Errorf("restore workload StatefulSet is deleting")
+	}
+	originUID := sts.Labels[WorkloadUIDLabel]
+	if originUID == "" {
+		originUID = string(sts.UID)
+	}
+	if originUID != plan.Spec.WorkloadRef.UID {
+		return "", fmt.Errorf("restore workload StatefulSet origin UID mismatch")
 	}
 	if sts.Spec.Template.Labels[WorkloadUIDLabel] != plan.Spec.WorkloadRef.UID {
-		return fmt.Errorf("StatefulSet template lacks workload UID label required by partial restore admission")
+		return "", fmt.Errorf("StatefulSet template lacks workload UID label required by partial restore admission")
 	}
 	if sts.Spec.Template.Annotations[InjectAnnotation] != "true" {
-		return fmt.Errorf("StatefulSet template lacks fluidcr inject opt-in required before source deletion")
+		return "", fmt.Errorf("StatefulSet template lacks fluidcr inject opt-in required before source deletion")
 	}
 	var endpoints corev1.Endpoints
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: WebhookServiceNamespace, Name: WebhookServiceName}, &endpoints); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("restore webhook endpoints are not available")
+			return "", fmt.Errorf("restore webhook endpoints are not available")
 		}
-		return err
+		return "", err
 	}
 	for _, subset := range endpoints.Subsets {
 		if len(subset.Addresses) == 0 || len(subset.Ports) == 0 {
@@ -390,14 +398,14 @@ func validateAdmissionReady(ctx context.Context, reader client.Reader, plan *api
 		}
 		for _, port := range subset.Ports {
 			if port.Port == 9443 || port.Name == "webhook" || port.Port == 443 {
-				return nil
+				return string(sts.UID), nil
 			}
 		}
 	}
-	return fmt.Errorf("restore webhook endpoints have no ready webhook backend")
+	return "", fmt.Errorf("restore webhook endpoints have no ready webhook backend")
 }
 
-func sourcePodOwnedByWorkload(plan *api.RestorePlan, pod *corev1.Pod) bool {
+func sourcePodOwnedByWorkload(plan *api.RestorePlan, pod *corev1.Pod, memberWorkloadUID string) bool {
 	if plan.Spec.WorkloadRef.Kind == "Pod" {
 		if plan.Spec.LocalPodRestore && string(pod.UID) != plan.Spec.WorkloadRef.UID {
 			return false
@@ -408,5 +416,8 @@ func sourcePodOwnedByWorkload(plan *api.RestorePlan, pod *corev1.Pod) bool {
 	if owner == nil || owner.APIVersion != plan.Spec.WorkloadRef.APIVersion || owner.Kind != plan.Spec.WorkloadRef.Kind || owner.Name != plan.Spec.WorkloadRef.Name {
 		return false
 	}
-	return plan.Spec.WorkloadRef.UID == "" || string(owner.UID) == plan.Spec.WorkloadRef.UID
+	if memberWorkloadUID != "" && string(owner.UID) != memberWorkloadUID {
+		return false
+	}
+	return plan.Spec.WorkloadRef.UID == "" || pod.Labels[WorkloadUIDLabel] == plan.Spec.WorkloadRef.UID
 }

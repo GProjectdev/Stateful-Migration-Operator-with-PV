@@ -179,14 +179,14 @@ func partialFixture() (*api.RestorePlan, *corev1.Pod, *corev1.Node) {
 	pod.Labels = map[string]string{WorkloadUIDLabel: "workload-uid"}
 	pod.Annotations = map[string]string{InjectAnnotation: "true"}
 	controller := true
-	pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "workload-uid", Controller: &controller}}
+	pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer", UID: "member-workload-uid", Controller: &controller}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 	return plan, pod, node
 }
 
 func partialAdmissionObjects() []client.Object {
 	replicas := int32(2)
-	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: "jobs", UID: "workload-uid"}, Spec: appsv1.StatefulSetSpec{Replicas: &replicas, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{WorkloadUIDLabel: "workload-uid"}, Annotations: map[string]string{InjectAnnotation: "true"}}}}}
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: "jobs", UID: "member-workload-uid", Labels: map[string]string{WorkloadUIDLabel: "workload-uid"}}, Spec: appsv1.StatefulSetSpec{Replicas: &replicas, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{WorkloadUIDLabel: "workload-uid"}, Annotations: map[string]string{InjectAnnotation: "true"}}}}}
 	endpoints := &corev1.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: WebhookServiceName, Namespace: WebhookServiceNamespace}, Subsets: []corev1.EndpointSubset{{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.10"}}, Ports: []corev1.EndpointPort{{Name: "webhook", Port: 9443}}}}}
 	return []client.Object{sts, endpoints}
 }
