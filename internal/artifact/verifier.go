@@ -189,7 +189,6 @@ func (v *Verifier) Poll(ctx context.Context) error {
 		}
 		found, verified, message := false, true, "SHA256 verified"
 		durableRefs := map[string]bool{}
-		checkedAt := metav1.Now()
 		for _, pod := range p.Spec.Pods {
 			if p.Spec.SourceCluster == v.ClusterName && pod.SourceNode == v.NodeName {
 				found = true
@@ -234,6 +233,7 @@ func (v *Verifier) Poll(ctx context.Context) error {
 		if !found {
 			continue
 		}
+		checkedAt := metav1.Now()
 		report := api.ArtifactStatus{NodeName: v.NodeName, ObservedGeneration: p.Generation, Verified: verified, Message: message, CheckedAt: checkedAt}
 		if verified {
 			for ref := range durableRefs {
