@@ -347,6 +347,71 @@ func TestReconcile_PartialCheckpointTargetsOnlySelectedRank(t *testing.T) {
 	}
 }
 
+func TestReconcile_PartialCheckpointFinalizesAfterPodsBecomeNotReady(t *testing.T) {
+	s := newTestScheme(t)
+	sts := newTestStatefulSet()
+	sts.Status.ReadyReplicas = 0
+	sts.Status.AvailableReplicas = 0
+
+	mig := newTestMigration()
+	noResume := false
+	mig.Spec.Resume = &noResume
+	mig.Spec.WorkloadRef = fluidcrv1alpha1.WorkloadReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "trainer"}
+	mig.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{0}}
+	mig.Status = fluidcrv1alpha1.FluidCRMigrationStatus{
+		Phase:              fluidcrv1alpha1.PhaseContainerCheckpointing,
+		ObservedGeneration: 1,
+		Pods: []fluidcrv1alpha1.PodMigrationStatus{
+			{
+				PodName:             "trainer-0",
+				PodUID:              "uid-trainer-0",
+				NodeName:            "node-trainer-0",
+				PodIP:               "10.0.0.1",
+				Phase:               fluidcrv1alpha1.PodPhaseContainerCheckpointed,
+				AppCheckpointResult: "1 checkpoint-signalled",
+				CheckpointID:        "mig-round-001",
+				CheckpointFiles: []fluidcrv1alpha1.CheckpointFile{{
+					CheckpointID:  "mig-round-001",
+					ContainerName: "trainer",
+					FilePath:      "/var/lib/kubelet/checkpoints/checkpoint-trainer-0.tar",
+				}},
+			},
+			{
+				PodName:             "trainer-1",
+				PodUID:              "uid-trainer-1",
+				NodeName:            "node-trainer-1",
+				PodIP:               "10.0.0.2",
+				Rank:                1,
+				Phase:               fluidcrv1alpha1.PodPhaseSurvivorPaused,
+				AppCheckpointResult: "1 checkpoint-signalled",
+				SurvivorEvidence: &fluidcrv1alpha1.SurvivorEvidence{
+					Generation:    7,
+					PauseLockPath: "/checkpoint/trainer-1/pause-lock",
+					PauseLockPID:  274,
+					ObservedAt:    "now",
+				},
+			},
+		},
+	}
+
+	fc := &fakeCtrl{}
+	fk := &fakeKubelet{}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(sts, newStatefulPod("trainer-0", "10.0.0.1", "192.168.0.1"), newStatefulPod("trainer-1", "10.0.0.2", "192.168.0.2"), mig).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: fk}
+
+	got := reconcileToCompletion(t, r, c)
+
+	if got.Status.Phase != fluidcrv1alpha1.PhaseCompleted {
+		t.Fatalf("phase = %q, want Completed (message: %s)", got.Status.Phase, got.Status.Message)
+	}
+	if cp, rs := fc.counts(); cp != 0 || rs != 0 || fk.count() != 0 {
+		t.Fatalf("completed work was repeated: checkpoint=%d resume=%d kubelet=%d", cp, rs, fk.count())
+	}
+}
+
 func TestReconcile_PartialCheckpointWaitsForSurvivorEvidence(t *testing.T) {
 	s := newTestScheme(t)
 	mig := newTestMigration()

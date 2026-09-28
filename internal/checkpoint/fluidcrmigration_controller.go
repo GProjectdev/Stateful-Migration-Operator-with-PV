@@ -789,7 +789,11 @@ func (r *FluidCRMigrationReconciler) resolveTargetPods(ctx context.Context, m *f
 		}
 		pods = append(pods, p)
 	}
-	if m.Spec.WorkloadRef.Kind == "StatefulSet" {
+	// Require a fully Ready, stable StatefulSet only when taking the initial
+	// pod snapshot. Once status has bound the workflow to exact Pod UIDs, a
+	// partial checkpoint intentionally makes the target and survivors NotReady;
+	// reapplying the initial readiness gate would prevent finalization forever.
+	if m.Spec.WorkloadRef.Kind == "StatefulSet" && len(m.Status.Pods) == 0 {
 		var s appsv1.StatefulSet
 		if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: m.Spec.WorkloadRef.Name}, &s); err != nil {
 			return nil, err
