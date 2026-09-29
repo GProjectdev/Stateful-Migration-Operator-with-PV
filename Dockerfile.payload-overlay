@@ -1,5 +1,7 @@
 ARG FLUIDCR_PAYLOAD_IMAGE
 FROM ${FLUIDCR_PAYLOAD_IMAGE}
+# The paired backend needs the timing module from the current base payload.
+RUN test -f /opt/fluidcr/fluidcr/iteration.py
 COPY runtime/fluidcr/ /opt/fluidcr/fluidcr/
 # The injector copies files, not this image's environment, into the workload.
 RUN find /opt/fluidcr/fluidcr -type d -name __pycache__ -prune -exec rm -rf {} +

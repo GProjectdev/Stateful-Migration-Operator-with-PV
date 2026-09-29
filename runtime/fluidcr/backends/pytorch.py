@@ -18,6 +18,7 @@ import weakref
 from typing import Any, Dict, List, Optional, Set
 
 from fluidcr._config import CHECKPOINT_PATH, log, warn
+from fluidcr import group_restore
 from fluidcr.backends import AbstractBackend, register
 
 # ---------------------------------------------------------------------------
@@ -191,7 +192,9 @@ def _restore_rng_states(rng: Dict[str, Any]) -> None:
 
     if "torch_cpu" in rng:
         torch.random.set_rng_state(rng["torch_cpu"])
-    if "torch_cuda" in rng and torch.cuda.is_available():
+    if "torch_cuda" in rng and not torch.cuda.is_available():
+        raise RuntimeError("checkpoint CUDA RNG state requires CUDA")
+    if "torch_cuda" in rng:
         torch.cuda.set_rng_state_all(rng["torch_cuda"])
     if "python" in rng:
         import random
@@ -209,6 +212,7 @@ def _restore_rng_states(rng: Dict[str, Any]) -> None:
 def _save_checkpoint(path: str) -> None:
     """Serialize all tracked state to *path*."""
     import torch
+    round_context = group_restore.capture_round(path)
 
     models = _root_models()
     optimizers = _live_refs(_tracked_optimizers)
@@ -262,6 +266,7 @@ def _save_checkpoint(path: str) -> None:
     tmp_path = path + ".tmp"
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+    group_restore.publish_round(path, round_context)
 
 
 # ---------------------------------------------------------------------------
@@ -339,10 +344,11 @@ def _try_load_checkpoint() -> None:
     with _lock:
         if _checkpoint_loaded:
             return
-        _checkpoint_loaded = True
 
     load_path = _checkpoint_load_path()
     if not os.path.isfile(load_path):
+        with _lock:
+            _checkpoint_loaded = True
         return
 
     import torch
@@ -355,11 +361,32 @@ def _try_load_checkpoint() -> None:
     except TypeError:
         ckpt = torch.load(load_path, map_location="cpu")
     except Exception as exc:
-        warn(f"failed to read checkpoint: {exc}")
-        return
+        raise RuntimeError(f"failed to read checkpoint: {load_path}") from exc
 
     # Restore models --------------------------------------------------------
     models = _root_models()
+    optimizers = _live_refs(_tracked_optimizers)
+    if not isinstance(ckpt, dict):
+        raise ValueError("checkpoint payload must be a mapping")
+    # Validate coverage before mutating any live training state.
+    for key, tracked in (("models", models), ("optimizers", optimizers)):
+        entries = ckpt.get(key)
+        if not tracked or not isinstance(entries, list) or len(entries) != len(tracked):
+            raise ValueError(f"checkpoint {key} coverage does not match tracked state")
+        indices = []
+        for entry in entries:
+            if not isinstance(entry, dict) or type(entry.get("idx")) is not int or "state_dict" not in entry:
+                raise ValueError(f"invalid checkpoint {key} entry")
+            indices.append(entry["idx"])
+        if sorted(indices) != list(range(len(tracked))):
+            raise ValueError(f"checkpoint {key} indices are incomplete or duplicated")
+    step_counts = ckpt.get("step_counts")
+    if (not isinstance(step_counts, list) or len(step_counts) != len(optimizers)
+            or any(type(count) is not int or count < 0 for count in step_counts)):
+        raise ValueError("checkpoint optimizer steps are incomplete or invalid")
+    rng = ckpt.get("rng_states")
+    if not isinstance(rng, dict) or "torch_cpu" not in rng:
+        raise ValueError("checkpoint mandatory RNG state is missing")
     for entry in ckpt.get("models", []):
         idx = entry["idx"]
         if idx < len(models):
@@ -368,12 +395,9 @@ def _try_load_checkpoint() -> None:
                 inner.load_state_dict(entry["state_dict"])
                 log(f"Restored model[{idx}] ({entry['cls']})")
             except Exception as exc:
-                warn(f"model[{idx}] restore failed: {exc}")
-        else:
-            warn(f"checkpoint has model[{idx}] but only {len(models)} root model(s) tracked")
+                raise RuntimeError(f"model[{idx}] restore failed") from exc
 
     # Restore optimizers ----------------------------------------------------
-    optimizers = _live_refs(_tracked_optimizers)
     for entry in ckpt.get("optimizers", []):
         idx = entry["idx"]
         if idx < len(optimizers):
@@ -382,13 +406,10 @@ def _try_load_checkpoint() -> None:
                 _move_optimizer_state_to_device(optimizers[idx])
                 log(f"Restored optimizer[{idx}] ({entry['cls']})")
             except Exception as exc:
-                warn(f"optimizer[{idx}] restore failed: {exc}")
-        else:
-            warn(f"checkpoint has optimizer[{idx}] but only {len(optimizers)} optimizer(s) tracked")
+                raise RuntimeError(f"optimizer[{idx}] restore failed") from exc
 
     # Restore step counts ---------------------------------------------------
     global _dataloader_skip, _steps_per_epoch, _saved_epoch
-    step_counts = ckpt.get("step_counts", [])
     for idx, count in enumerate(step_counts):
         if idx < len(optimizers):
             optimizers[idx]._fluidcr_step = count  # type: ignore[attr-defined]
@@ -419,8 +440,10 @@ def _try_load_checkpoint() -> None:
             _restore_rng_states(rng)
             log("RNG states restored (torch/CUDA/Python/NumPy)")
         except Exception as exc:
-            warn(f"RNG state restore failed: {exc}")
+            raise RuntimeError("RNG state restore failed") from exc
 
+    with _lock:
+        _checkpoint_loaded = True
     log(f"Checkpoint resumed from {load_path}")
 
 
@@ -464,7 +487,7 @@ def _coordinate_checkpoint_request(device: Any, requested: bool) -> bool:
     return bool(flag.item())
 
 
-def _maybe_coordinated_checkpoint(opt: Any) -> None:
+def _maybe_coordinated_checkpoint(opt: Any) -> bool:
     """At each optimizer-step boundary, coordinate a manifest-driven action.
 
     Runs every step in distributed mode (the collective must be issued by every
@@ -530,6 +553,7 @@ def _maybe_coordinated_checkpoint(opt: Any) -> None:
     fluidcr.cancel_checkpoint_watchdog()
     log(f"Partial migration: rank {rank} is a survivor -- pause and rebuild NCCL.")
     survivor_pause_and_rebuild()
+    return True
 
 
 def _active_backend_for_exit() -> Any:
@@ -586,6 +610,7 @@ def _apply_patches(_module: Any) -> None:
             return
         _patched = True
 
+    import torch
     import torch.nn as nn
     import torch.optim as optim
 
@@ -663,28 +688,42 @@ def _apply_patches(_module: Any) -> None:
         # Per-instance step() wrapper for step counting
         self._fluidcr_step = 0  # type: ignore[attr-defined]
         _orig_step = self.step
+        from fluidcr.iteration import IterationWindow
+
+        timing = IterationWindow()
 
         # Must remain a bound method: PyTorch LRScheduler (LambdaLR, etc.) uses
         # optimizer.step.__func__ when wrapping step; assigning a plain function
         # breaks with AttributeError on newer torch.
         def _counted_step(opt: optim.Optimizer, *a: Any, **kw: Any) -> Any:
-            started = time.monotonic()
+            nonlocal timing
             result = _orig_step(*a, **kw)
             opt._fluidcr_step += 1  # type: ignore[attr-defined]
+            step = getattr(opt, "_fluidcr_step", 0)
+            device = _device_for_optimizer(opt)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            measurement = timing.finish(step, time.monotonic())
+            # Multi-optimizer steps are not a single unambiguous DDP iteration.
+            if len(_live_refs(_tracked_optimizers)) != 1:
+                measurement = None
             try:
                 from fluidcr.ctrl import record_runtime_status
 
                 record_runtime_status(
-                    global_step=getattr(opt, "_fluidcr_step", 0),
+                    global_step=step,
                     state="Running",
-                    iteration_time_seconds=time.monotonic() - started,
+                    iteration_measurement=measurement,
+                    worker_session=timing.session,
                 )
             except Exception:
                 pass
             # Coordinated-checkpoint rendezvous: a lockstep point across all
             # ranks where the backward all-reduce is done and no training
             # collective is in flight (no-op unless FLUIDCR_DISTRIBUTED=1).
-            _maybe_coordinated_checkpoint(opt)
+            if _maybe_coordinated_checkpoint(opt):
+                timing = IterationWindow()
+            timing.start_next(step, time.monotonic())
             return result
 
         self.step = types.MethodType(_counted_step, self)  # type: ignore[assignment]

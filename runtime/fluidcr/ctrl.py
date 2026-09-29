@@ -533,6 +533,8 @@ def record_runtime_status(
     global_step: Optional[int] = None,
     state: Optional[str] = None,
     iteration_time_seconds: Optional[float] = None,
+    iteration_measurement: Optional[Dict] = None,
+    worker_session: Optional[str] = None,
     force: bool = False,
 ) -> None:
     """Persist runtime telemetry for the in-pod ``GET /runtime`` collector.
@@ -548,6 +550,12 @@ def record_runtime_status(
         updates["state"] = state
     if iteration_time_seconds is not None:
         updates["iterationTimeSeconds"] = float(iteration_time_seconds)
+    if worker_session is not None:
+        updates["workerSession"] = worker_session
+        updates["iterationMeasurement"] = iteration_measurement
+        updates["iterationTimeSeconds"] = (
+            iteration_measurement["meanSeconds"] if iteration_measurement else None
+        )
     if updates:
         checkpoint_path = _default_checkpoint_path()
         binding = restore_checkpoint_binding(checkpoint_path)
@@ -689,6 +697,9 @@ def runtime_status() -> Dict:
     }
     if "iterationTimeSeconds" in status:
         payload["iterationTimeSeconds"] = status["iterationTimeSeconds"]
+    for name in ("iterationMeasurement", "workerSession"):
+        if name in status:
+            payload[name] = status[name]
     if "checkpointDurationSeconds" in status:
         payload["checkpointDurationSeconds"] = status["checkpointDurationSeconds"]
     try:
@@ -1168,15 +1179,28 @@ def checkpoint_ranks_and_wait(
         _checkpoint_lock.release()
 
 
+def _pending_marker_paths(name: str) -> List[str]:
+    paths = glob.glob(os.path.join(_BASE_DIR, "*", name))
+    base_marker = os.path.join(_BASE_DIR, name)
+    if os.path.exists(base_marker):
+        paths.append(base_marker)
+    explicit_path = os.environ.get("FLUIDCR_CHECKPOINT_PATH", "")
+    if explicit_path:
+        explicit_marker = os.path.join(os.path.dirname(explicit_path), name)
+        if os.path.exists(explicit_marker):
+            paths.append(explicit_marker)
+    return sorted(set(paths))
+
+
 def pending_lock_paths() -> List[str]:
     """Return absolute path of every checkpoint lock file currently present.
 
     Works regardless of how the lock directory is named: a PID
-    (``/checkpoint/1234/lock``) in single-pod mode, or a rank label
-    (``/checkpoint/rank0/lock``) in distributed mode.
+    (``/checkpoint/1234/lock``) in single-pod mode, a rank label
+    (``/checkpoint/rank0/lock``) in distributed mode, or the directory of an
+    explicit ``FLUIDCR_CHECKPOINT_PATH`` (``/checkpoint/lock``).
     """
-    pattern = os.path.join(_BASE_DIR, "*", "lock")
-    return sorted(glob.glob(pattern))
+    return _pending_marker_paths("lock")
 
 
 def pending_ppids() -> List[int]:
@@ -1307,6 +1331,8 @@ def resume_all_pending(
     for base in bases:
         for name in ("lock", "pause-lock"):
             paths.extend(sorted(glob.glob(os.path.join(base, "*", name))))
+    for name in ("lock", "pause-lock"):
+        paths.extend(_pending_marker_paths(name))
     paths.append(manifest_path())
 
     results: Dict[str, str] = {}
@@ -1549,6 +1575,27 @@ def ensure_api_server_started(
 
         log(f"control API server listening on {host}:{port}", level="INFO")
         return _api_server, _api_thread
+
+
+def stop_api_server() -> None:
+    """Stop the control server before CRIU captures the launcher.
+
+    A restored Pod receives a different IP. Leaving the listener or one of its
+    accepted connections in the checkpoint makes CRIU try to bind the source
+    Pod address in the target network namespace.
+    """
+    global _api_server, _api_thread
+
+    with _api_lock:
+        server, thread = _api_server, _api_thread
+        _api_server, _api_thread = None, None
+
+    if server is None:
+        return
+    server.shutdown()
+    server.server_close()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------

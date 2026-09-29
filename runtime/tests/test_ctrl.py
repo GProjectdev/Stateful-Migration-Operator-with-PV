@@ -1,6 +1,7 @@
 """Tests the payload overlay without importing torch or a FluidCR installation."""
 import importlib.util
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -76,6 +77,7 @@ def load_pytorch_backend(checkpoint_path):
     package = types.ModuleType("fluidcr")
     package.__path__ = []
     package.ctrl = ctrl
+    package.group_restore = ctrl.group_restore
     config = types.ModuleType("fluidcr._config")
     config.CHECKPOINT_PATH = str(checkpoint_path)
     config.log = Mock()
@@ -169,6 +171,60 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         lock = Path(ctrl._lock_path_for_ppid(11))
         make_dir(lock.parent)
         lock.write_text("new checkpoint")
+
+    def test_overlay_save_publishes_full_round_but_not_partial_group_metadata(self):
+        group = ctrl.group_restore
+        for targets in ("all", [1]):
+            with self.subTest(targets=targets):
+                checkpoint_id = "full-round" if targets == "all" else "partial-round"
+                latest = self.tmp_path / "trainer-1" / "latest.pt"
+                backend = load_pytorch_backend(latest)
+                torch = types.ModuleType("torch")
+                torch.save = lambda payload, path: Path(path).write_bytes(b"checkpoint-state")
+                with patch.dict(sys.modules, {"torch": torch}), \
+                     patch.dict(os.environ, {"FLUIDCR_SOURCE_WORLD_UID": "world-uid", "RANK": "1", "WORLD_SIZE": "2"}), \
+                     patch.object(group._distributed, "read_manifest", return_value={"checkpointID": checkpoint_id, "targets": targets}), \
+                     patch.object(group._distributed, "read_generation", return_value=42), \
+                     patch.object(backend, "_collect_rng_states", return_value={}):
+                    backend._save_checkpoint(str(latest))
+                self.assertEqual(latest.read_bytes(), b"checkpoint-state")
+                marker = self.tmp_path / "rounds" / checkpoint_id / "ranks" / "1.json"
+                if targets != "all":
+                    self.assertFalse(marker.exists())
+                    continue
+                metadata = json.loads(marker.read_text())
+                self.assertEqual(metadata["rank"], 1)
+                self.assertEqual(metadata["sourceWorldUID"], "world-uid")
+                self.assertEqual(metadata["generation"], 42)
+                self.assertEqual(metadata["checkpointID"], checkpoint_id)
+                self.assertEqual(metadata["sha256"], hashlib.sha256(latest.read_bytes()).hexdigest())
+                self.assertEqual((self.tmp_path / metadata["artifactPath"]).read_bytes(), latest.read_bytes())
+
+    def test_failed_serialization_does_not_publish_rank_metadata(self):
+        latest = self.tmp_path / "trainer-1" / "latest.pt"
+        backend = load_pytorch_backend(latest)
+        torch = types.ModuleType("torch")
+        torch.save = Mock(side_effect=OSError("storage unavailable"))
+        with patch.dict(sys.modules, {"torch": torch}), \
+             patch.object(backend, "_collect_rng_states", return_value={}), \
+             patch.object(ctrl.group_restore, "capture_round", return_value={"checkpointID": "round"}), \
+             patch.object(ctrl.group_restore, "publish_round") as publish:
+            with self.assertRaisesRegex(OSError, "storage unavailable"):
+                backend._save_checkpoint(str(latest))
+            publish.assert_not_called()
+
+    def test_overlay_restore_failure_never_claims_checkpoint_loaded(self):
+        latest = self.tmp_path / "latest.pt"
+        latest.write_bytes(b"corrupt")
+        backend = load_pytorch_backend(latest)
+        torch = types.ModuleType("torch")
+        torch.load = Mock(side_effect=ValueError("corrupt checkpoint"))
+        with patch.dict(sys.modules, {"torch": torch}), \
+             patch.object(backend, "_checkpoint_load_path", return_value=str(latest)):
+            with self.assertRaisesRegex(RuntimeError, "failed to read checkpoint"):
+                backend._try_load_checkpoint()
+        self.assertFalse(backend._checkpoint_loaded)
+        self.assertFalse(any("Checkpoint resumed" in str(c) for c in backend.log.call_args_list))
 
     def create_checkpoint_and_lock(self, worker=101, sig=None):
         checkpoint = Path(ctrl._checkpoint_path_for_ppid(11))
@@ -664,8 +720,9 @@ class ConfirmedCheckpointTests(unittest.TestCase):
 
 class FluidCRPayloadParityTests(unittest.TestCase):
     EXPECTED_SHA256 = {
-        # Paired payload update: owned rank-zero restore and group-control guards.
-        "ctrl.py": "1dfb91edb0039aaf770bd41db8b86c09fc00e15c58b466739246e9a5cceccc99",
+        # Keep checkpoint producer, load validation, and control API paired.
+        "ctrl.py": "fbf2c887220e88846aab4c1d630146dc9926942f9332642b3f0c97329ff8dff5",
+        "backends/pytorch.py": "6663ce492cd2aa1738f5c5df31e90a12042ec8961939f144ba1d67a68189b293",
         "group_restore.py": "0d22ab37c6ed05fcf44d3b5cc5a7b37288de2f57f4ab725bca338dbb3c7917d8",
         "distributed.py": "4d1d344ef4ec13ddcecff948cb0ccf6eab3c48f84072ded387ccfa039dc63298",
     }
@@ -682,7 +739,7 @@ class FluidCRPayloadParityTests(unittest.TestCase):
         source = repo.parents[1] / "My_FluidCR-work" / "fluidcr"
         if not source.exists():
             self.skipTest("local My_FluidCR-work source tree is not available")
-        for name in ("ctrl.py", "distributed.py", "group_restore.py"):
+        for name in self.EXPECTED_SHA256:
             with self.subTest(name=name):
                 self.assertEqual(
                     (repo / "fluidcr" / name).read_bytes().replace(b"\r\n", b"\n"),
