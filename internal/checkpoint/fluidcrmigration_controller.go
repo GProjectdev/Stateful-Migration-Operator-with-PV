@@ -143,16 +143,19 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 }
 
 func (r *FluidCRMigrationReconciler) reconcileRestoreOwnedResume(ctx context.Context, m *fluidcrv1alpha1.FluidCRMigration) (ctrl.Result, error) {
+	if m.Status.Phase != fluidcrv1alpha1.PhaseCompleted || m.Status.ObservedGeneration != m.Generation {
+		return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "CheckpointIncomplete", "restore-owned release requires a completed current-generation checkpoint")
+	}
 	if m.Spec.PartialCheckpoint == nil {
-		return r.markFailed(ctx, m, "restore-owned resume requires partial checkpoint status")
+		return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleaseRejected", "restore-owned resume requires partial checkpoint status")
 	}
 	checkpointID, err := checkpointIDFor(m)
 	if err != nil {
-		return r.markFailed(ctx, m, err.Error())
+		return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleaseRejected", err.Error())
 	}
 	pods, err := r.resolveTargetPods(ctx, m)
 	if err != nil {
-		return r.markWaiting(ctx, m, fmt.Sprintf("waiting for survivor pods before restore-owned resume: %v", err))
+		return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleasePending", fmt.Sprintf("waiting for survivor pods before restore-owned resume: %v", err))
 	}
 	byName := map[string]corev1.Pod{}
 	for i := range pods {
@@ -166,33 +169,31 @@ func (r *FluidCRMigrationReconciler) reconcileRestoreOwnedResume(ctx context.Con
 			continue
 		}
 		if ps.SurvivorEvidence == nil || ps.SurvivorEvidence.Generation <= 0 {
-			return r.markFailed(ctx, m, "survivor generation evidence missing before restore-owned resume")
+			return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleaseRejected", "survivor generation evidence missing before restore-owned resume")
 		}
 		if generation == 0 {
 			generation = ps.SurvivorEvidence.Generation
 		} else if generation != ps.SurvivorEvidence.Generation {
-			return r.markFailed(ctx, m, "survivor generations differ before restore-owned resume")
+			return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleaseRejected", "survivor generations differ before restore-owned resume")
 		}
 		pod, ok := byName[ps.PodName]
 		if !ok || string(pod.UID) != ps.PodUID {
-			return r.markWaiting(ctx, m, "waiting for UID-matched survivor pod before restore-owned resume")
+			return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleasePending", "waiting for UID-matched survivor pod before restore-owned resume")
 		}
 		container, err := resolveContainerName(&pod, m.Spec.Container)
 		if err != nil {
-			return r.markFailed(ctx, m, err.Error())
+			return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleaseRejected", err.Error())
 		}
 		port := resolveCtrlPort(&pod, container, m.Spec.CtrlPort)
 		if err := r.validateLiveSurvivorEvidence(ctx, ps, &pod, port, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID); err != nil {
-			return r.markWaiting(ctx, m, fmt.Sprintf("waiting for live survivor evidence before restore-owned resume: %v", err))
+			return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleasePending", fmt.Sprintf("waiting for live survivor evidence before restore-owned resume: %v", err))
 		}
 		release = append(release, target{podUID: pod.UID, podName: pod.Name, namespace: pod.Namespace, podIP: pod.Status.PodIP, hostIP: pod.Status.HostIP, container: container, port: port, rank: ps.Rank})
 	}
 	if len(release) == 0 {
 		return ctrl.Result{}, nil
 	}
-	m.Status.Phase = fluidcrv1alpha1.PhaseResuming
-	m.Status.Message = fmt.Sprintf("restore-owned scoped resume for %d survivor pod(s)", len(release))
-	if err := r.saveStatus(ctx, m); err != nil {
+	if _, err := r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "Releasing", fmt.Sprintf("restore-owned scoped resume for %d survivor pod(s)", len(release))); err != nil {
 		return ctrl.Result{}, err
 	}
 	outcomes := r.resumeOwned(ctx, release, timeoutOf(m.Spec.AppCheckpointTimeoutSeconds), checkpointID, generation)
@@ -212,14 +213,22 @@ func (r *FluidCRMigrationReconciler) reconcileRestoreOwnedResume(ctx context.Con
 		}
 	}
 	if len(errs) > 0 {
-		return r.markWaiting(ctx, m, "restore-owned resume retry pending: "+strings.Join(errs, "; "))
+		return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "ReleasePending", "restore-owned resume retry pending: "+strings.Join(errs, "; "))
 	}
-	now := metav1.Now()
-	m.Status.CompletionTime = &now
-	m.Status.Phase = fluidcrv1alpha1.PhaseCompleted
-	m.Status.Message = "checkpoint completed; restore-owned survivors resumed after target replacement"
-	setReadyCondition(m, metav1.ConditionTrue, "RestoreOwnedResumeCompleted", m.Status.Message)
-	return ctrl.Result{}, r.saveStatus(ctx, m)
+	return r.markSurvivorRelease(ctx, m, metav1.ConditionTrue, "Released", "restore-owned survivors resumed after target replacement")
+}
+
+func (r *FluidCRMigrationReconciler) markSurvivorRelease(ctx context.Context, m *fluidcrv1alpha1.FluidCRMigration, status metav1.ConditionStatus, reason, message string) (ctrl.Result, error) {
+	// Archive completion and its timestamp are immutable during later release.
+	meta.SetStatusCondition(&m.Status.Conditions, metav1.Condition{
+		Type: "SurvivorReleased", Status: status, Reason: reason, Message: message,
+		ObservedGeneration: m.Generation, LastTransitionTime: metav1.Now(),
+	})
+	result := ctrl.Result{}
+	if status != metav1.ConditionTrue {
+		result.RequeueAfter = waitRequeueInterval
+	}
+	return result, r.saveStatus(ctx, m)
 }
 
 func (r *FluidCRMigrationReconciler) validateLiveSurvivorEvidence(ctx context.Context, ps *fluidcrv1alpha1.PodMigrationStatus, pod *corev1.Pod, port int, timeout time.Duration, checkpointID string) error {

@@ -286,16 +286,28 @@ func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.
 		if cluster["clusterName"] != req.Spec.TargetCluster {
 			continue
 		}
-		observedGeneration, ok := int64From(cluster["observedGeneration"])
-		if !ok || observedGeneration != tr.GetGeneration() {
-			return nil, fmt.Errorf("TrainingRuntime observedGeneration mismatch")
-		}
 		if runtimeStatus != nil {
 			return nil, fmt.Errorf("duplicate target TrainingRuntime aggregation")
 		}
 		status, ok := cluster["status"].(map[string]interface{})
 		if !ok {
 			return nil, fmt.Errorf("target TrainingRuntime report is missing status")
+		}
+		// Current RIC reflects the member status intact. Accept the old envelope
+		// during upgrades, but never accept contradictory generation receipts.
+		generation, hasNested := status["observedGeneration"]
+		if !hasNested {
+			generation = cluster["observedGeneration"]
+		}
+		observed, valid := int64From(generation)
+		if !valid || observed != tr.GetGeneration() {
+			return nil, fmt.Errorf("TrainingRuntime observedGeneration mismatch")
+		}
+		if outer, found := cluster["observedGeneration"]; found {
+			value, valid := int64From(outer)
+			if !valid || value != observed {
+				return nil, fmt.Errorf("conflicting TrainingRuntime generation receipts")
+			}
 		}
 		runtimeStatus = status
 	}

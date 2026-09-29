@@ -19,7 +19,6 @@ package checkpoint
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -569,8 +568,17 @@ func TestReconcile_RestoreOwnedResumeRetryStaysOwnedLane(t *testing.T) {
 	if len(fc.resumeOwnedCalls) != 1 || fc.resumeOwnedCalls[0] != "10.0.0.1" {
 		t.Fatalf("restore-owned retry first call = %v", fc.resumeOwnedCalls)
 	}
-	if got.Status.Phase != fluidcrv1alpha1.PhasePending || !strings.Contains(got.Status.Message, "restore-owned resume retry pending") {
+	if got.Status.Phase != fluidcrv1alpha1.PhaseCompleted || got.Status.CompletionTime == nil {
 		t.Fatalf("retry status = %q %q", got.Status.Phase, got.Status.Message)
+	}
+	var pendingRelease bool
+	for _, condition := range got.Status.Conditions {
+		if condition.Type == "SurvivorReleased" && condition.Status == metav1.ConditionFalse && condition.Reason == "ReleasePending" {
+			pendingRelease = true
+		}
+	}
+	if !pendingRelease {
+		t.Fatalf("release wait must be separate from checkpoint completion: %+v", got.Status.Conditions)
 	}
 	if _, generic := fc.counts(); generic != 0 {
 		t.Fatalf("generic resume calls during owned retry = %d", generic)
@@ -624,8 +632,7 @@ func TestReconcile_RestoreOwnedResumeRetryAfterLostStatusAcceptsReleasedRuntime(
 	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
 		t.Fatal(err)
 	}
-	got.Status.Phase = fluidcrv1alpha1.PhasePending
-	got.Status.CompletionTime = nil
+	got.Status.Phase = fluidcrv1alpha1.PhaseCompleted
 	for i := range got.Status.Pods {
 		if got.Status.Pods[i].PodName == "trainer-0" {
 			got.Status.Pods[i].Phase = fluidcrv1alpha1.PodPhaseSurvivorPaused
