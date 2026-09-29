@@ -106,6 +106,7 @@ func makeSameClusterPartial(req *api.RestoreRequest, cp *unstructured.Unstructur
 	req.Spec.Pods[0].SourcePodUID = "target-source-uid"
 	req.Spec.PartialRestore = &api.PartialRestoreSpec{TargetRanks: []int64{1}, PreventPeriodicResume: true, PreservedSurvivors: []api.SurvivorEvidence{{Rank: 0, PodName: "db-1", PodUID: "survivor-uid", NodeName: "source-node-survivor", Generation: 7, PauseLockPath: "/checkpoint/rank0/pause-lock"}}}
 	cp.Object["spec"].(map[string]interface{})["resume"] = false
+	req.Spec.PartialRestore.PreservedSurvivors[0].ObservedAt = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	sourcePod(cp)["rank"] = int64(1)
 	sourcePod(cp)["podUID"] = "target-source-uid"
 	source(cp)["pods"] = append(source(cp)["pods"].([]interface{}), survivorPodEvidence())
@@ -377,7 +378,8 @@ func partialTrainingRuntime(req *api.RestoreRequest, targetUID string, observed 
 		"phase": "Running", "globalStep": int64(12), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "readyRanks": int64(2), "worldSize": int64(2), "workloadUID": req.Spec.WorkloadRef.UID, "memberWorkloadUID": "member-workload", "observedAt": current,
 		"pods": []interface{}{
 			map[string]interface{}{"name": "db-0", "uid": targetUID, "rank": int64(1), "globalStep": int64(12), "previousGlobalStep": int64(11), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "previousObservedAt": previous, "observedAt": current},
-			map[string]interface{}{"name": "db-1", "uid": "survivor-uid", "rank": int64(0), "globalStep": int64(13), "previousGlobalStep": int64(12), "checkpointID": req.Spec.CheckpointRef.CheckpointID, "previousObservedAt": previous, "observedAt": current},
+			map[string]interface{}{"name": "db-1", "uid": "survivor-uid", "nodeName": req.Spec.PartialRestore.PreservedSurvivors[0].NodeName, "rank": int64(0), "globalStep": int64(13), "previousGlobalStep": int64(12), "checkpointID": "prior-periodic-round", "previousObservedAt": previous, "observedAt": current,
+				"survivorResume": map[string]interface{}{"checkpointID": req.Spec.CheckpointRef.CheckpointID, "generation": req.Spec.PartialRestore.PreservedSurvivors[0].Generation, "podUID": "survivor-uid", "rank": int64(0), "nodeName": req.Spec.PartialRestore.PreservedSurvivors[0].NodeName, "resumedAt": observed.Time.Add(-2 * time.Second).Format(time.RFC3339)}},
 		},
 	}}}}}}
 	tr.SetGroupVersionKind(trainingRuntimeGVK)

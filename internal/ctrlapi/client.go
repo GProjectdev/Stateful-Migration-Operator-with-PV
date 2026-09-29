@@ -103,6 +103,7 @@ func (c *Client) ResumeOwned(ctx context.Context, podIP string, port int, timeou
 }
 
 type RuntimeStatus struct {
+	CheckpointReady  bool             `json:"checkpointReady"`
 	Rank             int64            `json:"rank"`
 	WorldSize        int64            `json:"worldSize"`
 	State            string           `json:"state"`

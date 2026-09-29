@@ -650,6 +650,8 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         pause_lock = self.tmp_path / "rank0" / "pause-lock"
         make_dir(pause_lock.parent)
         pause_lock.write_text("parked")
+        (pause_lock.parent / ".fluidcr-survivor.json").write_text(json.dumps({"checkpointID": "round-resume", "generation": 123}))
+        self.distributed._atomic_write = Mock()
         self.distributed.read_manifest.return_value = {
             "checkpointID": "round-resume",
             "generation": 123,
@@ -673,6 +675,8 @@ class ConfirmedCheckpointTests(unittest.TestCase):
         pause_lock = self.tmp_path / "rank0" / "pause-lock"
         make_dir(pause_lock.parent)
         pause_lock.write_text("parked")
+        (pause_lock.parent / ".fluidcr-survivor.json").write_text(json.dumps({"checkpointID": "round-http-resume", "generation": 123}))
+        self.distributed._atomic_write = Mock()
         self.distributed.read_manifest.return_value = {
             "checkpointID": "round-http-resume",
             "generation": 123,
@@ -721,10 +725,10 @@ class ConfirmedCheckpointTests(unittest.TestCase):
 class FluidCRPayloadParityTests(unittest.TestCase):
     EXPECTED_SHA256 = {
         # Keep checkpoint producer, load validation, and control API paired.
-        "ctrl.py": "fbf2c887220e88846aab4c1d630146dc9926942f9332642b3f0c97329ff8dff5",
+        "ctrl.py": "b36ed1c556d254782c6b410b160df44d34e858a04a59b0a8adca61491102f3d2",
         "backends/pytorch.py": "6663ce492cd2aa1738f5c5df31e90a12042ec8961939f144ba1d67a68189b293",
         "group_restore.py": "0d22ab37c6ed05fcf44d3b5cc5a7b37288de2f57f4ab725bca338dbb3c7917d8",
-        "distributed.py": "4d1d344ef4ec13ddcecff948cb0ccf6eab3c48f84072ded387ccfa039dc63298",
+        "distributed.py": "b0e84dbfb25737f99a4df050d7b17b3162c292985f598c904425099a6e6efde9",
     }
 
     def test_stateful_overlay_matches_pinned_fluidcr_payload_hashes(self):

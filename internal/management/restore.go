@@ -187,7 +187,7 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 					if err := r.authorizeRestoreOwnedResume(ctx, cp); err != nil {
 						return ctrl.Result{}, err
 					}
-					phase, message = "RestoreReady", "target native restore and source fence evidence verified; scoped survivor release authorized"
+					phase, message = "RestoreReady", "scoped survivor release authorized; final runtime verification pending: "+err.Error()
 					req.Status.Verification = stableVerification(req, verification)
 					break
 				}
@@ -550,16 +550,31 @@ func validateRuntimeStatus(req *api.RestoreRequest, plan *api.RestorePlan, targe
 				return fmt.Errorf("target runtime pod identity mismatch")
 			}
 			seenTargets++
+			if pod["checkpointID"] != req.Spec.CheckpointRef.CheckpointID {
+				return fmt.Errorf("target runtime pod checkpointID mismatch")
+			}
 		} else if survivor, ok := survivors[name]; ok {
 			if survivor.PodUID != uid || survivor.Rank != int64(rank) {
 				return fmt.Errorf("target runtime survivor identity mismatch")
 			}
+			receipt, ok := pod["survivorResume"].(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("survivor resume receipt missing")
+			}
+			generation, valid := int64From(receipt["generation"])
+			receiptRank, validRank := int64From(receipt["rank"])
+			if !valid || generation != survivor.Generation || !validRank || receiptRank != survivor.Rank || receipt["podUID"] != uid || receipt["nodeName"] != survivor.NodeName || pod["nodeName"] != survivor.NodeName || receipt["checkpointID"] != req.Spec.CheckpointRef.CheckpointID {
+				return fmt.Errorf("survivor resume receipt identity or round mismatch")
+			}
+			resumed, resumeErr := parseObservedAt(receipt["resumedAt"])
+			parked, parkErr := parseObservedAt(survivor.ObservedAt)
+			previous, previousErr := parseObservedAt(pod["previousObservedAt"])
+			if resumeErr != nil || parkErr != nil || previousErr != nil || !resumed.After(parked) || !previous.After(resumed) {
+				return fmt.Errorf("survivor requires two post-resume progress samples")
+			}
 			seenSurvivors++
 		} else {
 			return fmt.Errorf("target runtime pod identity mismatch")
-		}
-		if pod["checkpointID"] != req.Spec.CheckpointRef.CheckpointID {
-			return fmt.Errorf("target runtime pod checkpointID mismatch")
 		}
 		step, ok := int64From(pod["globalStep"])
 		if !ok || step <= 0 {

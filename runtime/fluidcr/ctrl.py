@@ -728,6 +728,20 @@ def runtime_status() -> Dict:
             "pauseLockPID": pid,
             "observedAt": proof.get("observedAt", ""),
         }
+    if (proof and proof.get("state") == "SurvivorResumed"
+            and proof.get("loadedCheckpointID") == payload["checkpointID"]):
+        identity = _require_pod_identity()
+        if (proof.get("podUID") != identity["podUID"] or proof.get("rank") != rank
+                or proof.get("pid") not in workers.values()
+                or not proof.get("releaseAuthorizedAt") or not proof.get("resumedAt")
+                or os.path.exists(str(proof.get("pauseLockPath") or ""))):
+            raise ValueError("runtime survivor resume receipt does not match live worker")
+        payload["survivorResume"] = {
+            key: proof[key] for key in
+            ("checkpointID", "generation", "podUID", "rank", "nodeName", "resumedAt")
+        }
+    payload["checkpointReady"] = state == "Running" and payload.get("phase") != "SurvivorPaused" and any(
+        _pid_uses_gpu(pid) for pid in workers.values())
     return payload
 
 
@@ -1334,6 +1348,20 @@ def resume_all_pending(
     for name in ("lock", "pause-lock"):
         paths.extend(_pending_marker_paths(name))
     paths.append(manifest_path())
+
+    # Publish authorization before unlink: survivors may observe removal immediately.
+    for path in dict.fromkeys(paths):
+        if not manifest.get("restoreOwnedResume") or os.path.basename(path) != "pause-lock" or not os.path.exists(path):
+            continue
+        from fluidcr.distributed import _atomic_write
+        proof_path = os.path.join(os.path.dirname(path), ".fluidcr-survivor.json")
+        with open(proof_path) as fh:
+            proof = json.load(fh)
+        if (proof.get("checkpointID") != manifest.get("checkpointID")
+                or proof.get("generation") != manifest.get("generation")):
+            raise ValueError("survivor release receipt does not match manifest")
+        proof["releaseAuthorizedAt"] = _utc_now()
+        _atomic_write(proof_path, json.dumps(proof, sort_keys=True), ".survivor-")
 
     results: Dict[str, str] = {}
     seen = set()

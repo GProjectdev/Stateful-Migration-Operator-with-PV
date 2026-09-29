@@ -345,6 +345,26 @@ func (r *FluidCRMigrationReconciler) reconcileWorkflow(ctx context.Context, m *f
 		return ps.Phase == fluidcrv1alpha1.PodPhasePending
 	})
 	if len(appTargets) > 0 {
+		// Preflight the entire world before issuing any collective checkpoint signal.
+		if len(appTargets) == len(targets) {
+			for _, t := range appTargets {
+				ready, err := r.CtrlClient.Runtime(ctx, t.podIP, t.port, 3*time.Second)
+				if err != nil || !ready.CheckpointReady || ready.State != "Running" {
+					message := fmt.Sprintf("waiting for GPU worker readiness on %s", t.podName)
+					if err != nil {
+						message += ": " + err.Error()
+					}
+					if appCheckpointTimedOut(m) {
+						return r.markFailed(ctx, m, message+"; readiness timeout")
+					}
+					m.Status.Message = message
+					if err := r.saveStatus(ctx, m); err != nil {
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+				}
+			}
+		}
 		m.Status.Phase = fluidcrv1alpha1.PhaseAppCheckpointing
 		m.Status.Message = fmt.Sprintf("signalling application checkpoint on %d pod(s)", len(appTargets))
 		if err := r.saveStatus(ctx, m); err != nil {

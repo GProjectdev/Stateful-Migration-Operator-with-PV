@@ -461,4 +461,14 @@ def survivor_pause_and_rebuild() -> None:
     _reinit_process_group()
     rebuild_tracked_ddp()
     clear_migration_flags()
+    proof = read_survivor_proof()
+    owned = proof.get("restoreOwnedResume")
+    if (proof.get("pid") != os.getpid() or proof.get("podUID") != _pod_uid()
+            or (owned and not proof.get("releaseAuthorizedAt"))):
+        raise RuntimeError("survivor rebuild lacks matching authorized release receipt")
+    from fluidcr.ctrl import _read_status, _default_checkpoint_path
+    loaded = _read_status(_default_checkpoint_path()).get("checkpointID", "")
+    proof.update(state="SurvivorResumed" if owned else "SurvivorRejoined", phase="Running", resumedAt=_utc_now(),
+                 loadedCheckpointID=loaded)
+    _atomic_write(_survivor_proof_path(), json.dumps(proof, sort_keys=True), ".survivor-")
     log("Survivor rejoined. Resuming training.")

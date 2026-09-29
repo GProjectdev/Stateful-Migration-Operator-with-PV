@@ -39,6 +39,7 @@ import (
 
 // fakeCtrl is an in-memory CtrlAPI that records calls and can inject errors per pod IP.
 type fakeCtrl struct {
+	readinessBlocked        bool
 	mu                      sync.Mutex
 	checkpointCalls         []string
 	partialCalls            []string
@@ -79,9 +80,12 @@ func (f *fakeCtrl) CheckpointRanks(_ context.Context, podIP string, _ int, _ tim
 	return map[string]string{"1234": "checkpoint-ready"}, nil
 }
 
-func (f *fakeCtrl) Runtime(_ context.Context, podIP string, _ int, _ time.Duration) (ctrlapi.RuntimeStatus, error) {
+func (f *fakeCtrl) Runtime(_ context.Context, podIP string, _ int, timeout time.Duration) (ctrlapi.RuntimeStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if timeout == 3*time.Second {
+		return ctrlapi.RuntimeStatus{State: "Running", CheckpointReady: !f.readinessBlocked}, nil
+	}
 	if statuses := f.runtimeSequence[podIP]; len(statuses) > 0 {
 		status := statuses[0]
 		f.runtimeSequence[podIP] = statuses[1:]
