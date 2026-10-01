@@ -439,6 +439,10 @@ def _start_watchdog_thread() -> None:
     unbounded time by design and must not be force-exited.
     """
     global _active_watchdog_cancel
+    # Repeated signals belong to the same round; keep its original deadline
+    # and cancellation handle so a survivor cannot leave an orphan timer.
+    if _active_watchdog_cancel is not None and not _active_watchdog_cancel.is_set():
+        return
     cancel = threading.Event()
     _active_watchdog_cancel = cancel
 
