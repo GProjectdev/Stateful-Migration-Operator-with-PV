@@ -19,18 +19,21 @@ package checkpoint
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	fluidcrv1alpha1 "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/fluidcr/v1alpha1"
@@ -809,4 +812,483 @@ func podStatusByName(pods []fluidcrv1alpha1.PodMigrationStatus, name string) *fl
 		}
 	}
 	return nil
+}
+
+func TestScheduleParentCreatesChildWithoutExecutingCheckpoint(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched"
+	parent.UID = "parent-uid"
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: true, IntervalSeconds: 60}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestDeployment(), newTestPod("p0", "10.0.0.1", "192.168.0.1"), parent).
+		WithObjects(newTestReplicaSet("default"), newTestReplicaSet("other")).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	fc, fk := &fakeCtrl{}, &fakeKubelet{}
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: fc, KubeletClient: fk}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "sched"}}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := c.List(context.Background(), &list, client.InNamespace("default"), client.MatchingLabels{LabelScheduledParent: "parent-uid"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("children = %d, want 1", len(list.Items))
+	}
+	child := list.Items[0]
+	if child.Spec.Schedule != nil || child.Annotations[AnnotationCheckpointID] == "" {
+		t.Fatalf("child contract = schedule %#v annotations %#v", child.Spec.Schedule, child.Annotations)
+	}
+	if cp, rs := fc.counts(); cp != 0 || rs != 0 || fk.count() != 0 {
+		t.Fatalf("parent executed checkpoint: checkpoint=%d resume=%d kubelet=%d", cp, rs, fk.count())
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.ObservedGeneration != got.Generation || got.Status.CurrentRun == nil || got.Status.CurrentRun.Name != child.Name {
+		t.Fatalf("parent status = %+v", got.Status)
+	}
+}
+
+func TestScheduleReservationRetryAfterChildCreateStatusFailureIsDeterministic(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-retry"
+	parent.UID = "parent-retry-uid"
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: true, IntervalSeconds: 60}
+	var createdChildren int
+	failMaterializedStatus := true
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(newTestDeployment(), newTestPod("p0", "10.0.0.1", "192.168.0.1"), parent).
+		WithObjects(newTestReplicaSet("default"), newTestReplicaSet("other")).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if mig, ok := obj.(*fluidcrv1alpha1.FluidCRMigration); ok && mig.Name != "sched-retry" {
+					createdChildren++
+					mig.UID = types.UID("child-retry-uid")
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if subResourceName == "status" && failMaterializedStatus {
+					if mig, ok := obj.(*fluidcrv1alpha1.FluidCRMigration); ok && mig.Name == "sched-retry" && mig.Status.CurrentRun != nil && mig.Status.CurrentRun.UID != "" {
+						failMaterializedStatus = false
+						return fmt.Errorf("injected parent status save failure")
+					}
+				}
+				return c.Status().Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "sched-retry"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	reserved := got.Status.CurrentRun
+	if reserved == nil || reserved.Name == "" || reserved.CheckpointID == "" || reserved.UID != "" {
+		t.Fatalf("reservation status = %+v", got.Status.CurrentRun)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("second reconcile unexpectedly saved parent status")
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := c.List(context.Background(), &list, client.InNamespace("default"), client.MatchingLabels{LabelScheduledParent: "parent-retry-uid"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 || createdChildren != 1 {
+		t.Fatalf("children=%d createCalls=%d, want exactly one child/create", len(list.Items), createdChildren)
+	}
+	child := list.Items[0]
+	if child.Name != reserved.Name || child.Annotations[AnnotationCheckpointID] != reserved.CheckpointID {
+		t.Fatalf("child identity = %s/%s, want %s/%s", child.Name, child.Annotations[AnnotationCheckpointID], reserved.Name, reserved.CheckpointID)
+	}
+}
+
+func TestSchedulePendingReservationValidatesExistingChildBeforeAdopting(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-adopt"
+	parent.UID = "parent-adopt-uid"
+	parent.Finalizers = []string{FinalizerName}
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: true, IntervalSeconds: 60}
+	reservation := scheduledRunReservation(parent)
+	parent.Status.CurrentRun = reservation
+	child := mustScheduledChildForReservation(parent, reservation)
+	child.Spec.Container = "tampered"
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(parent, child).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: parent.Name}})
+	if err == nil || !strings.Contains(err.Error(), "spec does not match reserved execution spec") {
+		t.Fatalf("expected reserved child validation error, got %v", err)
+	}
+}
+
+func TestSameWorkloadRefNormalizesOmittedNamespace(t *testing.T) {
+	a := fluidcrv1alpha1.WorkloadReference{UID: "workload-uid", APIVersion: "apps/v1", Kind: "Deployment", Name: "trainer"}
+	b := a
+	b.Namespace = "default"
+	if !sameWorkloadRef(a, b, "default") {
+		t.Fatal("empty namespace and explicit object namespace must conflict as the same workload")
+	}
+	b.Namespace = "other"
+	if sameWorkloadRef(a, b, "default") {
+		t.Fatal("different explicit namespace must not match")
+	}
+}
+
+func TestSameWorkloadPartialCompletedUnblocksOnlyAfterSurvivorRelease(t *testing.T) {
+	now := metav1.Now()
+	other := newTestMigration()
+	other.Spec.PartialCheckpoint = &fluidcrv1alpha1.PartialCheckpointSpec{TargetRanks: []int64{1}}
+	other.Generation = 3
+	other.Status.Phase = fluidcrv1alpha1.PhaseCompleted
+	other.Status.ObservedGeneration = 3
+	other.Status.CompletionTime = &now
+	if !sameWorkloadMigrationBlocksPeriodic(other) {
+		t.Fatal("completed partial without explicit survivor release must still block periodic checkpoints")
+	}
+	meta.SetStatusCondition(&other.Status.Conditions, metav1.Condition{Type: "SurvivorReleased", Status: metav1.ConditionTrue, Reason: "Released", ObservedGeneration: 3, LastTransitionTime: now})
+	if sameWorkloadMigrationBlocksPeriodic(other) {
+		t.Fatal("completed partial with explicit survivor release should not block periodic checkpoints")
+	}
+}
+
+func TestSameWorkloadDurableFullResumeFalseStillBlocksPeriodic(t *testing.T) {
+	now := metav1.Now()
+	resumeFalse := false
+	other := newTestMigration()
+	other.Spec.Resume = &resumeFalse
+	other.Annotations[AnnotationCheckpointID] = "checkpoint-001"
+	other.Generation = 2
+	other.Status = fluidcrv1alpha1.FluidCRMigrationStatus{
+		ObservedGeneration: 2,
+		Phase:              fluidcrv1alpha1.PhaseCompleted,
+		CompletionTime:     &now,
+		Pods: []fluidcrv1alpha1.PodMigrationStatus{{
+			PodName:      "p0",
+			PodUID:       "pod-uid",
+			CheckpointID: "checkpoint-001",
+			CheckpointFiles: []fluidcrv1alpha1.CheckpointFile{{
+				CheckpointID:  "checkpoint-001",
+				ContainerName: "trainer",
+				FilePath:      "/var/lib/kubelet/checkpoints/a.tar",
+				SHA256:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				DurableRef:    "file-store:default/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				ExportedAt:    "2026-09-26T00:00:00Z",
+			}},
+		}},
+	}
+	if !durableFullCheckpointComplete(other) {
+		t.Fatal("test setup must be durable full complete")
+	}
+	if !sameWorkloadMigrationBlocksPeriodic(other) {
+		t.Fatal("durable full checkpoint with resume=false leaves workload paused and must block periodic overlap")
+	}
+}
+
+func TestScheduleDisabledAcknowledgesPauseWithoutSpawning(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched"
+	parent.UID = "parent-uid"
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: false, IntervalSeconds: 60}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent).WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "sched"}}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.ObservedGeneration != got.Generation || got.Status.Message != "schedule paused" {
+		t.Fatalf("pause ack status = %+v", got.Status)
+	}
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := c.List(context.Background(), &list, client.InNamespace("default")); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("paused schedule spawned children: %d objects", len(list.Items))
+	}
+}
+
+func TestSchedulePausedSecondReconcileDoesNotRewriteStatus(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-paused-stable"
+	parent.UID = "parent-paused-stable-uid"
+	parent.Finalizers = []string{FinalizerName}
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: false, IntervalSeconds: 60}
+	var statusWrites int
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(parent).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if subResourceName == "status" {
+				statusWrites++
+			}
+			return c.Status().Update(ctx, obj, opts...)
+		}}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: parent.Name}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if statusWrites != 1 {
+		t.Fatalf("initial pause status writes = %d, want 1", statusWrites)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if statusWrites != 1 {
+		t.Fatalf("second pause reconcile rewrote status: writes=%d", statusWrites)
+	}
+}
+
+func TestSchedulePinnedCurrentRunMissingChildBlocksPauseAck(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-missing-current"
+	parent.UID = "parent-missing-current-uid"
+	parent.Finalizers = []string{FinalizerName}
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: false, IntervalSeconds: 60}
+	parent.Status.CurrentRun = &fluidcrv1alpha1.ScheduledRunReference{Name: "missing-child", UID: "child-uid", CheckpointID: "checkpoint-001"}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent).WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: parent.Name}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != fluidcrv1alpha1.PhasePending || got.Status.Message == "schedule paused" || got.Status.CurrentRun == nil || got.Status.CurrentRun.Name != "missing-child" {
+		t.Fatalf("pinned missing child should block without pause ack/new run: %+v", got.Status)
+	}
+}
+
+func TestSchedulePinnedCurrentRunUIDMismatchBlocksReplacement(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-replaced-current"
+	parent.UID = "parent-replaced-current-uid"
+	parent.Finalizers = []string{FinalizerName}
+	parent.Annotations = nil
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: true, IntervalSeconds: 1}
+	child := scheduledChildFor(parent)
+	child.Name = "replaced-child"
+	child.UID = "new-child-uid"
+	parent.Status.CurrentRun = &fluidcrv1alpha1.ScheduledRunReference{Name: child.Name, UID: "old-child-uid", CheckpointID: child.Annotations[AnnotationCheckpointID]}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent, child).WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: parent.Name}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != fluidcrv1alpha1.PhasePending || got.Status.CurrentRun == nil || got.Status.CurrentRun.UID != "old-child-uid" || !strings.Contains(got.Status.Message, "found UID") {
+		t.Fatalf("pinned UID mismatch should block without adopting replacement: %+v", got.Status)
+	}
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := c.List(context.Background(), &list, client.InNamespace("default"), client.MatchingLabels{LabelScheduledParent: "parent-replaced-current-uid"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("UID mismatch spawned a new child: %d", len(list.Items))
+	}
+}
+
+func TestScheduleActiveChildPreventsOverlapAndGenerationAppliesNextRun(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched"
+	parent.UID = "parent-uid"
+	parent.Generation = 2
+	parent.Annotations = nil
+	parent.Finalizers = []string{FinalizerName}
+	parent.Spec.Container = "next-container"
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: true, IntervalSeconds: 1}
+	child := scheduledChildFor(parent, 1)
+	child.Name = "active-child"
+	child.UID = "child-uid"
+	child.Spec.Container = "old-container"
+	child.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(parent, fluidcrv1alpha1.GroupVersion.WithKind("FluidCRMigration"))}
+	child.Status.Phase = fluidcrv1alpha1.PhaseAppCheckpointing
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent, child).WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "sched"}}); err != nil {
+		t.Fatal(err)
+	}
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := c.List(context.Background(), &list, client.InNamespace("default"), client.MatchingLabels{LabelScheduledParent: "parent-uid"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 || list.Items[0].Spec.Container != "old-container" {
+		t.Fatalf("overlap/generation contract broken: %+v", list.Items)
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "sched"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.ObservedGeneration != 2 || got.Status.CurrentRun == nil || got.Status.CurrentRun.Phase != fluidcrv1alpha1.PhaseAppCheckpointing {
+		t.Fatalf("active child status = %+v", got.Status)
+	}
+}
+
+func TestScheduleDurableFullChildUpdatesSuccessSnapshot(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched"
+	parent.UID = "parent-uid"
+	parent.Annotations = nil
+	parent.Finalizers = []string{FinalizerName}
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: false, IntervalSeconds: 60}
+	child := scheduledChildFor(parent, 1)
+	child.Name = "done-child"
+	child.UID = "child-uid"
+	child.Generation = 1
+	child.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(parent, fluidcrv1alpha1.GroupVersion.WithKind("FluidCRMigration"))}
+	checkpointID := child.Annotations[AnnotationCheckpointID]
+	now := metav1.Now()
+	child.Status = fluidcrv1alpha1.FluidCRMigrationStatus{ObservedGeneration: 1, Phase: fluidcrv1alpha1.PhaseCompleted, StartTime: &now, CompletionTime: &now, Pods: []fluidcrv1alpha1.PodMigrationStatus{{PodName: "p0", PodUID: "pod-uid", CheckpointID: checkpointID, Phase: fluidcrv1alpha1.PodPhaseResumed, CheckpointFiles: []fluidcrv1alpha1.CheckpointFile{{CheckpointID: checkpointID, ContainerName: "trainer", FilePath: "/var/lib/kubelet/checkpoints/a.tar", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DurableRef: "file-store:default/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ExportedAt: "2026-09-26T00:00:00Z"}}}}}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent, child).WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "sched"}}); err != nil {
+		t.Fatal(err)
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "sched"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	ref := got.Status.LastSuccessfulFullCheckpoint
+	if ref == nil || ref.Name != child.Name || ref.UID != "child-uid" || ref.CheckpointID != checkpointID || ref.CompletionTime == nil || ref.Result == nil {
+		t.Fatalf("success ref = %+v", ref)
+	}
+	if strings.Contains(string(ref.Result.Spec.Raw), "schedule") || !strings.Contains(string(ref.Result.Status.Raw), "durableRef") {
+		t.Fatalf("snapshot missing immutable evidence: spec=%s status=%s", ref.Result.Spec.Raw, ref.Result.Status.Raw)
+	}
+}
+
+func TestScheduleIdleAfterDurableChildSecondReconcileDoesNotRewriteStatus(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-idle-stable"
+	parent.UID = "parent-idle-stable-uid"
+	parent.Annotations = nil
+	parent.Finalizers = []string{FinalizerName}
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: true, IntervalSeconds: 3600}
+	child := scheduledChildFor(parent)
+	child.Name = "done-idle-stable-child"
+	child.UID = "child-idle-stable-uid"
+	child.Generation = 1
+	checkpointID := child.Annotations[AnnotationCheckpointID]
+	now := metav1.Now()
+	child.CreationTimestamp = now
+	child.Status = fluidcrv1alpha1.FluidCRMigrationStatus{ObservedGeneration: 1, Phase: fluidcrv1alpha1.PhaseCompleted, StartTime: &now, CompletionTime: &now, Pods: []fluidcrv1alpha1.PodMigrationStatus{{PodName: "p0", PodUID: "pod-uid", CheckpointID: checkpointID, Phase: fluidcrv1alpha1.PodPhaseResumed, CheckpointFiles: []fluidcrv1alpha1.CheckpointFile{{CheckpointID: checkpointID, ContainerName: "trainer", FilePath: "/var/lib/kubelet/checkpoints/a.tar", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DurableRef: "file-store:default/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ExportedAt: "2026-09-26T00:00:00Z"}}}}}
+	var statusWrites int
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(parent, child).
+		WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if subResourceName == "status" {
+				statusWrites++
+			}
+			return c.Status().Update(ctx, obj, opts...)
+		}}).
+		Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: parent.Name}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if statusWrites != 1 {
+		t.Fatalf("initial idle status writes = %d, want 1", statusWrites)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if statusWrites != 1 {
+		t.Fatalf("second idle reconcile rewrote status: writes=%d", statusWrites)
+	}
+}
+
+func TestScheduleSuccessSnapshotFreezesSameChild(t *testing.T) {
+	s := newTestScheme(t)
+	parent := newTestMigration()
+	parent.Name = "sched-freeze"
+	parent.UID = "parent-freeze-uid"
+	parent.Annotations = nil
+	parent.Finalizers = []string{FinalizerName}
+	parent.Spec.Schedule = &fluidcrv1alpha1.MigrationScheduleSpec{Enabled: false, IntervalSeconds: 60}
+	child := scheduledChildFor(parent)
+	child.Name = "done-freeze-child"
+	child.UID = "freeze-child-uid"
+	child.Generation = 1
+	checkpointID := child.Annotations[AnnotationCheckpointID]
+	now := metav1.Now()
+	child.Status = fluidcrv1alpha1.FluidCRMigrationStatus{ObservedGeneration: 1, Phase: fluidcrv1alpha1.PhaseCompleted, StartTime: &now, CompletionTime: &now, Pods: []fluidcrv1alpha1.PodMigrationStatus{{PodName: "p0", PodUID: "pod-uid", CheckpointID: checkpointID, Phase: fluidcrv1alpha1.PodPhaseResumed, CheckpointFiles: []fluidcrv1alpha1.CheckpointFile{{CheckpointID: checkpointID, ContainerName: "trainer", FilePath: "/var/lib/kubelet/checkpoints/a.tar", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DurableRef: "file-store:default/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ExportedAt: "2026-09-26T00:00:00Z"}}}}}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(parent, child).WithStatusSubresource(&fluidcrv1alpha1.FluidCRMigration{}).Build()
+	r := &FluidCRMigrationReconciler{Client: c, Scheme: s, CtrlClient: &fakeCtrl{}, KubeletClient: &fakeKubelet{}}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: parent.Name}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var got fluidcrv1alpha1.FluidCRMigration
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	first := string(got.Status.LastSuccessfulFullCheckpoint.Result.Status.Raw)
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(child), child); err != nil {
+		t.Fatal(err)
+	}
+	child.Status.Conditions = []metav1.Condition{{Type: "ExporterObserved", Status: metav1.ConditionTrue, Reason: "Later", Message: "later", LastTransitionTime: metav1.Now()}}
+	child.Status.Pods[0].CheckpointFiles[0].ExportedAt = "2026-09-26T00:05:00Z"
+	if err := c.Status().Update(context.Background(), child); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if second := string(got.Status.LastSuccessfulFullCheckpoint.Result.Status.Raw); second != first {
+		t.Fatalf("snapshot changed for same child:\nfirst=%s\nsecond=%s", first, second)
+	}
 }

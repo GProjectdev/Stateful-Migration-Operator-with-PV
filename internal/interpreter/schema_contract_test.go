@@ -43,12 +43,12 @@ func TestCheckpointCRDStructuralCELAndStatusFidelity(t *testing.T) {
 	root := restoreSchema(t, crd)
 	immutable := false
 	for _, rule := range root.Properties["spec"].XValidations {
-		if rule.Rule == "self == oldSelf" {
+		if strings.Contains(rule.Rule, "self.workloadRef == oldSelf.workloadRef") && strings.Contains(rule.Rule, "partialCheckpoint") {
 			immutable = true
 		}
 	}
 	if !immutable {
-		t.Fatal("checkpoint spec must be immutable")
+		t.Fatal("checkpoint execution spec must be immutable except schedule")
 	}
 	structural, err := structuralschema.NewStructural(root)
 	if err != nil {
@@ -304,4 +304,31 @@ func restoreFirstFixtureArchive(t *testing.T, obj map[string]any) map[string]any
 		t.Fatalf("fixture archive shape = %#v", archives[0])
 	}
 	return archive
+}
+
+func TestCheckpointScheduleCELAllowsScheduleUpdatesOnly(t *testing.T) {
+	validator := restoreNewValidator(t, restoreLoadCRD(t, "fluidcrmigrations.yaml"))
+	base := map[string]any{
+		"apiVersion": "fluidcr.dcnlab.com/v1alpha1",
+		"kind":       "FluidCRMigration",
+		"metadata":   map[string]any{"name": "checkpoint", "namespace": "default"},
+		"spec": map[string]any{"workloadRef": map[string]any{
+			"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "trainer",
+		}},
+	}
+	restoreAssertValid(t, validator, runtime.DeepCopyJSONValue(base), nil)
+
+	scheduledOld := runtime.DeepCopyJSONValue(base).(map[string]any)
+	scheduledOld["spec"].(map[string]any)["schedule"] = map[string]any{"enabled": true, "intervalSeconds": int64(30)}
+	scheduledNew := runtime.DeepCopyJSONValue(scheduledOld).(map[string]any)
+	scheduledNew["spec"].(map[string]any)["schedule"] = map[string]any{"enabled": false, "intervalSeconds": int64(60)}
+	restoreAssertValid(t, validator, scheduledNew, scheduledOld)
+
+	convertedToSchedule := runtime.DeepCopyJSONValue(base).(map[string]any)
+	convertedToSchedule["spec"].(map[string]any)["schedule"] = map[string]any{"enabled": true, "intervalSeconds": int64(30)}
+	restoreAssertInvalidContains(t, validator, convertedToSchedule, base, "only spec.schedule may be updated")
+
+	convertedToOneShot := runtime.DeepCopyJSONValue(scheduledOld).(map[string]any)
+	delete(convertedToOneShot["spec"].(map[string]any), "schedule")
+	restoreAssertInvalidContains(t, validator, convertedToOneShot, scheduledOld, "only spec.schedule may be updated")
 }

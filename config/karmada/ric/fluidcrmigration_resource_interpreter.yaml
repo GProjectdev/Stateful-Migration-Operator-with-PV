@@ -83,5 +83,9 @@ spec:
           if type(status) ~= "table" or type(generation) ~= "number" or generation < 1 then
             return false
           end
+          local spec = observedObj and observedObj.spec
+          if type(spec) == "table" and type(spec.schedule) == "table" then
+            return status.observedGeneration == generation and status.phase ~= "Failed"
+          end
           return status.observedGeneration == generation and status.phase == "Completed"
         end

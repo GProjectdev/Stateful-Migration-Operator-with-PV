@@ -53,8 +53,10 @@ spec:
           spec:
             description: spec defines the desired state of FluidCRMigration
             x-kubernetes-validations:
-            - rule: self == oldSelf
-              message: spec is immutable; create a new checkpoint CR
+            - rule: has(self.schedule) == has(oldSelf.schedule) && self.workloadRef == oldSelf.workloadRef && (!has(self.resume) && !has(oldSelf.resume) || has(self.resume) && has(oldSelf.resume) && self.resume == oldSelf.resume) && (!has(self.container) && !has(oldSelf.container) || has(self.container) && has(oldSelf.container) && self.container == oldSelf.container) && (!has(self.ctrlPort) && !has(oldSelf.ctrlPort) || has(self.ctrlPort) && has(oldSelf.ctrlPort) && self.ctrlPort == oldSelf.ctrlPort) && (!has(self.appCheckpointTimeoutSeconds) && !has(oldSelf.appCheckpointTimeoutSeconds) || has(self.appCheckpointTimeoutSeconds) && has(oldSelf.appCheckpointTimeoutSeconds) && self.appCheckpointTimeoutSeconds == oldSelf.appCheckpointTimeoutSeconds) && (!has(self.kubeletTimeoutSeconds) && !has(oldSelf.kubeletTimeoutSeconds) || has(self.kubeletTimeoutSeconds) && has(oldSelf.kubeletTimeoutSeconds) && self.kubeletTimeoutSeconds == oldSelf.kubeletTimeoutSeconds) && (!has(self.partialCheckpoint) && !has(oldSelf.partialCheckpoint) || has(self.partialCheckpoint) && has(oldSelf.partialCheckpoint) && self.partialCheckpoint == oldSelf.partialCheckpoint)
+              message: checkpoint execution spec is immutable; only spec.schedule may be updated
+            - rule: '!has(self.schedule) || (!has(self.partialCheckpoint) && (!has(self.resume) || self.resume == true))'
+              message: scheduled checkpoints require full-rank checkpointing and resume=true
             properties:
               appCheckpointTimeoutSeconds:
                 description: |-
@@ -111,6 +113,19 @@ spec:
                   checkpoints are taken, so the workload continues in place. Defaults to
                   true.
                 type: boolean
+              schedule:
+                description: Schedule turns this object into a durable member-local scheduler parent.
+                properties:
+                  enabled:
+                    type: boolean
+                  intervalSeconds:
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                - intervalSeconds
+                type: object
               workloadRef:
                 description: |-
                   WorkloadRef references the workload whose pods will be checkpointed.
@@ -180,6 +195,15 @@ spec:
                       format: int64
                     message:
                       type: string
+                    currentRun:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    lastSuccessfulCheckpoint:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    lastSuccessfulFullCheckpoint:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                     pods:
                       type: array
                       items:
@@ -292,6 +316,15 @@ spec:
               phase:
                 description: Phase is the overall phase of the migration workflow.
                 type: string
+              currentRun:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              lastSuccessfulCheckpoint:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              lastSuccessfulFullCheckpoint:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
               pods:
                 description: Pods tracks the per-pod progress of the workflow.
                 items:

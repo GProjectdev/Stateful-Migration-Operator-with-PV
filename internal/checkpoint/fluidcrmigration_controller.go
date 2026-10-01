@@ -18,10 +18,14 @@ package checkpoint
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,13 +55,18 @@ const (
 	// paused workload before the resource disappears.
 	FinalizerName = "fluidcrmigration.fluidcr.dcnlab.com/finalizer"
 
-	conditionReady               = "Ready"
-	defaultTimeoutSecs           = 300
-	waitRequeueInterval          = 15 * time.Second
-	statusUpdateAttempts         = 5
-	AnnotationCheckpointID       = "training.dcnlab.com/checkpoint-id"
-	AnnotationRestoreOwnedResume = "training.dcnlab.com/restore-owned-resume"
-	LabelWorkloadUID             = "training.dcnlab.com/workload-uid"
+	conditionReady                = "Ready"
+	defaultTimeoutSecs            = 300
+	waitRequeueInterval           = 15 * time.Second
+	statusUpdateAttempts          = 5
+	AnnotationCheckpointID        = "training.dcnlab.com/checkpoint-id"
+	AnnotationRestoreOwnedResume  = "training.dcnlab.com/restore-owned-resume"
+	AnnotationScheduledParentName = "training.dcnlab.com/scheduled-parent-name"
+	AnnotationScheduledParentUID  = "training.dcnlab.com/scheduled-parent-uid"
+	LabelRole                     = "training.dcnlab.com/role"
+	LabelScheduledParent          = "training.dcnlab.com/scheduled-parent"
+	LabelWorkloadUID              = "training.dcnlab.com/workload-uid"
+	RoleCheckpointEvidence        = "checkpoint-evidence"
 )
 
 // CtrlAPI is the subset of the in-pod FluidCR control API the controller uses.
@@ -117,6 +126,10 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if migration.Labels[LabelRole] == RoleCheckpointEvidence {
+		return ctrl.Result{}, nil
+	}
+
 	if migration.DeletionTimestamp != nil {
 		return r.reconcileDelete(ctx, &migration)
 	}
@@ -127,6 +140,10 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if migration.Spec.Schedule != nil {
+		return r.reconcileSchedule(ctx, &migration)
 	}
 
 	if restoreOwnedResumeRequested(&migration) && restoreOwnedResumePending(&migration) {
@@ -142,6 +159,407 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return r.reconcileWorkflow(ctx, &migration)
 }
 
+func (r *FluidCRMigrationReconciler) reconcileSchedule(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration) (ctrl.Result, error) {
+	if parent.Spec.Schedule == nil {
+		return ctrl.Result{}, nil
+	}
+	if parent.Spec.Schedule.IntervalSeconds <= 0 {
+		return r.markFailed(ctx, parent, "schedule intervalSeconds must be positive")
+	}
+	if parent.Spec.PartialCheckpoint != nil {
+		return r.markFailed(ctx, parent, "scheduled checkpoints require full-rank checkpoint; partialCheckpoint is not allowed")
+	}
+	if !shouldResume(parent) {
+		return r.markFailed(ctx, parent, "scheduled checkpoints require spec.resume=true or omitted")
+	}
+	children, err := r.scheduledChildren(ctx, parent)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if pendingScheduleReservation(parent.Status.CurrentRun) {
+		if child := childByName(children, parent.Status.CurrentRun.Name); child != nil {
+			if err := validateReservedScheduledChild(parent, parent.Status.CurrentRun, child); err != nil {
+				return ctrl.Result{}, err
+			}
+			blocking := activeScheduledChild(children) != nil
+			result, err := r.updateScheduleFromCurrentChild(ctx, parent, child, blocking)
+			if err != nil || blocking {
+				return result, err
+			}
+		} else {
+			return r.materializeReservedScheduledChild(ctx, parent)
+		}
+	}
+	if pinnedCurrentRun(parent.Status.CurrentRun) {
+		child := childByName(children, parent.Status.CurrentRun.Name)
+		if child == nil {
+			return r.blockScheduleOnPinnedCurrentRun(ctx, parent, fmt.Sprintf("waiting for pinned scheduled child %s to appear", parent.Status.CurrentRun.Name))
+		}
+		if string(child.UID) != parent.Status.CurrentRun.UID {
+			return r.blockScheduleOnPinnedCurrentRun(ctx, parent, fmt.Sprintf("waiting for pinned scheduled child %s UID %s, found UID %s", child.Name, parent.Status.CurrentRun.UID, child.UID))
+		}
+	}
+	active := activeScheduledChild(children)
+	current := active
+	if current == nil && parent.Status.CurrentRun != nil {
+		current = childByName(children, parent.Status.CurrentRun.Name)
+	}
+	if current == nil {
+		current = latestScheduledChild(children)
+	}
+	if current != nil {
+		result, err := r.updateScheduleFromCurrentChild(ctx, parent, current, active != nil)
+		if err != nil || active != nil {
+			return result, err
+		}
+	}
+	if !parent.Spec.Schedule.Enabled {
+		parent.Status.ObservedGeneration = parent.Generation
+		parent.Status.Phase = fluidcrv1alpha1.PhasePaused
+		parent.Status.Message = "schedule paused"
+		setReadyCondition(parent, metav1.ConditionFalse, "SchedulePaused", parent.Status.Message)
+		return ctrl.Result{}, r.saveStatus(ctx, parent)
+	}
+	if wait := scheduleWait(parent, children); wait > 0 {
+		parent.Status.ObservedGeneration = parent.Generation
+		parent.Status.Phase = fluidcrv1alpha1.PhasePending
+		parent.Status.Message = "waiting for next scheduled checkpoint interval"
+		setReadyCondition(parent, metav1.ConditionTrue, "ScheduleIdle", parent.Status.Message)
+		if err := r.saveStatus(ctx, parent); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+	if conflict := r.conflictingWorkloadMigration(ctx, parent, children); conflict != "" {
+		parent.Status.ObservedGeneration = parent.Generation
+		parent.Status.Phase = fluidcrv1alpha1.PhasePending
+		parent.Status.Message = conflict
+		setReadyCondition(parent, metav1.ConditionFalse, "ScheduleBlocked", conflict)
+		return ctrl.Result{RequeueAfter: waitRequeueInterval}, r.saveStatus(ctx, parent)
+	}
+	parent.Status.CurrentRun = scheduledRunReservation(parent)
+	parent.Status.ObservedGeneration = parent.Generation
+	parent.Status.Phase = fluidcrv1alpha1.PhasePending
+	parent.Status.Message = fmt.Sprintf("reserved scheduled child %s", parent.Status.CurrentRun.Name)
+	setReadyCondition(parent, metav1.ConditionFalse, "ScheduleActive", parent.Status.Message)
+	if err := r.saveStatus(ctx, parent); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+func (r *FluidCRMigrationReconciler) blockScheduleOnPinnedCurrentRun(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration, message string) (ctrl.Result, error) {
+	parent.Status.ObservedGeneration = parent.Generation
+	parent.Status.Phase = fluidcrv1alpha1.PhasePending
+	parent.Status.Message = message
+	setReadyCondition(parent, metav1.ConditionFalse, "ScheduleBlocked", message)
+	return ctrl.Result{RequeueAfter: waitRequeueInterval}, r.saveStatus(ctx, parent)
+}
+
+func (r *FluidCRMigrationReconciler) updateScheduleFromCurrentChild(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration, current *fluidcrv1alpha1.FluidCRMigration, blocking bool) (ctrl.Result, error) {
+	parent.Status.CurrentRun = scheduledRunReference(current, false)
+	if durableFullCheckpointComplete(current) && !sameRunReference(parent.Status.LastSuccessfulFullCheckpoint, current) {
+		parent.Status.LastSuccessfulCheckpoint = scheduledRunReference(current, true)
+		parent.Status.LastSuccessfulFullCheckpoint = scheduledRunReference(current, true)
+	}
+	if !blocking {
+		return ctrl.Result{}, nil
+	}
+	parent.Status.ObservedGeneration = parent.Generation
+	parent.Status.Phase = fluidcrv1alpha1.PhasePending
+	if isTerminalPhase(current.Status.Phase) {
+		parent.Status.Message = fmt.Sprintf("last child %s finished with phase %s", current.Name, current.Status.Phase)
+	} else {
+		parent.Status.Message = fmt.Sprintf("waiting for child %s to finish", current.Name)
+	}
+	setReadyCondition(parent, metav1.ConditionFalse, "ScheduleActive", parent.Status.Message)
+	if err := r.saveStatus(ctx, parent); err != nil {
+		return ctrl.Result{}, err
+	}
+	if blocking {
+		return ctrl.Result{RequeueAfter: waitRequeueInterval}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *FluidCRMigrationReconciler) materializeReservedScheduledChild(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration) (ctrl.Result, error) {
+	child, err := scheduledChildForReservation(parent, parent.Status.CurrentRun)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.Create(ctx, child); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, err
+		}
+		var existing fluidcrv1alpha1.FluidCRMigration
+		if getErr := r.Get(ctx, client.ObjectKeyFromObject(child), &existing); getErr != nil {
+			return ctrl.Result{}, getErr
+		}
+		if err := validateReservedScheduledChild(parent, parent.Status.CurrentRun, &existing); err != nil {
+			return ctrl.Result{}, err
+		}
+		child = &existing
+	}
+	parent.Status.CurrentRun = scheduledRunReference(child, false)
+	parent.Status.ObservedGeneration = parent.Generation
+	parent.Status.Phase = fluidcrv1alpha1.PhasePending
+	parent.Status.Message = fmt.Sprintf("created scheduled child %s", child.Name)
+	setReadyCondition(parent, metav1.ConditionFalse, "ScheduleActive", parent.Status.Message)
+	if err := r.saveStatus(ctx, parent); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+func (r *FluidCRMigrationReconciler) scheduledChildren(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration) ([]fluidcrv1alpha1.FluidCRMigration, error) {
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := r.List(ctx, &list, client.InNamespace(parent.Namespace), client.MatchingLabels{LabelScheduledParent: string(parent.UID)}); err != nil {
+		return nil, err
+	}
+	children := list.Items[:0]
+	for i := range list.Items {
+		child := list.Items[i]
+		if controlledBy(&child, parent) {
+			children = append(children, child)
+		}
+	}
+	sort.Slice(children, func(i, j int) bool {
+		return children[i].CreationTimestamp.Before(&children[j].CreationTimestamp) || (children[i].CreationTimestamp.Equal(&children[j].CreationTimestamp) && children[i].Name < children[j].Name)
+	})
+	return children, nil
+}
+
+func controlledBy(child, parent *fluidcrv1alpha1.FluidCRMigration) bool {
+	return child.Labels[LabelScheduledParent] == string(parent.UID) &&
+		child.Annotations[AnnotationScheduledParentUID] == string(parent.UID) &&
+		child.Annotations[AnnotationScheduledParentName] == parent.Name
+}
+
+func activeScheduledChild(children []fluidcrv1alpha1.FluidCRMigration) *fluidcrv1alpha1.FluidCRMigration {
+	for i := range children {
+		if !durableFullCheckpointComplete(&children[i]) {
+			return &children[i]
+		}
+	}
+	return nil
+}
+
+func latestScheduledChild(children []fluidcrv1alpha1.FluidCRMigration) *fluidcrv1alpha1.FluidCRMigration {
+	if len(children) == 0 {
+		return nil
+	}
+	return &children[len(children)-1]
+}
+
+func childByName(children []fluidcrv1alpha1.FluidCRMigration, name string) *fluidcrv1alpha1.FluidCRMigration {
+	for i := range children {
+		if children[i].Name == name {
+			return &children[i]
+		}
+	}
+	return nil
+}
+
+func (r *FluidCRMigrationReconciler) conflictingWorkloadMigration(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration, ownChildren []fluidcrv1alpha1.FluidCRMigration) string {
+	own := map[string]bool{}
+	for i := range ownChildren {
+		own[ownChildren[i].Name] = true
+	}
+	var list fluidcrv1alpha1.FluidCRMigrationList
+	if err := r.List(ctx, &list, client.InNamespace(parent.Namespace)); err != nil {
+		return fmt.Sprintf("waiting for workload migration inventory: %v", err)
+	}
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.Name == parent.Name || own[other.Name] || other.Labels[LabelRole] == RoleCheckpointEvidence {
+			continue
+		}
+		if !sameWorkloadRef(parent.Spec.WorkloadRef, other.Spec.WorkloadRef, parent.Namespace) {
+			continue
+		}
+		if sameWorkloadMigrationBlocksPeriodic(other) {
+			return fmt.Sprintf("waiting for same-workload FluidCRMigration %s/%s", other.Namespace, other.Name)
+		}
+	}
+	return ""
+}
+
+func sameWorkloadMigrationBlocksPeriodic(other *fluidcrv1alpha1.FluidCRMigration) bool {
+	if other.Spec.Schedule != nil {
+		return true
+	}
+	if completedPartialSurvivorsReleased(other) {
+		return false
+	}
+	if durableFullCheckpointComplete(other) && shouldResume(other) {
+		return false
+	}
+	return true
+}
+
+func completedPartialSurvivorsReleased(m *fluidcrv1alpha1.FluidCRMigration) bool {
+	if m.Spec.PartialCheckpoint == nil || m.Status.Phase != fluidcrv1alpha1.PhaseCompleted || m.Status.ObservedGeneration != m.Generation || m.Status.CompletionTime == nil {
+		return false
+	}
+	condition := meta.FindStatusCondition(m.Status.Conditions, "SurvivorReleased")
+	return condition != nil && condition.Status == metav1.ConditionTrue && condition.Reason == "Released" && condition.ObservedGeneration == m.Generation
+}
+
+func sameWorkloadRef(a, b fluidcrv1alpha1.WorkloadReference, defaultNamespace string) bool {
+	return a.UID == b.UID && a.APIVersion == b.APIVersion && a.Kind == b.Kind && a.Name == b.Name && workloadRefNamespace(a, defaultNamespace) == workloadRefNamespace(b, defaultNamespace)
+}
+
+func workloadRefNamespace(ref fluidcrv1alpha1.WorkloadReference, defaultNamespace string) string {
+	if ref.Namespace != "" {
+		return ref.Namespace
+	}
+	return defaultNamespace
+}
+func scheduleWait(parent *fluidcrv1alpha1.FluidCRMigration, children []fluidcrv1alpha1.FluidCRMigration) time.Duration {
+	if len(children) == 0 {
+		return 0
+	}
+	latest := children[len(children)-1]
+	base := latest.CreationTimestamp.Time
+	if latest.Status.CompletionTime != nil {
+		base = latest.Status.CompletionTime.Time
+	}
+	if base.IsZero() {
+		return 0
+	}
+	due := base.Add(time.Duration(parent.Spec.Schedule.IntervalSeconds) * time.Second)
+	return time.Until(due)
+}
+
+func pendingScheduleReservation(ref *fluidcrv1alpha1.ScheduledRunReference) bool {
+	return ref != nil && ref.Name != "" && ref.CheckpointID != "" && ref.UID == ""
+}
+
+func pinnedCurrentRun(ref *fluidcrv1alpha1.ScheduledRunReference) bool {
+	return ref != nil && ref.Name != "" && ref.UID != ""
+}
+
+func scheduledRunReservation(parent *fluidcrv1alpha1.FluidCRMigration) *fluidcrv1alpha1.ScheduledRunReference {
+	checkpointID := newScheduledCheckpointID(parent)
+	now := metav1.Now()
+	return &fluidcrv1alpha1.ScheduledRunReference{
+		Name:         childName(parent.Name, checkpointID),
+		CheckpointID: checkpointID,
+		Phase:        fluidcrv1alpha1.PhasePending,
+		StartTime:    &now,
+	}
+}
+
+func newScheduledCheckpointID(parent *fluidcrv1alpha1.FluidCRMigration) string {
+	createdAt := time.Now().UTC().UnixNano()
+	parentUID := string(parent.UID)
+	return fmt.Sprintf("%s-%s-g%d-t%d", parent.Name, shortID(parentUID), parent.Generation, createdAt)
+}
+
+func scheduledChildFor(parent *fluidcrv1alpha1.FluidCRMigration, _ ...int) *fluidcrv1alpha1.FluidCRMigration {
+	return mustScheduledChildForReservation(parent, scheduledRunReservation(parent))
+}
+
+func scheduledChildForReservation(parent *fluidcrv1alpha1.FluidCRMigration, ref *fluidcrv1alpha1.ScheduledRunReference) (*fluidcrv1alpha1.FluidCRMigration, error) {
+	if ref == nil || ref.Name == "" || ref.CheckpointID == "" {
+		return nil, fmt.Errorf("scheduled child reservation is incomplete")
+	}
+	if wantName := childName(parent.Name, ref.CheckpointID); wantName != ref.Name {
+		return nil, fmt.Errorf("scheduled child reservation name %q does not match checkpointID %q", ref.Name, ref.CheckpointID)
+	}
+	return mustScheduledChildForReservation(parent, ref), nil
+}
+
+func mustScheduledChildForReservation(parent *fluidcrv1alpha1.FluidCRMigration, ref *fluidcrv1alpha1.ScheduledRunReference) *fluidcrv1alpha1.FluidCRMigration {
+	parentUID := string(parent.UID)
+	spec := *parent.Spec.DeepCopy()
+	spec.Schedule = nil
+	annotations := map[string]string{AnnotationCheckpointID: ref.CheckpointID, AnnotationScheduledParentName: parent.Name, AnnotationScheduledParentUID: parentUID}
+	labels := map[string]string{LabelScheduledParent: parentUID}
+	return &fluidcrv1alpha1.FluidCRMigration{
+		TypeMeta:   metav1.TypeMeta{APIVersion: fluidcrv1alpha1.GroupVersion.String(), Kind: "FluidCRMigration"},
+		ObjectMeta: metav1.ObjectMeta{Name: ref.Name, Namespace: parent.Namespace, Annotations: annotations, Labels: labels},
+		Spec:       spec,
+	}
+}
+
+func validateReservedScheduledChild(parent *fluidcrv1alpha1.FluidCRMigration, ref *fluidcrv1alpha1.ScheduledRunReference, child *fluidcrv1alpha1.FluidCRMigration) error {
+	want, err := scheduledChildForReservation(parent, ref)
+	if err != nil {
+		return err
+	}
+	if !controlledBy(child, parent) || child.Annotations[AnnotationCheckpointID] != ref.CheckpointID {
+		return fmt.Errorf("existing scheduled child %s/%s is not owned by reserved parent UID/checkpointID", child.Namespace, child.Name)
+	}
+	if !reflect.DeepEqual(child.Spec, want.Spec) {
+		return fmt.Errorf("existing scheduled child %s/%s spec does not match reserved execution spec", child.Namespace, child.Name)
+	}
+	return nil
+}
+func shortID(value string) string {
+	if value == "" {
+		value = "nouid"
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+func childName(parentName, checkpointID string) string {
+	sum := sha256.Sum256([]byte(checkpointID))
+	suffix := hex.EncodeToString(sum[:])[:10]
+	prefix := strings.Trim(parentName, "-")
+	if len(prefix) > 45 {
+		prefix = prefix[:45]
+	}
+	return strings.Trim(prefix, "-") + "-" + suffix
+}
+
+func rawSnapshot(value any) runtime.RawExtension {
+	data, _ := json.Marshal(value)
+	return runtime.RawExtension{Raw: data}
+}
+
+func sameRunReference(ref *fluidcrv1alpha1.ScheduledRunReference, child *fluidcrv1alpha1.FluidCRMigration) bool {
+	return ref != nil && ref.UID == string(child.UID) && ref.CheckpointID == strings.TrimSpace(child.Annotations[AnnotationCheckpointID])
+}
+
+func scheduledRunReference(child *fluidcrv1alpha1.FluidCRMigration, includeResult bool) *fluidcrv1alpha1.ScheduledRunReference {
+	ref := &fluidcrv1alpha1.ScheduledRunReference{
+		Name: child.Name, UID: string(child.UID), CheckpointID: strings.TrimSpace(child.Annotations[AnnotationCheckpointID]),
+		Phase: child.Status.Phase, StartTime: child.Status.StartTime, CompletionTime: child.Status.CompletionTime,
+	}
+	if includeResult {
+		spec := *child.Spec.DeepCopy()
+		spec.Schedule = nil
+		status := *child.Status.DeepCopy()
+		status.CurrentRun = nil
+		status.LastSuccessfulCheckpoint = nil
+		status.LastSuccessfulFullCheckpoint = nil
+		ref.Result = &fluidcrv1alpha1.ScheduledRunResult{Spec: rawSnapshot(spec), Status: rawSnapshot(status)}
+	}
+	return ref
+}
+
+func durableFullCheckpointComplete(child *fluidcrv1alpha1.FluidCRMigration) bool {
+	if child.Spec.PartialCheckpoint != nil || child.Status.Phase != fluidcrv1alpha1.PhaseCompleted || child.Status.ObservedGeneration != child.Generation || child.Status.CompletionTime == nil {
+		return false
+	}
+	checkpointID := strings.TrimSpace(child.Annotations[AnnotationCheckpointID])
+	if checkpointID == "" || len(child.Status.Pods) == 0 {
+		return false
+	}
+	for _, pod := range child.Status.Pods {
+		if pod.CheckpointID != checkpointID || len(pod.CheckpointFiles) == 0 {
+			return false
+		}
+		for _, file := range pod.CheckpointFiles {
+			if file.CheckpointID != checkpointID || file.SHA256 == "" || file.DurableRef == "" || file.ExportedAt == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
 func (r *FluidCRMigrationReconciler) reconcileRestoreOwnedResume(ctx context.Context, m *fluidcrv1alpha1.FluidCRMigration) (ctrl.Result, error) {
 	if m.Status.Phase != fluidcrv1alpha1.PhaseCompleted || m.Status.ObservedGeneration != m.Generation {
 		return r.markSurvivorRelease(ctx, m, metav1.ConditionFalse, "CheckpointIncomplete", "restore-owned release requires a completed current-generation checkpoint")
@@ -984,6 +1402,12 @@ func (r *FluidCRMigrationReconciler) saveStatus(ctx context.Context, m *fluidcrv
 			return fmt.Errorf("migration identity/spec changed during status update; refusing stale work")
 		}
 		clusters := latest.Status.Clusters
+		desired := *m.Status.DeepCopy()
+		desired.Clusters = clusters
+		if reflect.DeepEqual(latest.Status, desired) {
+			*m = latest
+			return nil
+		}
 		latest.Status = m.Status
 		latest.Status.Clusters = clusters
 		err := r.Status().Update(ctx, &latest)

@@ -36,6 +36,8 @@ const (
 	// PhaseResuming means the controller is releasing the application
 	// checkpoint locks so the workload resumes in place.
 	PhaseResuming MigrationPhase = "Resuming"
+	// PhasePaused means a scheduler parent is quiesced and will not spawn new children.
+	PhasePaused MigrationPhase = "Paused"
 	// PhaseCompleted is a terminal phase indicating the workflow succeeded.
 	PhaseCompleted MigrationPhase = "Completed"
 	// PhaseFailed is a terminal phase indicating the workflow failed.
@@ -89,7 +91,7 @@ type WorkloadReference struct {
 }
 
 // FluidCRMigrationSpec defines the desired state of FluidCRMigration.
-// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable; create a new checkpoint CR"
+// +kubebuilder:validation:XValidation:rule="has(self.schedule) == has(oldSelf.schedule) && self.workloadRef == oldSelf.workloadRef && (!has(self.resume) && !has(oldSelf.resume) || has(self.resume) && has(oldSelf.resume) && self.resume == oldSelf.resume) && (!has(self.container) && !has(oldSelf.container) || has(self.container) && has(oldSelf.container) && self.container == oldSelf.container) && (!has(self.ctrlPort) && !has(oldSelf.ctrlPort) || has(self.ctrlPort) && has(oldSelf.ctrlPort) && self.ctrlPort == oldSelf.ctrlPort) && (!has(self.appCheckpointTimeoutSeconds) && !has(oldSelf.appCheckpointTimeoutSeconds) || has(self.appCheckpointTimeoutSeconds) && has(oldSelf.appCheckpointTimeoutSeconds) && self.appCheckpointTimeoutSeconds == oldSelf.appCheckpointTimeoutSeconds) && (!has(self.kubeletTimeoutSeconds) && !has(oldSelf.kubeletTimeoutSeconds) || has(self.kubeletTimeoutSeconds) && has(oldSelf.kubeletTimeoutSeconds) && self.kubeletTimeoutSeconds == oldSelf.kubeletTimeoutSeconds) && (!has(self.partialCheckpoint) && !has(oldSelf.partialCheckpoint) || has(self.partialCheckpoint) && has(oldSelf.partialCheckpoint) && self.partialCheckpoint == oldSelf.partialCheckpoint)",message="checkpoint execution spec is immutable; only spec.schedule may be updated"\n// +kubebuilder:validation:XValidation:rule="!has(self.schedule) || (!has(self.partialCheckpoint) && (!has(self.resume) || self.resume == true))",message="scheduled checkpoints require full-rank checkpointing and resume=true"
 type FluidCRMigrationSpec struct {
 	// WorkloadRef references the workload whose pods will be checkpointed.
 	// The controller resolves the workload's pod selector and fans out the
@@ -135,6 +137,25 @@ type FluidCRMigrationSpec struct {
 	// never resumed by this controller. Requires spec.resume=false.
 	// +optional
 	PartialCheckpoint *PartialCheckpointSpec `json:"partialCheckpoint,omitempty"`
+
+	// Schedule turns this object into a durable member-local scheduler parent.
+	// The parent never executes a checkpoint itself; it creates immutable child
+	// FluidCRMigration rounds at the requested interval.
+	// +optional
+	Schedule *MigrationScheduleSpec `json:"schedule,omitempty"`
+}
+
+// MigrationScheduleSpec controls periodic child checkpoint creation.
+type MigrationScheduleSpec struct {
+	// Enabled controls child spawning. Disabling the schedule pauses new
+	// children, but any active child is allowed to finish.
+	// +required
+	Enabled bool `json:"enabled"`
+
+	// IntervalSeconds is the minimum delay between child round starts.
+	// +kubebuilder:validation:Minimum=1
+	// +required
+	IntervalSeconds int32 `json:"intervalSeconds"`
 }
 
 // PartialCheckpointSpec selects target ranks for same-cluster partial-rank replacement.
@@ -254,6 +275,21 @@ type FluidCRMigrationStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// CurrentRun references the child FluidCRMigration currently tracked by a
+	// scheduler parent.
+	// +optional
+	CurrentRun *ScheduledRunReference `json:"currentRun,omitempty"`
+
+	// LastSuccessfulCheckpoint references the most recent child whose completed
+	// full-rank checkpoint has durable archive evidence.
+	// +optional
+	LastSuccessfulCheckpoint *ScheduledRunReference `json:"lastSuccessfulCheckpoint,omitempty"`
+
+	// LastSuccessfulFullCheckpoint references the most recent full-rank child
+	// checkpoint with durable archive evidence.
+	// +optional
+	LastSuccessfulFullCheckpoint *ScheduledRunReference `json:"lastSuccessfulFullCheckpoint,omitempty"`
+
 	// StartTime is when the workflow started.
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
@@ -274,6 +310,51 @@ type FluidCRMigrationStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// ScheduledRunReference identifies immutable evidence produced by a scheduler child.
+type ScheduledRunReference struct {
+	// Name is the child FluidCRMigration name.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Name string `json:"name"`
+
+	// UID is the child object UID assigned by the API server.
+	// +optional
+	UID string `json:"uid,omitempty"`
+
+	// CheckpointID is the logical checkpoint ID carried by the child annotation.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	CheckpointID string `json:"checkpointID"`
+
+	// Phase is the child workflow phase observed by the scheduler parent.
+	// +optional
+	Phase MigrationPhase `json:"phase,omitempty"`
+
+	// StartTime is copied from the child status.
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// CompletionTime is copied from the child when it reaches a terminal phase.
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Result snapshots the immutable child spec and complete child status once a
+	// durable full-rank checkpoint succeeds.
+	// +optional
+	Result *ScheduledRunResult `json:"result,omitempty"`
+}
+
+// ScheduledRunResult embeds immutable child evidence for management handoff.
+type ScheduledRunResult struct {
+	// Spec is the child execution spec with any nested schedule stripped.
+	// +required
+	Spec runtime.RawExtension `json:"spec"`
+
+	// Status is the complete child status, including pod archive evidence.
+	// +required
+	Status runtime.RawExtension `json:"status"`
+}
+
 // ClusterMigrationStatus retains the member status needed by orchestration.
 type ClusterMigrationStatus struct {
 	StartTime          *metav1.Time   `json:"startTime,omitempty"`
@@ -283,8 +364,11 @@ type ClusterMigrationStatus struct {
 	ObservedGeneration int64          `json:"observedGeneration,omitempty"`
 	Message            string         `json:"message,omitempty"`
 	// +kubebuilder:pruning:PreserveUnknownFields
-	Pods       []runtime.RawExtension `json:"pods,omitempty"`
-	Conditions []metav1.Condition     `json:"conditions,omitempty"`
+	Pods                         []runtime.RawExtension `json:"pods,omitempty"`
+	CurrentRun                   *runtime.RawExtension  `json:"currentRun,omitempty"`
+	LastSuccessfulCheckpoint     *runtime.RawExtension  `json:"lastSuccessfulCheckpoint,omitempty"`
+	LastSuccessfulFullCheckpoint *runtime.RawExtension  `json:"lastSuccessfulFullCheckpoint,omitempty"`
+	Conditions                   []metav1.Condition     `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
