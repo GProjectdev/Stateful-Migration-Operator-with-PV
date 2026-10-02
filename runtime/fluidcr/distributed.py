@@ -104,6 +104,51 @@ def read_manifest() -> Dict[str, Any]:
         return {}
 
 
+def validated_checkpoint_manifest(world_size: int) -> Dict[str, Any]:
+    """Require an explicit request before choosing destructive rank roles."""
+    data = read_manifest()
+    targets = data.get("targets")
+    if targets != "all":
+        if not isinstance(targets, list) or any(
+            type(rank) is not int or not 0 <= rank < world_size for rank in targets
+        ) or len(set(targets)) != len(targets):
+            raise ValueError("checkpoint manifest requires explicit valid targets")
+        if data.get("restoreOwnedResume") and (
+            not isinstance(data.get("checkpointID"), str) or not data["checkpointID"]
+            or data.get("restoreOwnedResume") is not True
+            or data.get("noPeriodicResume") is not True
+            or type(data.get("generation")) is not int
+        ):
+            raise ValueError("partial manifest lacks round identity or restore ownership")
+    return data
+
+
+def agreed_checkpoint_manifest(world_size: int) -> Dict[str, Any]:
+    """Hold at the step boundary until every rank sees the same valid request.
+
+    The caller cancels its signal watchdog before entering this hold. Invalid
+    metadata must never turn a survivor into an implicit full-checkpoint target.
+    """
+    import sys
+    import torch.distributed as dist
+
+    attempts = 0
+    while True:
+        try:
+            local = {"manifest": validated_checkpoint_manifest(world_size)}
+        except (OSError, ValueError) as exc:
+            local = {"error": str(exc)}
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, local)
+        if "manifest" in local and all(item == local for item in gathered):
+            return local["manifest"]
+        if attempts % 40 == 0:
+            print("[FluidCR] checkpoint manifest agreement pending: "
+                  + json.dumps(gathered, sort_keys=True), file=sys.stderr, flush=True)
+        attempts += 1
+        time.sleep(0.25)
+
+
 def read_migration_targets() -> Targets:
     """Read the manifest. Returns ``"all"`` or a list of rank ints.
 
@@ -353,11 +398,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _write_pause_lock(path: str) -> None:
+def _write_pause_lock(path: str, manifest: Optional[Dict[str, Any]] = None) -> None:
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
-    manifest = read_manifest()
+    manifest = read_manifest() if manifest is None else manifest
     rank = _env_int("RANK")
     proof = {
         "state": "SurvivorParked",
@@ -369,7 +414,7 @@ def _write_pause_lock(path: str) -> None:
         "podUID": _pod_uid(),
         "nodeName": _env_text("FLUIDCR_NODE_NAME", "NODE_NAME"),
         "checkpointID": manifest.get("checkpointID", ""),
-        "generation": read_generation(),
+        "generation": manifest.get("generation", read_generation()),
         "pauseLockPath": path,
         "observedAt": _utc_now(),
         "restoreOwnedResume": bool(manifest.get("restoreOwnedResume")),
@@ -443,7 +488,7 @@ def _reinit_process_group() -> None:
     dist.init_process_group(backend=backend, **kwargs)
 
 
-def survivor_pause_and_rebuild() -> None:
+def survivor_pause_and_rebuild(manifest: Optional[Dict[str, Any]] = None) -> None:
     """Tear down NCCL, park until unparked, then rebuild PG + DDP in place.
 
     Model and optimizer state remain resident in VRAM across the whole call.
@@ -452,7 +497,7 @@ def survivor_pause_and_rebuild() -> None:
 
     _destroy_pg_safely()
     lock = _pause_lock_path()
-    _write_pause_lock(lock)
+    _write_pause_lock(lock, manifest)
     log(f"Survivor parked (VRAM held). Waiting for unpark at {lock} ...")
 
     _wait_for_pause_lock_removal(lock)

@@ -415,6 +415,12 @@ _SIGUSR1_WATCHDOG_TIMEOUT: int = int(
 # not kill it. A target/full-checkpoint rank leaves it armed -- it guards the
 # save/release/exit from hanging inside HAMi.
 _active_watchdog_cancel: Optional[threading.Event] = None
+_coordinated_checkpoint_active = threading.Event()
+
+
+def _lifecycle_diagnostic(message: str) -> None:
+    """Emit bounded lifecycle diagnostics even when normal logs are quiet."""
+    print(f"[FluidCR lifecycle] {message}", file=sys.stderr, flush=True)
 
 
 def _start_watchdog_thread() -> None:
@@ -442,13 +448,23 @@ def _start_watchdog_thread() -> None:
     # Repeated signals belong to the same round; keep its original deadline
     # and cancellation handle so a survivor cannot leave an orphan timer.
     if _active_watchdog_cancel is not None and not _active_watchdog_cancel.is_set():
+        _lifecycle_diagnostic(
+            "checkpoint watchdog already armed; keeping existing deadline"
+        )
         return
     cancel = threading.Event()
     _active_watchdog_cancel = cancel
+    _lifecycle_diagnostic(
+        f"checkpoint watchdog armed timeout_s={_SIGUSR1_WATCHDOG_TIMEOUT}"
+    )
 
     def _watchdog() -> None:
         if cancel.wait(_SIGUSR1_WATCHDOG_TIMEOUT):
             return  # cancelled: this rank rendezvoused and is parking as a survivor
+        _lifecycle_diagnostic(
+            f"checkpoint watchdog fired timeout_s={_SIGUSR1_WATCHDOG_TIMEOUT} "
+            f"exit_code={EXIT_CODE}"
+        )
         warn(
             f"Checkpoint watchdog fired after {_SIGUSR1_WATCHDOG_TIMEOUT}s -- "
             "forcing exit."
@@ -470,7 +486,14 @@ def cancel_checkpoint_watchdog() -> None:
     cancel = _active_watchdog_cancel
     if cancel is not None:
         cancel.set()
+        _lifecycle_diagnostic("checkpoint watchdog cancelled")
 
+
+def begin_coordinated_checkpoint() -> None:
+    """Mark coordinated checkpoint handling active and disarm survivor watchdog."""
+    _coordinated_checkpoint_active.set()
+    _lifecycle_diagnostic("coordinated checkpoint phase active")
+    cancel_checkpoint_watchdog()
 
 # ---------------------------------------------------------------------------
 # Coordinated (distributed) checkpoint
@@ -517,6 +540,7 @@ def clear_migration_flags() -> None:
     re-fire on the next optimizer step.
     """
     _checkpoint_requested.clear()
+    _coordinated_checkpoint_active.clear()
 
 
 def distributed_checkpoint_enabled() -> bool:
@@ -536,11 +560,18 @@ def perform_checkpoint_and_exit(backend: Any = None) -> None:
     boundary (see ``_maybe_coordinated_checkpoint``).  Never call this from the
     async signal handler in distributed mode.
     """
+    if _coordinated_checkpoint_active.is_set():
+        _start_watchdog_thread()
     if backend is None:
         backend = get_active()
     if backend is None:
+        _lifecycle_diagnostic(
+            f"checkpoint save_exit skipped backend=none exit_code={EXIT_CODE}"
+        )
         os._exit(EXIT_CODE)
 
+    backend_name = getattr(backend, "name", type(backend).__name__)
+    _lifecycle_diagnostic(f"checkpoint save begin backend={backend_name}")
     log("Saving checkpoint...")
     try:
         from fluidcr.ctrl import record_runtime_status
@@ -556,8 +587,13 @@ def perform_checkpoint_and_exit(backend: Any = None) -> None:
             record_runtime_status(global_step=global_step(), state="CheckpointSaved")
         except Exception:
             pass
+        _lifecycle_diagnostic(f"checkpoint save complete backend={backend_name}")
         log("Checkpoint saved.")
     except Exception as exc:
+        _lifecycle_diagnostic(
+            f"checkpoint save failed backend={backend_name} "
+            f"error_type={type(exc).__name__}"
+        )
         warn(f"Error saving checkpoint: {exc}")
 
     # Best-effort GPU release in a background thread with a timeout.  The
@@ -568,8 +604,14 @@ def perform_checkpoint_and_exit(backend: Any = None) -> None:
     t.start()
     t.join(timeout=_GPU_RELEASE_TIMEOUT)
     if t.is_alive():
+        _lifecycle_diagnostic(
+            f"checkpoint gpu_release timeout backend={backend_name}"
+        )
         warn("GPU release timed out; proceeding with exit.")
 
+    _lifecycle_diagnostic(
+        f"checkpoint exiting backend={backend_name} exit_code={EXIT_CODE}"
+    )
     log("Exiting for migration.")
 
     # ``os._exit`` skips atexit hooks (which can deadlock inside a virtual-GPU
@@ -587,6 +629,12 @@ def _sigusr1_handler(signum: int, frame: Any) -> None:
     (see the module note above); the optimizer-step hook performs the actual
     coordinated save once every rank has agreed.
     """
+    if _coordinated_checkpoint_active.is_set():
+        _lifecycle_diagnostic(
+            "checkpoint signal ignored phase=coordinated-active"
+        )
+        return
+
     # Thread-based watchdog: GUARANTEED to fire even if the main thread is
     # stuck in a hung CUDA C call (which the SIGALRM approach cannot escape).
     # It also bounds the distributed path: if a peer has already died, the
@@ -595,10 +643,18 @@ def _sigusr1_handler(signum: int, frame: Any) -> None:
 
     backend = get_active()
     if backend is None:
+        _lifecycle_diagnostic(
+            "checkpoint signal branch backend=none action=exit"
+        )
         log("SIGUSR1 received but no ML framework imported -- nothing to save.")
         os._exit(EXIT_CODE)
 
+    backend_name = getattr(backend, "name", type(backend).__name__)
     if distributed_checkpoint_enabled():
+        _lifecycle_diagnostic(
+            f"checkpoint signal branch distributed=true backend={backend_name} "
+            "action=defer state=requested"
+        )
         log(
             "SIGUSR1 received. Distributed mode: deferring to the next "
             "optimizer-step boundary for a coordinated checkpoint."
@@ -606,6 +662,10 @@ def _sigusr1_handler(signum: int, frame: Any) -> None:
         request_checkpoint()
         return
 
+    _lifecycle_diagnostic(
+        f"checkpoint signal branch distributed=false backend={backend_name} "
+        "action=save_exit"
+    )
     log("SIGUSR1 received.")
     perform_checkpoint_and_exit(backend)
 

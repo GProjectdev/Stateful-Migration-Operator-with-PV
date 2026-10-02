@@ -523,23 +523,33 @@ def _maybe_coordinated_checkpoint(opt: Any) -> bool:
     from fluidcr.distributed import (
         is_full,
         rank_is_target,
-        read_migration_targets,
+        agreed_checkpoint_manifest,
         survivor_pause_and_rebuild,
     )
 
-    targets = read_migration_targets()
+    # All ranks reached the step boundary. Metadata disagreement is a hold,
+    # not permission for a timeout to terminate a would-be survivor.
+    fluidcr.begin_coordinated_checkpoint()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    manifest = agreed_checkpoint_manifest(world_size)
+    targets = manifest["targets"]
+    import sys
+    print(
+        f"[FluidCR] checkpoint role rank={rank} worldSize={world_size} "
+        f"checkpointID={manifest.get('checkpointID', '')} targets={targets} "
+        f"role={'target' if rank_is_target(rank, targets) else 'survivor'}",
+        file=sys.stderr, flush=True,
+    )
     if isinstance(targets, list) and not targets:
         warn("Migration triggered but manifest target list is empty -- no-op.")
         # This rank rendezvoused and will keep training, not exit -- so if it was
         # the signalled rank, disarm the watchdog before it force-exits us.
-        fluidcr.cancel_checkpoint_watchdog()
         fluidcr.clear_migration_flags()
         return
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
     if rank_is_target(rank, targets):
+        fluidcr._start_watchdog_thread()
         if is_full(targets, world_size):
             log("Coordinated full checkpoint: this rank saves and exits.")
         else:
@@ -550,9 +560,8 @@ def _maybe_coordinated_checkpoint(opt: Any) -> bool:
     # Survivor: this rank parks for an unbounded time keeping its VRAM. If it was
     # the rank that received SIGUSR1, its watchdog would otherwise force-exit it
     # after the timeout -- disarm it now that we have safely rendezvoused.
-    fluidcr.cancel_checkpoint_watchdog()
     log(f"Partial migration: rank {rank} is a survivor -- pause and rebuild NCCL.")
-    survivor_pause_and_rebuild()
+    survivor_pause_and_rebuild(manifest)
     return True
 
 

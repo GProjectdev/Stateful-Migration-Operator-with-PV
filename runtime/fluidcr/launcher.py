@@ -59,6 +59,11 @@ def _log(msg: str) -> None:
         print(msg, flush=True)
 
 
+def _lifecycle_log(msg: str) -> None:
+    """Print bounded launcher diagnostics even when worker logs are quiet."""
+    print(f"[Launcher lifecycle] {msg}", file=sys.stderr, flush=True)
+
+
 def _build_env() -> Dict[str, str]:
     """Return a copy of the environment with ``PYTHONPATH`` prepended.
 
@@ -151,6 +156,7 @@ def _spawn_worker(command: List[str], env: Dict[str, str]) -> int:
         proc.wait()
     finally:
         unregister_worker_pid(launcher_pid)
+    _lifecycle_log(f"worker child exited pid={proc.pid} exit_code={proc.returncode}")
     return proc.returncode
 
 

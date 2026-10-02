@@ -24,7 +24,7 @@ class WatchdogTests(unittest.TestCase):
                         callbacks.append(self.target)
                 scope = dict(threading=SimpleNamespace(Event=threading.Event, Thread=DeferredThread),
                              _active_watchdog_cancel=None, _SIGUSR1_WATCHDOG_TIMEOUT=0,
-                             warn=lambda message: None, os=SimpleNamespace(_exit=exits.append), EXIT_CODE=99)
+                             warn=lambda message: None, _lifecycle_diagnostic=lambda message: None, os=SimpleNamespace(_exit=exits.append), EXIT_CODE=99)
                 exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), scope)
                 scope["_start_watchdog_thread"]()
                 scope["_start_watchdog_thread"]()
