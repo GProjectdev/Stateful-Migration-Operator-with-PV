@@ -21,4 +21,3 @@ See the [coordinated Buildah and deployment guide](https://github.com/GProjectde
 ## Validation Boundary
 
 Local contract/unit tests do not prove GPU/NCCL/CRIU recovery. Validate two successive partial replacements, continued progress on both ranks, and stable prior-operation receipts on the deployed cluster before accepting performance measurements.
-
