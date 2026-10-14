@@ -8,9 +8,36 @@ import (
 
 const FenceAnnotation = "migration.dcnlab.com/group-source-fence"
 const TargetVerifiedAnnotation = "migration.dcnlab.com/group-target-verified"
+const PartialTargetVerifiedAnnotation = "migration.dcnlab.com/partial-target-verified"
 
 func TargetVerified(plan *api.RestorePlan) bool {
 	return plan.Spec.GroupRestore != nil && plan.Spec.RequestUID != "" && plan.Annotations[TargetVerifiedAnnotation] == plan.Spec.RequestUID
+}
+
+type PartialTargetReceipt struct {
+	RequestUID     string `json:"requestUID"`
+	PlanGeneration int64  `json:"planGeneration"`
+	CheckpointID   string `json:"checkpointID"`
+	Operation      string `json:"operation"`
+}
+
+func EncodePartialTargetVerified(plan *api.RestorePlan, operation string) (string, error) {
+	if plan.Spec.PartialRestore == nil || plan.Spec.RequestUID == "" || plan.Generation <= 0 || plan.Spec.CheckpointRef.CheckpointID == "" || operation == "" {
+		return "", fmt.Errorf("partial target receipt requires request, operation, checkpoint and plan generation")
+	}
+	b, err := json.Marshal(PartialTargetReceipt{RequestUID: plan.Spec.RequestUID, PlanGeneration: plan.Generation, CheckpointID: plan.Spec.CheckpointRef.CheckpointID, Operation: operation})
+	return string(b), err
+}
+
+func PartialTargetVerified(plan *api.RestorePlan) bool {
+	if plan.Spec.PartialRestore == nil || plan.Spec.RequestUID == "" || plan.Generation <= 0 {
+		return false
+	}
+	var r PartialTargetReceipt
+	if err := json.Unmarshal([]byte(plan.Annotations[PartialTargetVerifiedAnnotation]), &r); err != nil {
+		return false
+	}
+	return r.RequestUID == plan.Spec.RequestUID && r.PlanGeneration == plan.Generation && r.CheckpointID == plan.Spec.CheckpointRef.CheckpointID && r.Operation != ""
 }
 
 // Receipts are written only by the management controller after reading source

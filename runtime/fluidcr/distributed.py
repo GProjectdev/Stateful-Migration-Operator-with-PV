@@ -336,6 +336,21 @@ def record_ddp(wrapper: Any, args: tuple, kwargs: dict) -> None:
     """Record a DDP wrapper and its constructor arguments for later rebuild."""
     if _rebuilding:
         return
+    live: List[Tuple[Any, tuple, dict]] = []
+    replaced = False
+    for ref, old_args, old_kwargs in _ddp_records:
+        existing = ref()
+        if existing is None:
+            continue
+        if existing is wrapper:
+            live.append((weakref.ref(wrapper), tuple(args), dict(kwargs)))
+            replaced = True
+        else:
+            live.append((ref, old_args, old_kwargs))
+    if replaced:
+        _ddp_records[:] = live
+        return
+    _ddp_records[:] = live
     _ddp_records.append((weakref.ref(wrapper), tuple(args), dict(kwargs)))
 
 

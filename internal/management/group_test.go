@@ -80,6 +80,17 @@ func TestGroupVerificationRequiresPostResumeProgressAndFence(t *testing.T) {
 		})
 	}
 }
+
+func TestGroupCompletedReceiptPreservesExistingSourceFenceSemantics(t *testing.T) {
+	r, _ := groupRequestFixture()
+	r.Status.Phase = "Verified"
+	r.Status.ObservedGeneration = r.Generation
+	r.Status.Verification = &api.RestoreVerification{RequestUID: string(r.UID), Operation: r.Spec.GroupRestore.OperationUID, CheckpointID: r.Spec.CheckpointRef.CheckpointID, VerifiedAt: metav1.Now(), SourceCluster: r.Spec.SourceCluster, TargetCluster: r.Spec.TargetCluster, SourceFenced: true}
+	if !completedOperationReceiptMatches(r) {
+		t.Fatal("group completed receipt regressed on SourceFenced status semantics")
+	}
+}
+
 func TestGroupSourceReceiptAuthorization(t *testing.T) {
 	r, c := groupRequestFixture()
 	r.Spec.TargetCluster = "target"

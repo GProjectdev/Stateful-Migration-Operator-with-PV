@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,6 +45,23 @@ func inject(pod *corev1.Pod) {
 	pod.Spec.Volumes = []corev1.Volume{{Name: "fluidcr-payload", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}, {Name: "checkpoints", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "fluidcr-payload", MountPath: "/opt/fluidcr", ReadOnly: true}, {Name: "checkpoints", MountPath: "/checkpoint"}}
 	pod.Spec.InitContainers = []corev1.Container{{Name: "fluidcr-inject", Image: "payload:v1", VolumeMounts: []corev1.VolumeMount{{Name: "fluidcr-payload", MountPath: "/fluidcr"}}}}
+}
+
+func markPartialTargetVerified(t *testing.T, plan *api.RestorePlan) {
+	t.Helper()
+	if plan.Spec.CheckpointRef.CheckpointID == "" {
+		plan.Spec.CheckpointRef.CheckpointID = "checkpoint-round"
+	}
+	receipt, err := groupcontract.EncodePartialTargetVerified(plan, "partial-operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Annotations == nil {
+		plan.Annotations = map[string]string{}
+	}
+	plan.Annotations[groupcontract.PartialTargetVerifiedAnnotation] = receipt
+	plan.Status.Phase = "Verified"
+	plan.Status.ObservedGeneration = plan.Generation
 }
 
 func TestMutationIdempotentPreservesSchedulingAndImage(t *testing.T) {
@@ -202,9 +220,14 @@ func TestUnlabelledPartialAdmissionRequiresUniqueActivePlanAndWorkloadUID(t *tes
 		t.Fatal("unlabelled partial Pod was not bound to the running plan")
 	}
 	terminal := plan.DeepCopy()
-	terminal.Status.Phase = "Verified"
+	markPartialTargetVerified(t, terminal)
 	if err := NewWebhook(testClient(t, terminal, node), "spot-cluster").Apply(context.Background(), unlabelled); err == nil {
 		t.Fatal("terminal partial plan matched an unlabelled replacement Pod")
+	}
+	explicit := unlabelled.DeepCopy()
+	explicit.Labels[api.PlanLabel] = terminal.Name
+	if err := NewWebhook(testClient(t, terminal, node), "spot-cluster").Apply(context.Background(), explicit); err == nil {
+		t.Fatal("terminal partial plan accepted explicit stale binding")
 	}
 	pod.Labels = map[string]string{WorkloadUIDLabel: "other-workload"}
 	if err := NewWebhook(testClient(t, plan, node), "spot-cluster").Apply(context.Background(), pod); err == nil {
@@ -216,6 +239,35 @@ func TestUnlabelledPartialAdmissionRequiresUniqueActivePlanAndWorkloadUID(t *tes
 	other.UID = "plan-other"
 	if err := NewWebhook(testClient(t, plan, other, node), "spot-cluster").Apply(context.Background(), pod); err == nil {
 		t.Fatal("ambiguous active partial plans accepted")
+	}
+}
+
+func TestCompletedPartialReceiptRetiresNonTerminalPhaseDuringNextAdmission(t *testing.T) {
+	for _, phase := range []string{"StagedReady", "RestoreReady"} {
+		t.Run(phase, func(t *testing.T) {
+			oldPlan, pod, node := partialFixture()
+			oldPlan.Name = "restore-old"
+			oldPlan.UID = "old-plan-uid"
+			oldPlan.Spec.RequestUID = "old-request-uid"
+			markPartialTargetVerified(t, oldPlan)
+			oldPlan.Status.Phase = phase
+
+			newPlan := oldPlan.DeepCopy()
+			newPlan.Name = "restore-new"
+			newPlan.UID = "new-plan-uid"
+			newPlan.Spec.RequestUID = "new-request-uid"
+			newPlan.Annotations = nil
+			newPlan.Status = api.RestoreStatus{Artifacts: oldPlan.Status.Artifacts, Phase: "Running"}
+
+			pod.Labels = map[string]string{WorkloadUIDLabel: "workload-uid"}
+			pod.Annotations = map[string]string{InjectAnnotation: "true"}
+			if err := NewWebhook(testClient(t, oldPlan, newPlan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
+			if pod.Labels[api.PlanLabel] != newPlan.Name || pod.Annotations[PlanUIDAnnotation] != string(newPlan.UID) {
+				t.Fatalf("new operation was not selected, labels=%v annotations=%v", pod.Labels, pod.Annotations)
+			}
+		})
 	}
 }
 

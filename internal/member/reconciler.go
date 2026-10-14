@@ -60,6 +60,9 @@ func (r *Reconciler) plansForPod(ctx context.Context, obj client.Object) []recon
 		if plan.Spec.TargetCluster != r.ClusterName {
 			continue
 		}
+		if completedPartialPlan(&plan) {
+			continue
+		}
 		for _, mapping := range plan.Spec.Pods {
 			if mapping.TargetPod == obj.GetName() {
 				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&plan)})
@@ -80,7 +83,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return nil
 		}
 		before := plan.DeepCopy().Status
-		if plan.Spec.TargetCluster == r.ClusterName && groupcontract.TargetVerified(&plan) {
+		if plan.Spec.TargetCluster == r.ClusterName && (groupcontract.TargetVerified(&plan) || completedPartialPlan(&plan)) {
 			return nil
 		}
 		phase, message, pods, sourceFences, err := r.evaluate(ctx, &plan)

@@ -164,6 +164,39 @@ func TestPodWatchFindsUnlabelledConflictingPod(t *testing.T) {
 	}
 }
 
+func TestCompletedPartialPlanDoesNotWatchOrReconcileOldOperation(t *testing.T) {
+	oldPlan, pod, node := partialFixture()
+	oldPlan.Name = "restore-old"
+	oldPlan.UID = "old-plan-uid"
+	oldPlan.Spec.RequestUID = "old-request-uid"
+	markPartialTargetVerified(t, oldPlan)
+	newPlan := oldPlan.DeepCopy()
+	newPlan.Name = "restore-new"
+	newPlan.UID = "new-plan-uid"
+	newPlan.Spec.RequestUID = "new-request-uid"
+	newPlan.Annotations = nil
+	newPlan.Status = api.RestoreStatus{Artifacts: oldPlan.Status.Artifacts}
+	if err := NewWebhook(testClient(t, newPlan, node), "spot-cluster").Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	c := testClient(t, withPartialAdmission(oldPlan, newPlan, node, pod)...)
+	r := NewReconciler(c, c, "spot-cluster")
+	requests := r.plansForPod(context.Background(), pod)
+	if len(requests) != 1 || requests[0].Name != newPlan.Name {
+		t.Fatalf("completed old plan still watched replacement Pod: %+v", requests)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(oldPlan)}); err != nil {
+		t.Fatal(err)
+	}
+	var got api.RestorePlan
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(oldPlan), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Verified" || !completedPartialPlan(&got) {
+		t.Fatalf("completed old plan was mutated by new operation Pod: %+v", got.Status)
+	}
+}
+
 func partialFixture() (*api.RestorePlan, *corev1.Pod, *corev1.Node) {
 	plan, pod, node := fixture()
 	plan.Spec.SourceCluster = "spot-cluster"

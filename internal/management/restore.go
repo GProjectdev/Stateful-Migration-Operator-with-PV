@@ -30,6 +30,7 @@ var trainingRuntimeGVK = schema.GroupVersionKind{Group: "training.dcnlab.com", V
 var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 const annotationRestoreOwnedResume = "training.dcnlab.com/restore-owned-resume"
+const annotationRecoveryOperation = "training.dcnlab.com/recovery-operation"
 
 // RestoreReconciler uses only the Karmada control-plane client and reader.
 type RestoreReconciler struct {
@@ -82,7 +83,12 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	}
 	// Completion is an operation receipt, not a perpetual health check. A later
 	// failure is a new operation and must not revoke this operation's evidence.
-	if req.Spec.GroupRestore != nil && req.Status.Phase == "Verified" && req.Status.ObservedGeneration == req.Generation && req.Status.Verification != nil && req.Status.Verification.RequestUID == string(req.UID) && req.Status.Verification.Operation == req.Spec.GroupRestore.OperationUID {
+	if completedOperationReceiptMatches(req) {
+		if req.Spec.PartialRestore != nil {
+			if err := r.authorizePartialTargetVerified(ctx, req); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, nil
 	}
 	cp := &unstructured.Unstructured{}
@@ -208,7 +214,55 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	}
+	if req.Spec.PartialRestore != nil && phase == "Verified" {
+		if err := r.patchPartialTargetVerified(ctx, req, plan); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	return finish(phase, message, plan.Name)
+}
+
+func (r *RestoreReconciler) authorizePartialTargetVerified(ctx context.Context, req *api.RestoreRequest) error {
+	if req.Status.PlanName == "" {
+		return nil
+	}
+	cp := &unstructured.Unstructured{}
+	cp.SetGroupVersionKind(checkpointGVK)
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Spec.CheckpointRef.Name}, cp); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	ready, err := validateCheckpoint(req, cp)
+	if err != nil || !ready {
+		return nil
+	}
+	desired, err := desiredPlan(req, cp)
+	if err != nil {
+		return nil
+	}
+	var plan api.RestorePlan
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Status.PlanName}, &plan); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if plan.Name != desired.Name || !ownedBy(&plan, req) || !reflect.DeepEqual(plan.Spec, desired.Spec) || !plan.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	return r.patchPartialTargetVerified(ctx, req, &plan)
+}
+
+func (r *RestoreReconciler) patchPartialTargetVerified(ctx context.Context, req *api.RestoreRequest, plan *api.RestorePlan) error {
+	receipt, err := groupcontract.EncodePartialTargetVerified(plan, req.Annotations[annotationRecoveryOperation])
+	if err != nil {
+		return err
+	}
+	if plan.Annotations[groupcontract.PartialTargetVerifiedAnnotation] == receipt {
+		return nil
+	}
+	before := plan.DeepCopy()
+	if plan.Annotations == nil {
+		plan.Annotations = map[string]string{}
+	}
+	plan.Annotations[groupcontract.PartialTargetVerifiedAnnotation] = receipt
+	return r.Client.Patch(ctx, plan, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *RestoreReconciler) authorizeRestoreOwnedResume(ctx context.Context, cp *unstructured.Unstructured) error {
@@ -321,7 +375,7 @@ func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.
 		return nil, err
 	}
 	verifiedAt := metav1.Now()
-	verification := &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations["training.dcnlab.com/recovery-operation"], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: verifiedAt, TrainingRuntimeRef: api.RuntimeReference{Name: tr.GetName(), UID: string(tr.GetUID())}, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced}
+	verification := &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations[annotationRecoveryOperation], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: verifiedAt, TrainingRuntimeRef: api.RuntimeReference{Name: tr.GetName(), UID: string(tr.GetUID())}, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced}
 	if req.Spec.GroupRestore != nil {
 		verification.SourceFenced = true
 		verification.Operation = req.Spec.GroupRestore.OperationUID
@@ -369,7 +423,7 @@ func partialRestoreReadyVerification(req *api.RestoreRequest, plan *api.RestoreP
 	if err != nil {
 		return nil, err
 	}
-	return &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations["training.dcnlab.com/recovery-operation"], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: now, TrainingRuntimeRef: req.Spec.TrainingRuntimeRef, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced, SourceFence: sourceFence, PartialRestore: partial, PreservedSurvivors: append([]api.SurvivorEvidence{}, req.Spec.PartialRestore.PreservedSurvivors...), Survivors: survivors}, nil
+	return &api.RestoreVerification{RequestUID: string(req.UID), Operation: req.Annotations[annotationRecoveryOperation], CheckpointID: req.Spec.CheckpointRef.CheckpointID, VerifiedAt: now, TrainingRuntimeRef: req.Spec.TrainingRuntimeRef, SourceCluster: req.Spec.SourceCluster, TargetCluster: req.Spec.TargetCluster, SourceFenced: req.Spec.SourceFenced, SourceFence: sourceFence, PartialRestore: partial, PreservedSurvivors: append([]api.SurvivorEvidence{}, req.Spec.PartialRestore.PreservedSurvivors...), Survivors: survivors}, nil
 }
 
 func (r *RestoreReconciler) resolveTrainingRuntime(ctx context.Context, req *api.RestoreRequest) (*unstructured.Unstructured, error) {
@@ -420,8 +474,55 @@ func stableVerification(req *api.RestoreRequest, next *api.RestoreVerification) 
 	return next
 }
 
+func completedOperationReceiptMatches(req *api.RestoreRequest) bool {
+	if req.UID == "" || req.Generation <= 0 || req.Status.Phase != "Verified" || req.Status.ObservedGeneration != req.Generation || req.Status.Verification == nil {
+		return false
+	}
+	v := req.Status.Verification
+	if v.RequestUID != string(req.UID) || v.CheckpointID != req.Spec.CheckpointRef.CheckpointID || v.SourceCluster != req.Spec.SourceCluster || v.TargetCluster != req.Spec.TargetCluster || v.VerifiedAt.IsZero() {
+		return false
+	}
+	if req.Spec.GroupRestore != nil {
+		return v.Operation == req.Spec.GroupRestore.OperationUID
+	}
+	if req.Spec.PartialRestore == nil {
+		return false
+	}
+	operation := req.Annotations[annotationRecoveryOperation]
+	if operation == "" || v.Operation != operation || v.SourceFence.Operation != operation || v.SourceFenced != req.Spec.SourceFenced || !v.SourceFence.Fenced || v.SourceFence.EvidenceID == "" || v.SourceFence.ObservedAt == "" {
+		return false
+	}
+	if req.Spec.TrainingRuntimeRef.Name != "" && v.TrainingRuntimeRef.Name != req.Spec.TrainingRuntimeRef.Name {
+		return false
+	}
+	if req.Spec.TrainingRuntimeRef.UID != "" && v.TrainingRuntimeRef.UID != req.Spec.TrainingRuntimeRef.UID {
+		return false
+	}
+	if v.TrainingRuntimeRef.Name == "" || v.TrainingRuntimeRef.UID == "" {
+		return false
+	}
+	if !reflect.DeepEqual(v.PreservedSurvivors, req.Spec.PartialRestore.PreservedSurvivors) || v.PartialRestore == nil || !v.PartialRestore.PreventPeriodicResume || len(v.PartialRestore.TargetRanks) != len(req.Spec.Pods) || len(v.Survivors) != len(req.Spec.PartialRestore.PreservedSurvivors) {
+		return false
+	}
+	archives := map[int64]string{}
+	for _, pod := range req.Spec.Pods {
+		if len(pod.Archives) != 1 {
+			return false
+		}
+		archives[pod.Rank] = restoreArchiveEvidence(pod.Archives[0])
+	}
+	seen := map[int64]bool{}
+	for _, target := range v.PartialRestore.TargetRanks {
+		if seen[target.Rank] || target.TargetPodUID == "" || target.CheckpointID != req.Spec.CheckpointRef.CheckpointID || target.ArchiveEvidenceID == "" || target.ArchiveEvidenceID != archives[target.Rank] {
+			return false
+		}
+		seen[target.Rank] = true
+	}
+	return len(seen) == len(archives)
+}
+
 func partialVerification(req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, sourceFences []api.SourcePodFenceStatus, observedAt string) (*api.PartialRestoreVerification, api.SourceFenceEvidence, []api.SurvivorStateEvidence, error) {
-	operation := req.Annotations["training.dcnlab.com/recovery-operation"]
+	operation := req.Annotations[annotationRecoveryOperation]
 	targetUIDs := map[string]string{}
 	for _, pod := range targetPods {
 		if pod.UID != "" {

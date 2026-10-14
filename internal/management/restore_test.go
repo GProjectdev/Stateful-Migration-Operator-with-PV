@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -100,6 +101,9 @@ func survivorPodEvidence() map[string]interface{} {
 	}
 }
 func makeSameClusterPartial(req *api.RestoreRequest, cp *unstructured.Unstructured) {
+	if req.Annotations == nil {
+		req.Annotations = map[string]string{annotationRecoveryOperation: "partial-operation"}
+	}
 	req.Spec.TargetCluster = req.Spec.SourceCluster
 	req.Spec.SourceFenced = false
 	req.Spec.Pods[0].Rank = 1
@@ -518,6 +522,110 @@ func TestPartialRestoreAuthorizesReleaseThenVerifiesAfterSurvivorResume(t *testi
 			got = reconcile(t, c, req)
 			if got.Status.Phase != "Verified" {
 				t.Fatalf("phase after release/runtime = %q: %+v", got.Status.Phase, got.Status)
+			}
+		})
+	}
+}
+
+func TestVerifiedPartialReceiptIsImmutableButMismatchesAreNotFrozen(t *testing.T) {
+	req, cp := fixture()
+	req.Annotations = map[string]string{annotationRecoveryOperation: "operation-1"}
+	makeSameClusterPartial(req, cp)
+	plan, err := desiredPlan(req, cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Generation = 1
+	now := metav1.Now()
+	gone := metav1.NewTime(now.Time.Add(-time.Second))
+	plan.Status.Clusters = []api.ClusterStatus{{ClusterName: req.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Running", Message: "target restored", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}, SourceFences: []api.SourcePodFenceStatus{{PodName: "db-0", SourcePodUID: "target-source-uid", ObservedGeneration: 1, Phase: "SourceGone", DeleteRequestedAt: &gone, GoneObservedAt: &gone}}}}
+	c := testClient(t, req, cp, plan, partialTrainingRuntime(req, "target-pod-uid", now))
+	got := reconcile(t, c, req)
+	if got.Status.Phase != "Verified" || got.Status.Verification == nil || got.Status.Verification.Operation != "operation-1" {
+		t.Fatalf("partial operation did not verify: %+v", got.Status)
+	}
+
+	var current api.RestorePlan
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &current); err != nil {
+		t.Fatal(err)
+	}
+	current.Status.Clusters[0].Phase = "Failed"
+	current.Status.Clusters[0].Message = "later replacement failed"
+	if err := c.Status().Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	r := &RestoreReconciler{Client: c, APIReader: c}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(req)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("verified receipt should stop polling, got %s", result.RequeueAfter)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(req), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != "Verified" || got.Status.Message != "target runtime evidence verified" {
+		t.Fatalf("later failed plan mutated immutable receipt: %+v", got.Status)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(plan), &current); err != nil {
+		t.Fatal(err)
+	}
+	if !groupcontract.PartialTargetVerified(&current) {
+		t.Fatalf("verified partial plan receipt not propagated to member: %v", current.Annotations)
+	}
+	t.Run("changed plan is not backfilled", func(t *testing.T) {
+		changedReq, changedCP := fixture()
+		changedReq.Annotations = map[string]string{annotationRecoveryOperation: "operation-1"}
+		makeSameClusterPartial(changedReq, changedCP)
+		changedPlan, err := desiredPlan(changedReq, changedCP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changedPlan.Generation = 1
+		changedReq.Status = got.Status
+		changedReq.Status.PlanName = changedPlan.Name
+		changedPlan.Spec.Pods[0].TargetNode = "changed-node"
+		changedPlan.Status.Clusters = []api.ClusterStatus{{ClusterName: changedReq.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Failed", Message: "changed plan should not be certified"}}
+		changedClient := testClient(t, changedReq, changedCP, changedPlan)
+		r := &RestoreReconciler{Client: changedClient, APIReader: changedClient}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(changedReq)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.RequeueAfter != 0 {
+			t.Fatalf("verified receipt should still stop polling, got %s", result.RequeueAfter)
+		}
+		if err := changedClient.Get(context.Background(), client.ObjectKeyFromObject(changedPlan), changedPlan); err != nil {
+			t.Fatal(err)
+		}
+		if groupcontract.PartialTargetVerified(changedPlan) {
+			t.Fatalf("changed plan was backfilled with a completion receipt: %v", changedPlan.Annotations)
+		}
+	})
+
+	for _, mode := range []string{"operation", "generation"} {
+		t.Run(mode, func(t *testing.T) {
+			staleReq, staleCP := fixture()
+			staleReq.Annotations = map[string]string{annotationRecoveryOperation: "operation-1"}
+			makeSameClusterPartial(staleReq, staleCP)
+			stalePlan, err := desiredPlan(staleReq, staleCP)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stalePlan.Generation = 1
+			stalePlan.Status.Clusters = []api.ClusterStatus{{ClusterName: staleReq.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Failed", Message: "current operation failed"}}
+			staleReq.Status = got.Status
+			switch mode {
+			case "operation":
+				staleReq.Status.Verification.Operation = "operation-0"
+				staleReq.Status.Verification.SourceFence.Operation = "operation-0"
+			case "generation":
+				staleReq.Status.ObservedGeneration = 0
+			}
+			checked := reconcile(t, testClient(t, staleReq, staleCP, stalePlan), staleReq)
+			if checked.Status.Phase != "Failed" {
+				t.Fatalf("%s mismatch was frozen as verified: %+v", mode, checked.Status)
 			}
 		})
 	}

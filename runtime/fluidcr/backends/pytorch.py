@@ -82,6 +82,11 @@ def _root_models() -> List[Any]:
     """Return tracked models that are root-level and carry learnable parameters.
 
     Filters out sub-modules and stateless singletons (``nn.ReLU``, etc.).
+    DDP rebuilds re-run ``DistributedDataParallel.__init__`` in place, which can
+    invoke ``nn.Module.__init__`` on the same wrapper again.  Preserve only one
+    root per unwrapped module identity so a survivor's next checkpoint does not
+    serialize the same model twice, while distinct model objects with identical
+    ``state_dict`` keys remain separate.
     """
     all_models = _live_refs(_tracked_models)
     if not all_models:
@@ -93,10 +98,17 @@ def _root_models() -> List[Any]:
             if child is not m:
                 child_ids.add(id(child))
 
-    return [
-        m for m in all_models
-        if id(m) not in child_ids and _has_parameters(m)
-    ]
+    roots = []
+    seen_roots: Set[int] = set()
+    for m in all_models:
+        if id(m) in child_ids or not _has_parameters(m):
+            continue
+        root_id = id(_unwrap_model(m))
+        if root_id in seen_roots:
+            continue
+        seen_roots.add(root_id)
+        roots.append(m)
+    return roots
 
 
 # ---------------------------------------------------------------------------

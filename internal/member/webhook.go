@@ -247,6 +247,9 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	if err := validatePlan(&plan, w.ClusterName); err != nil {
 		return err
 	}
+	if completedPartialPlan(&plan) {
+		return fmt.Errorf("partial restore operation already verified; a new recovery operation is required")
+	}
 	if plan.Spec.LocalPodRestore {
 		if err := validateLocalCheckpoint(ctx, w.Reader, &plan); err != nil {
 			return err
@@ -380,6 +383,9 @@ func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.Re
 }
 
 func activePartialPlan(plan *api.RestorePlan, cluster string) bool {
+	if completedPartialPlan(plan) {
+		return false
+	}
 	if plan.Spec.GroupRestore != nil {
 		if plan.Spec.TargetCluster == cluster && groupcontract.TargetVerified(plan) {
 			return false
@@ -387,6 +393,10 @@ func activePartialPlan(plan *api.RestorePlan, cluster string) bool {
 		return (plan.Spec.TargetCluster == cluster || plan.Spec.SourceCluster == cluster) && plan.DeletionTimestamp.IsZero()
 	}
 	return (plan.Spec.PartialRestore != nil || plan.Spec.LocalPodRestore) && plan.Spec.TargetCluster == cluster && plan.DeletionTimestamp.IsZero() && plan.Status.Phase != "Verified" && (plan.Spec.LocalPodRestore || plan.Status.Phase != "Failed")
+}
+
+func completedPartialPlan(plan *api.RestorePlan) bool {
+	return groupcontract.PartialTargetVerified(plan)
 }
 
 func workloadMatchesPod(plan *api.RestorePlan, pod *corev1.Pod) bool {
