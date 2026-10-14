@@ -374,13 +374,37 @@ def _env_text(*names: str) -> str:
     return ""
 
 
-def _pod_identity() -> Dict[str, str]:
-    return {
-        "podName": _env_text("FLUIDCR_POD_NAME", "POD_NAME", "HOSTNAME"),
-        "podUID": _env_text("FLUIDCR_POD_UID", "POD_UID", "K8S_POD_UID"),
-        "nodeName": _env_text("FLUIDCR_NODE_NAME", "NODE_NAME"),
-    }
+def _file_text(*paths: str) -> str:
+    for path in paths:
+        path = (path or "").strip()
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                value = fh.read().strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return ""
 
+
+def _pod_identity() -> Dict[str, str]:
+    base = os.environ.get("FLUIDCR_IDENTITY_DIR", "/opt/fluidcr/pod-identity").strip()
+    return {
+        "podName": (
+            _file_text(os.environ.get("FLUIDCR_POD_NAME_FILE", ""), os.path.join(base, "name"))
+            or _env_text("FLUIDCR_POD_NAME", "POD_NAME", "HOSTNAME")
+        ),
+        "podUID": (
+            _file_text(os.environ.get("FLUIDCR_POD_UID_FILE", ""), os.path.join(base, "uid"))
+            or _env_text("FLUIDCR_POD_UID", "POD_UID", "K8S_POD_UID")
+        ),
+        "nodeName": (
+            _file_text(os.environ.get("FLUIDCR_NODE_NAME_FILE", ""), os.path.join(base, "node"))
+            or _env_text("FLUIDCR_NODE_NAME", "NODE_NAME")
+        ),
+    }
 
 def _require_pod_identity() -> Dict[str, str]:
     identity = _pod_identity()

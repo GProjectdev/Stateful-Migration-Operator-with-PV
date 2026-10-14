@@ -56,6 +56,58 @@ func TestDeletionUsesRecordedPodUIDWithoutWorkload(t *testing.T) {
 	}
 }
 
+func TestDeletionSkipsAlreadyResumedHistoricalCheckpoint(t *testing.T) {
+	m := newTestMigration()
+	m.Finalizers = []string{FinalizerName}
+	m.Status.Phase = fluidcr.PhaseCompleted
+	m.Status.ObservedGeneration = m.Generation
+	m.Status.Pods = []fluidcr.PodMigrationStatus{{
+		PodName:             "p0",
+		PodUID:              "uid-p0",
+		Phase:               fluidcr.PodPhaseResumed,
+		AppCheckpointResult: "checkpoint-ready",
+	}}
+	p := newTestPod("p0", "10.0.0.1", "192.168.0.1")
+	c := fake.NewClientBuilder().WithScheme(newTestScheme(t)).WithObjects(m, p).Build()
+	fc := &fakeCtrl{}
+	r := &FluidCRMigrationReconciler{Client: c, CtrlClient: fc}
+
+	if _, err := r.reconcileDelete(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Finalizers) != 0 {
+		t.Fatal("finalizer retained")
+	}
+	if _, resumes := fc.counts(); resumes != 0 {
+		t.Fatalf("resume calls = %d, want 0 for already resumed historical checkpoint", resumes)
+	}
+}
+
+func TestDeletionStillResumesActivePausedCheckpoint(t *testing.T) {
+	m := newTestMigration()
+	m.Finalizers = []string{FinalizerName}
+	m.Status.Pods = []fluidcr.PodMigrationStatus{{
+		PodName:             "p0",
+		PodUID:              "uid-p0",
+		Phase:               fluidcr.PodPhaseAppCheckpointed,
+		AppCheckpointResult: "checkpoint-ready",
+	}}
+	p := newTestPod("p0", "10.0.0.1", "192.168.0.1")
+	c := fake.NewClientBuilder().WithScheme(newTestScheme(t)).WithObjects(m, p).Build()
+	fc := &fakeCtrl{}
+	r := &FluidCRMigrationReconciler{Client: c, CtrlClient: fc}
+
+	if _, err := r.reconcileDelete(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Finalizers) != 0 {
+		t.Fatal("finalizer retained")
+	}
+	if _, resumes := fc.counts(); resumes != 1 {
+		t.Fatalf("resume calls = %d, want 1 for active paused checkpoint", resumes)
+	}
+}
+
 type unavailableDeletionClient struct{ client.Client }
 
 func (c unavailableDeletionClient) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {

@@ -15,6 +15,7 @@ import time
 from typing import Dict, List, Optional
 
 from fluidcr.ctrl import (
+    _pod_identity,
     ensure_api_server_started,
     record_runtime_status,
     register_worker_pid,
@@ -77,6 +78,14 @@ def _build_env() -> Dict[str, str]:
     else:
         env["PYTHONPATH"] = _PAYLOAD_DIR
     env["FLUIDCR_CHECKPOINT_PATH"] = CHECKPOINT_PATH
+    for key, value in _pod_identity().items():
+        if value:
+            env_key = {
+                "podName": "FLUIDCR_POD_NAME",
+                "podUID": "FLUIDCR_POD_UID",
+                "nodeName": "FLUIDCR_NODE_NAME",
+            }[key]
+            env[env_key] = value
     restore_path = restore_checkpoint_path(CHECKPOINT_PATH)
     if restore_path != CHECKPOINT_PATH:
         env["FLUIDCR_RESTORE_CHECKPOINT_PATH"] = restore_path

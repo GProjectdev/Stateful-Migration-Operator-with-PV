@@ -574,6 +574,56 @@ func TestVerifiedPartialReceiptIsImmutableButMismatchesAreNotFrozen(t *testing.T
 	if !groupcontract.PartialTargetVerified(&current) {
 		t.Fatalf("verified partial plan receipt not propagated to member: %v", current.Annotations)
 	}
+	t.Run("partial survivor status evidence must be exact", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			mutate func(*api.RestoreRequest)
+		}{
+			{"missing survivor", func(r *api.RestoreRequest) { r.Status.Verification.Survivors = nil }},
+			{"extra duplicate rank", func(r *api.RestoreRequest) {
+				r.Status.Verification.Survivors = append(r.Status.Verification.Survivors, r.Status.Verification.Survivors[0])
+			}},
+			{"wrong uid", func(r *api.RestoreRequest) { r.Status.Verification.Survivors[0].PodUID = "other-survivor" }},
+			{"wrong kind", func(r *api.RestoreRequest) { r.Status.Verification.Survivors[0].StateEvidence.Kind = "runtime-sample" }},
+			{"missing observedAt", func(r *api.RestoreRequest) { r.Status.Verification.Survivors[0].StateEvidence.ObservedAt = "" }},
+			{"bad observedAt", func(r *api.RestoreRequest) {
+				r.Status.Verification.Survivors[0].StateEvidence.ObservedAt = "not-a-time"
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				candidate := got.DeepCopy()
+				tc.mutate(candidate)
+				if completedOperationReceiptMatches(candidate) {
+					t.Fatalf("invalid survivor status evidence was accepted: %+v", candidate.Status.Verification.Survivors)
+				}
+			})
+		}
+	})
+	t.Run("changed desired spec cannot use durable plan receipt", func(t *testing.T) {
+		changedReq, changedCP := fixture()
+		changedReq.Annotations = map[string]string{annotationRecoveryOperation: "operation-2"}
+		makeSameClusterPartial(changedReq, changedCP)
+		changedPlan, err := desiredPlan(changedReq, changedCP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changedPlan.Generation = 1
+		changedReq.Status = got.Status
+		changedReq.Status.PlanName = changedPlan.Name
+		changedReq.Status.Verification.Operation = "operation-1"
+		changedReq.Status.Verification.SourceFence.Operation = "operation-1"
+		receipt, err := groupcontract.EncodePartialTargetVerified(changedPlan, "operation-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		changedPlan.Annotations = map[string]string{groupcontract.PartialTargetVerifiedAnnotation: receipt}
+		changedPlan.Spec.Pods[0].TargetNode = "changed-node"
+		changedPlan.Status.Clusters = []api.ClusterStatus{{ClusterName: changedReq.Spec.TargetCluster, ObservedGeneration: 1, Phase: "Failed", Message: "changed plan should not be certified"}}
+		checked := reconcile(t, testClient(t, changedReq, changedCP, changedPlan), changedReq)
+		if checked.Status.Phase != "Failed" {
+			t.Fatalf("changed desired spec was frozen by durable receipt: %+v", checked.Status)
+		}
+	})
 	t.Run("changed plan is not backfilled", func(t *testing.T) {
 		changedReq, changedCP := fixture()
 		changedReq.Annotations = map[string]string{annotationRecoveryOperation: "operation-1"}

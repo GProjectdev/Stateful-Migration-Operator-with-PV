@@ -62,6 +62,7 @@ func TestSuspensionPermissionsAreControlPlaneOnly(t *testing.T) {
 		"migration.dcnlab.com/pvmetadata":      "get",
 		"training.dcnlab.com/trainingruntimes": "get,list,watch",
 		"fluidcr.dcnlab.com/fluidcrmigrations": "get,list,watch,patch,update",
+		"migration.dcnlab.com/restoreplans":    "get,list,watch,create,patch",
 	}
 	for _, entry := range role["rules"].([]interface{}) {
 		rule := entry.(map[string]interface{})

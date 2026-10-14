@@ -24,7 +24,7 @@ class SurvivorResumeTests(unittest.TestCase):
                 package = types.ModuleType("fluidcr")
                 package.log = Mock()
                 package.clear_migration_flags = Mock()
-                with patch.dict(sys.modules, {"fluidcr": package, "fluidcr.ctrl": ctrl}), patch.dict(os.environ, {"FLUIDCR_CHECKPOINT_PATH": ckpt, "FLUIDCR_POD_UID": "uid"}), patch.object(d, "_destroy_pg_safely"), patch.object(d, "_write_pause_lock"), patch.object(d, "_wait_for_pause_lock_removal"), patch.object(d, "_reinit_process_group"), patch.object(d, "read_survivor_proof", return_value=proof), patch.object(d, "rebuild_tracked_ddp", side_effect=RuntimeError("failed") if mode == "rebuild-failed" else None):
+                with patch.dict(sys.modules, {"fluidcr": package, "fluidcr.ctrl": ctrl}), patch.dict(os.environ, {"FLUIDCR_CHECKPOINT_PATH": ckpt, "FLUIDCR_POD_UID": "uid", "FLUIDCR_NODE_NAME": "node"}), patch.object(d, "_destroy_pg_safely"), patch.object(d, "_write_pause_lock"), patch.object(d, "_wait_for_pause_lock_removal"), patch.object(d, "_reinit_process_group"), patch.object(d, "read_survivor_proof", return_value=proof), patch.object(d, "rebuild_tracked_ddp", side_effect=RuntimeError("failed") if mode == "rebuild-failed" else None):
                     ctrl._write_status(ckpt, {"checkpointID": "old-loaded-round"})
                     if mode == "success":
                         d.survivor_pause_and_rebuild()
@@ -60,3 +60,80 @@ class SurvivorResumeTests(unittest.TestCase):
                         self.assertEqual(body["checkpointID"], "partial-round" if mode == "parked" else loaded)
                         self.assertEqual("survivorResume" in body, mode in ("resumed", "no-gpu"))
                         self.assertEqual(body["checkpointReady"], mode not in ("parked", "no-gpu"))
+
+    def test_identity_files_override_stale_env_and_can_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            identity_dir = Path(temp) / "pod-identity"
+            identity_dir.mkdir()
+            (identity_dir / "name").write_text("trainer-new")
+            (identity_dir / "uid").write_text("uid-new")
+            (identity_dir / "node").write_text("node-new")
+            with patch.dict(os.environ, {
+                "FLUIDCR_IDENTITY_DIR": str(identity_dir),
+                "FLUIDCR_POD_NAME": "trainer-old",
+                "FLUIDCR_POD_UID": "uid-old",
+                "FLUIDCR_NODE_NAME": "node-old",
+            }, clear=True):
+                self.assertEqual(ctrl._pod_identity(), {
+                    "podName": "trainer-new",
+                    "podUID": "uid-new",
+                    "nodeName": "node-new",
+                })
+                (identity_dir / "uid").write_text("uid-newer")
+                (identity_dir / "node").write_text("node-newer")
+                self.assertEqual(ctrl._pod_identity()["podUID"], "uid-newer")
+                self.assertEqual(ctrl._pod_identity()["nodeName"], "node-newer")
+
+    def test_missing_identity_files_fall_back_to_env(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {
+                "FLUIDCR_IDENTITY_DIR": str(Path(temp) / "missing"),
+                "FLUIDCR_POD_NAME": "trainer-env",
+                "FLUIDCR_POD_UID": "uid-env",
+                "FLUIDCR_NODE_NAME": "node-env",
+            }, clear=True):
+                self.assertEqual(ctrl._pod_identity(), {
+                    "podName": "trainer-env",
+                    "podUID": "uid-env",
+                    "nodeName": "node-env",
+                })
+
+    def test_owned_survivor_resume_rejects_mismatched_current_identity(self):
+        source = Path(__file__).resolve().parents[1] / "fluidcr" / "distributed.py"
+        spec = importlib.util.spec_from_file_location("distributed_identity_test", source)
+        d = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(d)
+        with tempfile.TemporaryDirectory() as temp:
+            ckpt = str(Path(temp) / "latest.pt")
+            identity_dir = Path(temp) / "pod-identity"
+            identity_dir.mkdir()
+            (identity_dir / "name").write_text("trainer-new")
+            (identity_dir / "uid").write_text("uid-new")
+            (identity_dir / "node").write_text("node-new")
+            proof = {
+                "pid": os.getpid(),
+                "podUID": "uid-old",
+                "nodeName": "node-old",
+                "restoreOwnedResume": True,
+                "releaseAuthorizedAt": "approved",
+            }
+            package = types.ModuleType("fluidcr")
+            package.log = Mock()
+            package.clear_migration_flags = Mock()
+            with patch.dict(sys.modules, {"fluidcr": package, "fluidcr.ctrl": ctrl}), \
+                 patch.dict(os.environ, {
+                     "FLUIDCR_CHECKPOINT_PATH": ckpt,
+                     "FLUIDCR_IDENTITY_DIR": str(identity_dir),
+                     "FLUIDCR_POD_UID": "uid-old",
+                     "FLUIDCR_NODE_NAME": "node-old",
+                 }), \
+                 patch.object(d, "_destroy_pg_safely"), \
+                 patch.object(d, "_write_pause_lock"), \
+                 patch.object(d, "_wait_for_pause_lock_removal"), \
+                 patch.object(d, "_reinit_process_group"), \
+                 patch.object(d, "read_survivor_proof", return_value=proof), \
+                 patch.object(d, "rebuild_tracked_ddp"):
+                ctrl._write_status(ckpt, {"checkpointID": "old-loaded-round"})
+                with self.assertRaisesRegex(RuntimeError, "authorized release receipt"):
+                    d.survivor_pause_and_rebuild()
+            self.assertFalse((Path(temp) / ".fluidcr-survivor.json").exists())

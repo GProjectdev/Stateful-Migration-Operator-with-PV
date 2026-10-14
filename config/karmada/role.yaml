@@ -62,7 +62,8 @@
         "get",
         "list",
         "watch",
-        "create"
+        "create",
+        "patch"
       ]
     },
     {

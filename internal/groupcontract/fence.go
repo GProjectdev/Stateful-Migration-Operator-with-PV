@@ -30,11 +30,18 @@ func EncodePartialTargetVerified(plan *api.RestorePlan, operation string) (strin
 }
 
 func PartialTargetVerified(plan *api.RestorePlan) bool {
+	return PartialTargetVerifiedForOperation(plan, "")
+}
+
+func PartialTargetVerifiedForOperation(plan *api.RestorePlan, operation string) bool {
 	if plan.Spec.PartialRestore == nil || plan.Spec.RequestUID == "" || plan.Generation <= 0 {
 		return false
 	}
 	var r PartialTargetReceipt
 	if err := json.Unmarshal([]byte(plan.Annotations[PartialTargetVerifiedAnnotation]), &r); err != nil {
+		return false
+	}
+	if operation != "" && r.Operation != operation {
 		return false
 	}
 	return r.RequestUID == plan.Spec.RequestUID && r.PlanGeneration == plan.Generation && r.CheckpointID == plan.Spec.CheckpointRef.CheckpointID && r.Operation != ""

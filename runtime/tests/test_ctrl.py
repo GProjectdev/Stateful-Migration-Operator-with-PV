@@ -725,10 +725,10 @@ class ConfirmedCheckpointTests(unittest.TestCase):
 class FluidCRPayloadParityTests(unittest.TestCase):
     EXPECTED_SHA256 = {
         # Keep checkpoint producer, load validation, and control API paired.
-        "ctrl.py": "b36ed1c556d254782c6b410b160df44d34e858a04a59b0a8adca61491102f3d2",
+        "ctrl.py": "0ecd93e5b56339ad107cd0cbfc41fc2071bed85c9d6b71cfd5298947c7eedff9",
         "backends/pytorch.py": "f82ff8426f3bc17d08714b4b7704b63d2960edaca5f81712897da2efbd076a1a",
         "group_restore.py": "0d22ab37c6ed05fcf44d3b5cc5a7b37288de2f57f4ab725bca338dbb3c7917d8",
-        "distributed.py": "af0eddfdddee96f326d9597e984a6198aea1d7bc5f68ad31f6198368000a4663",
+        "distributed.py": "2c91d55e7702bef0f77bf789acad65c1fd5d3cb75d35d77d21a37156ffe6abcc",
     }
 
     def test_stateful_overlay_matches_pinned_fluidcr_payload_hashes(self):

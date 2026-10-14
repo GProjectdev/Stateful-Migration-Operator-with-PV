@@ -83,6 +83,11 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 	}
 	// Completion is an operation receipt, not a perpetual health check. A later
 	// failure is a new operation and must not revoke this operation's evidence.
+	if ok, err := r.completedPartialPlanReceiptMatches(ctx, req); err != nil {
+		return ctrl.Result{}, err
+	} else if ok {
+		return ctrl.Result{}, nil
+	}
 	if completedOperationReceiptMatches(req) {
 		if req.Spec.PartialRestore != nil {
 			if err := r.authorizePartialTargetVerified(ctx, req); err != nil {
@@ -246,11 +251,51 @@ func (r *RestoreReconciler) authorizePartialTargetVerified(ctx context.Context, 
 	if plan.Name != desired.Name || !ownedBy(&plan, req) || !reflect.DeepEqual(plan.Spec, desired.Spec) || !plan.DeletionTimestamp.IsZero() {
 		return nil
 	}
-	return r.patchPartialTargetVerified(ctx, req, &plan)
+	return r.patchPartialTargetVerifiedOperation(ctx, &plan, req.Status.Verification.Operation)
 }
 
+func (r *RestoreReconciler) completedPartialPlanReceiptMatches(ctx context.Context, req *api.RestoreRequest) (bool, error) {
+	if req.Status.Verification == nil || req.Status.PlanName == "" || req.Spec.PartialRestore == nil {
+		return false, nil
+	}
+	if req.Status.Phase != "Verified" {
+		return false, nil
+	}
+	if !completedReceiptIdentityMatches(req) {
+		return false, nil
+	}
+	cp := &unstructured.Unstructured{}
+	cp.SetGroupVersionKind(checkpointGVK)
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Spec.CheckpointRef.Name}, cp); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	ready, err := validateCheckpoint(req, cp)
+	if err != nil || !ready {
+		return false, nil
+	}
+	desired, err := desiredPlan(req, cp)
+	if err != nil {
+		return false, nil
+	}
+	var plan api.RestorePlan
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Status.PlanName}, &plan); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if plan.Name != desired.Name || !ownedBy(&plan, req) || !reflect.DeepEqual(plan.Spec, desired.Spec) || !plan.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	operation := req.Status.Verification.Operation
+	if !groupcontract.PartialTargetVerifiedForOperation(&plan, operation) || !completedPartialOperationReceiptMatchesSpec(req, plan.Spec.Pods, plan.Spec.PartialRestore, operation) {
+		return false, nil
+	}
+	return true, nil
+}
 func (r *RestoreReconciler) patchPartialTargetVerified(ctx context.Context, req *api.RestoreRequest, plan *api.RestorePlan) error {
-	receipt, err := groupcontract.EncodePartialTargetVerified(plan, req.Annotations[annotationRecoveryOperation])
+	return r.patchPartialTargetVerifiedOperation(ctx, plan, req.Annotations[annotationRecoveryOperation])
+}
+
+func (r *RestoreReconciler) patchPartialTargetVerifiedOperation(ctx context.Context, plan *api.RestorePlan, operation string) error {
+	receipt, err := groupcontract.EncodePartialTargetVerified(plan, operation)
 	if err != nil {
 		return err
 	}
@@ -475,21 +520,34 @@ func stableVerification(req *api.RestoreRequest, next *api.RestoreVerification) 
 }
 
 func completedOperationReceiptMatches(req *api.RestoreRequest) bool {
-	if req.UID == "" || req.Generation <= 0 || req.Status.Phase != "Verified" || req.Status.ObservedGeneration != req.Generation || req.Status.Verification == nil {
+	if req.Status.Phase != "Verified" || !completedReceiptIdentityMatches(req) {
 		return false
 	}
 	v := req.Status.Verification
-	if v.RequestUID != string(req.UID) || v.CheckpointID != req.Spec.CheckpointRef.CheckpointID || v.SourceCluster != req.Spec.SourceCluster || v.TargetCluster != req.Spec.TargetCluster || v.VerifiedAt.IsZero() {
-		return false
-	}
 	if req.Spec.GroupRestore != nil {
 		return v.Operation == req.Spec.GroupRestore.OperationUID
 	}
-	if req.Spec.PartialRestore == nil {
+	return completedPartialOperationReceiptMatches(req, req.Annotations[annotationRecoveryOperation])
+}
+
+func completedReceiptIdentityMatches(req *api.RestoreRequest) bool {
+	if req.UID == "" || req.Generation <= 0 || req.Status.ObservedGeneration != req.Generation || req.Status.Verification == nil {
 		return false
 	}
-	operation := req.Annotations[annotationRecoveryOperation]
-	if operation == "" || v.Operation != operation || v.SourceFence.Operation != operation || v.SourceFenced != req.Spec.SourceFenced || !v.SourceFence.Fenced || v.SourceFence.EvidenceID == "" || v.SourceFence.ObservedAt == "" {
+	v := req.Status.Verification
+	return v.RequestUID == string(req.UID) && v.CheckpointID == req.Spec.CheckpointRef.CheckpointID && v.SourceCluster == req.Spec.SourceCluster && v.TargetCluster == req.Spec.TargetCluster && !v.VerifiedAt.IsZero()
+}
+
+func completedPartialOperationReceiptMatches(req *api.RestoreRequest, operation string) bool {
+	return completedPartialOperationReceiptMatchesSpec(req, req.Spec.Pods, req.Spec.PartialRestore, operation)
+}
+
+func completedPartialOperationReceiptMatchesSpec(req *api.RestoreRequest, pods []api.RestorePod, partial *api.PartialRestoreSpec, operation string) bool {
+	if partial == nil || operation == "" || req.Status.Verification == nil {
+		return false
+	}
+	v := req.Status.Verification
+	if v.Operation != operation || v.SourceFence.Operation != operation || v.SourceFenced != req.Spec.SourceFenced || !v.SourceFence.Fenced || v.SourceFence.EvidenceID == "" || v.SourceFence.ObservedAt == "" {
 		return false
 	}
 	if req.Spec.TrainingRuntimeRef.Name != "" && v.TrainingRuntimeRef.Name != req.Spec.TrainingRuntimeRef.Name {
@@ -501,11 +559,11 @@ func completedOperationReceiptMatches(req *api.RestoreRequest) bool {
 	if v.TrainingRuntimeRef.Name == "" || v.TrainingRuntimeRef.UID == "" {
 		return false
 	}
-	if !reflect.DeepEqual(v.PreservedSurvivors, req.Spec.PartialRestore.PreservedSurvivors) || v.PartialRestore == nil || !v.PartialRestore.PreventPeriodicResume || len(v.PartialRestore.TargetRanks) != len(req.Spec.Pods) || len(v.Survivors) != len(req.Spec.PartialRestore.PreservedSurvivors) {
+	if !reflect.DeepEqual(v.PreservedSurvivors, partial.PreservedSurvivors) || v.PartialRestore == nil || !v.PartialRestore.PreventPeriodicResume || len(v.PartialRestore.TargetRanks) != len(pods) || !completedSurvivorEvidenceMatches(v.Survivors, partial.PreservedSurvivors) {
 		return false
 	}
 	archives := map[int64]string{}
-	for _, pod := range req.Spec.Pods {
+	for _, pod := range pods {
 		if len(pod.Archives) != 1 {
 			return false
 		}
@@ -520,7 +578,29 @@ func completedOperationReceiptMatches(req *api.RestoreRequest) bool {
 	}
 	return len(seen) == len(archives)
 }
-
+func completedSurvivorEvidenceMatches(got []api.SurvivorStateEvidence, want []api.SurvivorEvidence) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	wantByRank := map[int64]string{}
+	for _, survivor := range want {
+		if survivor.PodUID == "" || wantByRank[survivor.Rank] != "" {
+			return false
+		}
+		wantByRank[survivor.Rank] = survivor.PodUID
+	}
+	seen := map[int64]bool{}
+	for _, survivor := range got {
+		if seen[survivor.Rank] || survivor.PodUID == "" || survivor.PodUID != wantByRank[survivor.Rank] || survivor.StateEvidence.Kind != "pause-lock" {
+			return false
+		}
+		if _, err := parseObservedAt(survivor.StateEvidence.ObservedAt); err != nil {
+			return false
+		}
+		seen[survivor.Rank] = true
+	}
+	return len(seen) == len(wantByRank)
+}
 func partialVerification(req *api.RestoreRequest, plan *api.RestorePlan, targetPods []api.PodStatus, sourceFences []api.SourcePodFenceStatus, observedAt string) (*api.PartialRestoreVerification, api.SourceFenceEvidence, []api.SurvivorStateEvidence, error) {
 	operation := req.Annotations[annotationRecoveryOperation]
 	targetUIDs := map[string]string{}

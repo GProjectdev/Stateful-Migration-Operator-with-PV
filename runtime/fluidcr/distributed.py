@@ -390,13 +390,21 @@ def _survivor_proof_path() -> str:
     return os.path.join(os.path.dirname(ckpt), ".fluidcr-survivor.json")
 
 
+def _pod_identity() -> Dict[str, str]:
+    try:
+        from fluidcr.ctrl import _pod_identity as ctrl_pod_identity
+
+        return ctrl_pod_identity()
+    except Exception:
+        return {
+            "podName": _env_text("FLUIDCR_POD_NAME", "POD_NAME", "HOSTNAME"),
+            "podUID": _env_text("FLUIDCR_POD_UID", "POD_UID", "K8S_POD_UID"),
+            "nodeName": _env_text("FLUIDCR_NODE_NAME", "NODE_NAME"),
+        }
+
+
 def _pod_uid() -> str:
-    return (
-        os.environ.get("FLUIDCR_POD_UID")
-        or os.environ.get("POD_UID")
-        or os.environ.get("K8S_POD_UID")
-        or ""
-    ).strip()
+    return _pod_identity().get("podUID", "").strip()
 
 
 def _env_text(*names: str) -> str:
@@ -419,15 +427,16 @@ def _write_pause_lock(path: str, manifest: Optional[Dict[str, Any]] = None) -> N
         os.makedirs(parent, exist_ok=True)
     manifest = read_manifest() if manifest is None else manifest
     rank = _env_int("RANK")
+    identity = _pod_identity()
     proof = {
         "state": "SurvivorParked",
         "phase": "SurvivorPaused",
         "pid": os.getpid(),
         "pauseLockPID": os.getpid(),
         "rank": rank,
-        "podName": _env_text("FLUIDCR_POD_NAME", "POD_NAME", "HOSTNAME"),
-        "podUID": _pod_uid(),
-        "nodeName": _env_text("FLUIDCR_NODE_NAME", "NODE_NAME"),
+        "podName": identity.get("podName", ""),
+        "podUID": identity.get("podUID", ""),
+        "nodeName": identity.get("nodeName", ""),
         "checkpointID": manifest.get("checkpointID", ""),
         "generation": manifest.get("generation", read_generation()),
         "pauseLockPath": path,
@@ -522,13 +531,19 @@ def survivor_pause_and_rebuild(manifest: Optional[Dict[str, Any]] = None) -> Non
     rebuild_tracked_ddp()
     clear_migration_flags()
     proof = read_survivor_proof()
+    identity = _pod_identity()
     owned = proof.get("restoreOwnedResume")
-    if (proof.get("pid") != os.getpid() or proof.get("podUID") != _pod_uid()
+    if (proof.get("pid") != os.getpid() or proof.get("podUID") != identity.get("podUID")
             or (owned and not proof.get("releaseAuthorizedAt"))):
         raise RuntimeError("survivor rebuild lacks matching authorized release receipt")
     from fluidcr.ctrl import _read_status, _default_checkpoint_path
     loaded = _read_status(_default_checkpoint_path()).get("checkpointID", "")
-    proof.update(state="SurvivorResumed" if owned else "SurvivorRejoined", phase="Running", resumedAt=_utc_now(),
-                 loadedCheckpointID=loaded)
+    proof.update(
+        identity,
+        state="SurvivorResumed" if owned else "SurvivorRejoined",
+        phase="Running",
+        resumedAt=_utc_now(),
+        loadedCheckpointID=loaded,
+    )
     _atomic_write(_survivor_proof_path(), json.dumps(proof, sort_keys=True), ".survivor-")
     log("Survivor rejoined. Resuming training.")

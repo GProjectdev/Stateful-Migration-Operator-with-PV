@@ -971,7 +971,7 @@ func (r *FluidCRMigrationReconciler) reconcileDelete(ctx context.Context, m *flu
 				for i := range pods {
 					pod := &pods[i]
 					ps := getPodStatus(m, pod.Name)
-					if ps == nil || ps.PodUID == "" || ps.PodUID != string(pod.UID) || ps.AppCheckpointResult == "" {
+					if !needsDeleteResume(ps, pod) {
 						continue
 					}
 					container, cerr := resolveContainerName(pod, m.Spec.Container)
@@ -1025,6 +1025,14 @@ func (r *FluidCRMigrationReconciler) resolveDeletionPods(ctx context.Context, m 
 		pods = append(pods, pod)
 	}
 	return pods, nil
+}
+
+func needsDeleteResume(ps *fluidcrv1alpha1.PodMigrationStatus, pod *corev1.Pod) bool {
+	return ps != nil &&
+		ps.PodUID != "" &&
+		ps.PodUID == string(pod.UID) &&
+		ps.AppCheckpointResult != "" &&
+		ps.Phase != fluidcrv1alpha1.PodPhaseResumed
 }
 
 // appCheckpoint signals the in-pod control API on every target concurrently.
