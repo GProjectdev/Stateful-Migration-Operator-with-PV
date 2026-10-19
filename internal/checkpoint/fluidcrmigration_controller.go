@@ -133,6 +133,9 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if migration.DeletionTimestamp != nil {
 		return r.reconcileDelete(ctx, &migration)
 	}
+	if operationUID := migration.Annotations[groupFallbackCancelAnnotation]; operationUID != "" {
+		return r.reconcileGroupFallbackCancel(ctx, &migration, operationUID)
+	}
 
 	if !controllerutil.ContainsFinalizer(&migration, FinalizerName) {
 		controllerutil.AddFinalizer(&migration, FinalizerName)
