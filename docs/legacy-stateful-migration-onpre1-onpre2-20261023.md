@@ -374,17 +374,185 @@ kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n stateful-migration get service chec
 
 ## 8. 단일 StatefulSet + NFS 실습 워크로드
 
-먼저 demo-app을 빌드한다. boot_id/counter는 메모리에만 존재하고 marker.txt만 PV에서 읽는다. 동일 파일만 보이는 경우와 프로세스 메모리가 복원된 경우를 구분하기 위한 CPU 실습 앱이다. 이 앱과 checkpoint runtime의 조합은 현장에서 검증해야 한다.
+### 8.1 member1 NFS 서버와 양쪽 Provisioner 준비
+
+참고: [Karmada_velero NFS 구성](https://github.com/GProjectdev/Karmada_velero#nfs-구성), [서버 스크립트](https://github.com/GProjectdev/Karmada_velero/blob/main/setup-nfs-server.sh), [Provisioner Helm values](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner/blob/master/charts/nfs-subdir-external-provisioner/values.yaml).
+
+서버는 member1(192.168.30.101), export는 /mnt/nfs이다. 원본 서버 스크립트의 실제 허용 대역은 192.168.40.0/24이므로 그대로 실행하지 않는다. 아래는 현재 두 worker IP만 허용한다. root_squash를 유지하고 실습 디렉터리를 nobody 소유로 만든다. member1 서버 자체가 중단되면 onpre2도 이 스토리지를 사용할 수 없다. 이 구성은 member1이 살아 있는 상태의 워크로드 이동 시연용이며 스토리지 HA가 아니다.
+
+**member1의 호스트 터미널에서 실행:** 기존 /mnt/nfs export가 있다면 먼저 `sudo exportfs -v`로 확인하고 중복 규칙을 만들지 않는다. 아래는 신규 설정 기준이다. 기존 데이터에 재귀 chown/chmod를 하지 않는다.
+
+~~~bash
+sudo apt-get update
+sudo apt-get install -y nfs-kernel-server nfs-common
+sudo mkdir -p /mnt/nfs/legacy-demo
+sudo chown nobody:nogroup /mnt/nfs /mnt/nfs/legacy-demo
+sudo chmod 0777 /mnt/nfs /mnt/nfs/legacy-demo
+sudo mkdir -p /etc/exports.d
+sudo tee /etc/exports.d/legacy-demo.exports >/dev/null <<'EOF'
+/mnt/nfs 192.168.30.101(rw,sync,no_subtree_check,root_squash) 192.168.30.102(rw,sync,no_subtree_check,root_squash)
+EOF
+sudo systemctl enable --now nfs-kernel-server
+sudo exportfs -ra
+sudo exportfs -v
+~~~
+
+0777은 UID가 다른 실습 앱과 provisioner의 쓰기를 허용하기 위한 실습용 설정이다. export 접근은 위 두 IP로 제한한다. 서버 방화벽이 켜져 있다면 두 worker에서 TCP 2049에 접근 가능하게 허용한다. 아래는 NFSv4.1을 사용한다.
+
+**member2의 호스트 터미널에서 실행:** 이후 worker를 추가하면 그 worker에도 nfs-common 및 export 접근 권한이 필요하다.
+
+~~~bash
+sudo apt-get update
+sudo apt-get install -y nfs-common
+~~~
+
+**member1과 member2 각각의 호스트에서 실행:** 두 서버 모두 같은 marker 파일을 읽고 쓸 수 있어야 한다. 실패하면 Provisioner 설치보다 NFS 연결부터 해결한다.
+
+~~~bash
+sudo mkdir -p /mnt/legacy-nfs-check
+sudo mount -t nfs -o vers=4.1 192.168.30.101:/mnt/nfs /mnt/legacy-nfs-check
+printf 'NFS client: %s\n' "$(hostname)" | sudo tee "/mnt/legacy-nfs-check/legacy-demo/mount-check-$(hostname).txt"
+ls -l /mnt/legacy-nfs-check/legacy-demo
+sudo umount /mnt/legacy-nfs-check
+~~~
+
+**이후 MGMT의 기존 root 터미널에서 실행:** Helm이 없다면 참고 저장소와 동일한 Helm 3 설치 경로를 사용한다.
+
+~~~bash
+if ! command -v helm >/dev/null 2>&1; then
+  curl -fsSL -o "$DEMO_ROOT/rendered/get-helm-3.sh" \
+    https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+  bash "$DEMO_ROOT/rendered/get-helm-3.sh"
+fi
+helm version --short
+export NFS_SERVER=192.168.30.101
+export NFS_PATH=/mnt/nfs/legacy-demo
+helm repo add nfs-subdir-external-provisioner \
+  https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+helm repo update
+cat > "$DEMO_ROOT/rendered/nfs-values.yaml" <<'EOF'
+nfs:
+  server: 192.168.30.101
+  path: /mnt/nfs
+  mountOptions:
+    - vers=4.1
+storageClass:
+  name: legacy-nfs-client
+  defaultClass: false
+  reclaimPolicy: Retain
+  onDelete: retain
+  archiveOnDelete: true
+  accessModes: ReadWriteMany
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: node-role.kubernetes.io/master
+    operator: Exists
+    effect: NoSchedule
+EOF
+helm upgrade --install legacy-nfs \
+  nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+  --version 4.0.18 --kubeconfig "$ONPRE1_KUBECONFIG" \
+  --namespace nfs-provisioner --create-namespace \
+  -f "$DEMO_ROOT/rendered/nfs-values.yaml" \
+  --set storageClass.provisionerName=legacy.demo/onpre1-nfs \
+  --wait --timeout 5m
+helm upgrade --install legacy-nfs \
+  nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+  --version 4.0.18 --kubeconfig "$ONPRE2_KUBECONFIG" \
+  --namespace nfs-provisioner --create-namespace \
+  -f "$DEMO_ROOT/rendered/nfs-values.yaml" \
+  --set storageClass.provisionerName=legacy.demo/onpre2-nfs \
+  --wait --timeout 5m
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n nfs-provisioner get deploy,pods
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner get deploy,pods
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" get storageclass legacy-nfs-client
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" get storageclass legacy-nfs-client
+~~~
+
+각 Helm 설치가 실패하면 다음 단계로 넘어가지 않는다. Pending이면 Pod Events에서 taint/마운트 오류를, ImagePullBackOff이면 registry 접근을 확인한다. 두 클러스터가 같은 export를 사용하지만 provisionerName은 구분한다. Karmada API나 MGMT Kubernetes에 Provisioner를 설치하는 것이 아니다.
+
+**Provisioner 동적 할당 확인 (MGMT):** 새 이름의 테스트 PVC만 사용하며 실습 StatefulSet PVC와 분리한다.
+
+~~~bash
+cat > "$DEMO_ROOT/rendered/nfs-smoke.yaml" <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: legacy-nfs-smoke
+  namespace: nfs-provisioner
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: legacy-nfs-client
+  resources:
+    requests:
+      storage: 32Mi
+EOF
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" apply -f "$DEMO_ROOT/rendered/nfs-smoke.yaml"
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" apply -f "$DEMO_ROOT/rendered/nfs-smoke.yaml"
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n nfs-provisioner wait \
+  --for=jsonpath='{.status.phase}'=Bound pvc/legacy-nfs-smoke --timeout=120s
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner wait \
+  --for=jsonpath='{.status.phase}'=Bound pvc/legacy-nfs-smoke --timeout=120s
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n nfs-provisioner get pvc legacy-nfs-smoke -o wide
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner get pvc legacy-nfs-smoke -o wide
+~~~
+
+테스트 PVC는 유지해도 된다. Retain 정책이므로 삭제해도 PV와 NFS 디렉터리가 자동 정리되지 않는다. PVC Bound는 동적 할당 확인이며 앱 Pod의 실제 I/O는 아래 demo 단계에서 검증한다.
+
+**중요:** Provisioner는 설치하고 별도 PVC로 검증하지만, 아래 migration-demo StatefulSet은 기존 방식대로 정적 PV + `storageClassName: ""`를 사용한다. 이를 `legacy-nfs-client`로 바꾸지 않는다. 대상에서 동적 할당이 먼저 일어나 새 디렉터리를 연결하는 것을 피하고, 구버전 PV migration이 동일한 `/mnt/nfs/legacy-demo` 경로를 연결하도록 하기 위함이다. 동적 할당 PVC 자체의 migration 시연은 별도로 경합과 PV annotation 처리를 검증해야 한다.
+
+### 8.2 영상 StatefulSet과 volumeClaimTemplates 준비
+
+
+### 영상 데모의 이미지와 성공 기준
+
+예시를 비교했다. [공식 nginx 이미지](https://hub.docker.com/_/nginx)는 MP4 파일 제공에 적합하지만 HTML video의 재생 시각이 브라우저 상태여서 서버 메모리 복원 증거로 부족하다. 이번에는 [공식 Python 이미지](https://hub.docker.com/_/python)의 `python:3.11-slim-bookworm`에 제공된 video-demo/app.py를 넣어 `docker.io/ACCOUNT/legacy-video-demo:TAG`를 빌드한다. 이 이미지는 아직 사전 게시된 제품 이미지가 아니라 이 가이드에서 직접 만드는 시연용 이미지다.
+
+영상 예시는 [Big Buck Bunny](https://peach.blender.org/download/)이며 [CC BY 3.0, Blender Foundation 저작자 표시](https://peach.blender.org/about/)를 유지한다. ffmpeg로 원본의 처음 120초를 640px/5fps JPEG로 준비하며 무음이다. JPEG는 브라우저 표시 방식이고 프레임 위치는 서버 Python 프로세스의 RAM에만 저장된다. 브라우저 localStorage나 PV에서 진행 위치를 복구하지 않는다. GPU/실시간 디코더/오디오 복원 시연은 아니다.
+
+- PV: 원본 MP4, 미리 추출한 영상 프레임, marker.txt를 저장한다.
+- RAM: boot_id, 현재 frame/seconds, paused 상태를 저장한다.
+- 동일 boot_id와 정지 프레임으로 복원 후 frame이 증가해야 메모리 복원의 증거가 된다. 같은 영상 파일이나 브라우저에 남은 화면만으로 성공으로 판정하지 않는다.
+- 일반 신규 프로세스는 boot_id가 바뀌고 frame=0부터 시작한다.
+- 체크포인트는 장애 직전 모든 상태를 자동 보존하지 않는다. 재생 중 갑작스러운 장애라면 마지막 백업 지점으로 되돌아간다. 정확히 정지한 장면의 재개를 촬영할 때는 pause -> checkpoint 완료 -> 서비스 중단 -> restore -> resume 순서를 명시한다. 이는 수동 복구 시연이며 무중단 서비스나 자동 장애 복구를 입증하지 않는다.
+
+**member1에서 영상 파일 준비:** 8.1의 /mnt/nfs/legacy-demo 생성 후, 아직 demo StatefulSet 배포 전 실행한다. 이미 다른 영상 프레임이 있다면 섞지 말고 별도 디렉터리를 사용한다. 직접 촬영한 MP4를 아래 input.mp4로 복사해도 된다.
+
+~~~bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg curl
+sudo mkdir -p /mnt/nfs/legacy-demo/video/frames
+sudo curl -fL --retry 3 \
+  https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4 \
+  -o /mnt/nfs/legacy-demo/video/input.mp4
+sudo ffmpeg -nostdin -n -i /mnt/nfs/legacy-demo/video/input.mp4 \
+  -t 120 -vf 'fps=5,scale=640:-2' -q:v 4 \
+  /mnt/nfs/legacy-demo/video/frames/%06d.jpg
+printf '%s\n' 'Big Buck Bunny (c) 2008 Blender Foundation / www.bigbuckbunny.org | CC BY 3.0 | resized, silent 5fps excerpt' \
+  | sudo tee /mnt/nfs/legacy-demo/video/ATTRIBUTION.txt
+sudo chmod -R a+rX /mnt/nfs/legacy-demo/video
+find /mnt/nfs/legacy-demo/video/frames -name '*.jpg' | wc -l
+du -sh /mnt/nfs/legacy-demo/video
+~~~
+
+영상 다운로드가 실패하면 공식 다운로드 페이지에서 파일을 받아 같은 input.mp4 경로로 복사한 뒤 ffmpeg부터 진행한다. 프레임은 600개를 예상하며 원본 길이가 120초 미만이면 더 적다. NFS의 PVC 요청 용량은 실제 사용량을 강제하는 quota가 아니므로 디스크 여유를 확인한다.
+
+**MGMT에서 이미지 빌드:** 아래 블록과 이후 StatefulSet YAML을 사용한다. 다른 데모를 이미 demo 이름으로 배포했다면 무작정 덮어쓰지 않는다. 먼저 기존 migration을 마치고 CR 및 checkpoint 이미지의 대상이 이번 영상 Pod인지 구분한다. volumeClaimTemplates는 일반적인 업데이트로 변경할 수 없으므로 최초 배포 전에 manifest를 확정한다.
+
 
 ~~~bash
 buildah bud --authfile "$REGISTRY_AUTH_FILE" --format docker \
-  -t "docker.io/$ACCOUNT/legacy-memory-demo:$TAG" "$ASSETS/demo-app" &&
+  -t "docker.io/$ACCOUNT/legacy-video-demo:$TAG" "$ASSETS/video-demo" &&
 buildah push --authfile "$REGISTRY_AUTH_FILE" \
-  "docker.io/$ACCOUNT/legacy-memory-demo:$TAG" \
-  "docker://docker.io/$ACCOUNT/legacy-memory-demo:$TAG"
-export NFS_SERVER=REPLACE_WITH_REACHABLE_NFS_IP
-export NFS_PATH=/REPLACE_WITH_DEMO_EXPORT
+  "docker.io/$ACCOUNT/legacy-video-demo:$TAG" \
+  "docker://docker.io/$ACCOUNT/legacy-video-demo:$TAG"
+export NFS_SERVER=192.168.30.101
+export NFS_PATH=/mnt/nfs/legacy-demo
 ~~~
+
+PV 자체는 클러스터 범위 리소스로 별도 생성하고, StatefulSet에는 volumeClaimTemplates로 PVC 템플릿을 넣는다. data 템플릿이 data-demo-0 PVC를 만들고, legacy-demo-source PV의 claimRef와 연결된다. 별도의 앱 PVC manifest를 만들지 않는다.
 
 NFS export는 양쪽 worker에서 마운트 가능해야 한다. 실습 전용 디렉터리, 동일 UID 권한을 사용한다. storageClassName은 비워 두어 대상의 default dynamic provisioner가 새 빈 볼륨을 먼저 만들지 않게 한다.
 
@@ -395,6 +563,7 @@ kind: PersistentVolume
 metadata:
   name: legacy-demo-source
 spec:
+  mountOptions: [vers=4.1]
   capacity:
     storage: 1Gi
   accessModes: [ReadWriteMany]
@@ -439,7 +608,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
       - name: app
-        image: "$ACCOUNT/legacy-memory-demo:$TAG"
+        image: "$ACCOUNT/legacy-video-demo:$TAG"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -490,13 +659,35 @@ kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo get pods,pvc -o wide
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo get pods,pvc
 kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- sh -c 'printf "legacy-pv-demo\n" > /data/marker.txt'
 kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- python -c \
-  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080").read().decode())' \
+  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/state").read().decode())' \
   | tee "$DEMO_ROOT/evidence/source-memory.json"
 kubectl --kubeconfig="$KARMADA_KUBECONFIG" get works -A -l pvsync.karmada.io/type=metadata -o yaml \
   > "$DEMO_ROOT/evidence/pv-metadata.yaml"
 ~~~
 
 metadata Work에 migration-demo.demo/onpre1의 PV spec이 저장되었는지 확인한다. 이 Work의 suspendDispatching=true는 metadata를 저장하기 위한 의도적인 설정이며 오류가 아니다. 이 시점에는 onpre2에 demo Pod/PVC가 없어야 한다. 구버전 restore의 ordinal 추정과 충돌하므로, 이전 시도의 CR/Pod/PVC가 남아 있는 namespace는 재사용하지 않는다.
+
+### 영상 화면 열기와 체크포인트 장면 고정
+
+MGMT의 별도 터미널에서 실행하고 유지한다. 이 터미널에는 ONPRE1_KUBECONFIG를 다시 설정한다.
+
+~~~bash
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo \
+  port-forward pod/demo-0 18080:8080 --address=127.0.0.1
+~~~
+
+사용자 PC에서 `ssh -L 18080:127.0.0.1:18080 root@<MGMT_IP>`를 연결한 다음 브라우저에서 http://127.0.0.1:18080 을 연다. SSH 사용자와 MGMT_IP는 실제 접속값이다. 화면의 boot_id, frame, seconds가 보이게 녹화한다. 단일 브라우저 탭을 사용한다.
+
+원하는 장면에서 **Pause for checkpoint**를 누른다. MGMT의 작업 터미널에서 상태를 저장한다.
+
+~~~bash
+curl --fail -X POST http://127.0.0.1:18080/pause
+curl --fail http://127.0.0.1:18080/state \
+  | tee "$DEMO_ROOT/evidence/source-memory.json"
+~~~
+
+paused=true와 frame>0을 확인한다. 브라우저의 **Disconnect for checkpoint**를 누르고 잠시 후 port-forward 터미널에서 Ctrl+C한다. HTTP 요청이 없는 상태로 다음 9절 백업을 실행한다. 체크포인트에 불필요한 활성 TCP 연결을 포함하지 않기 위한 절차다. HTTP probe는 데모 Pod에 추가하지 않는다.
+
 
 ## 9. 백업 생성
 
@@ -565,7 +756,7 @@ kubectl --kubeconfig="$KARMADA_KUBECONFIG" -n migration-demo patch resourcebindi
   -p '{"spec":{"suspension":{"dispatching":true}}}'
 ~~~
 
-source의 실제 Pod를 중지하여 두 프로세스가 동시에 쓰지 못하게 한다. RB에서 Work로 suspension이 반영되는 과정은 비동기이므로, RB의 dispatching=true만 보고 source를 중지하지 않는다. 아래 조회에서 manifests에 apps/v1 StatefulSet migration-demo/demo가 들어 있는 source Work를 찾고, 그 Work의 spec.suspendDispatching=true를 확인한 뒤 다음 scale 명령을 실행한다. Work 이름은 조회 결과를 사용한다. source의 PVC/PV는 유지한다.
+source의 실제 Pod를 중지하여 두 프로세스가 동시에 쓰지 못하게 한다. 프로세스 강제 종료를 촬영할 경우 이 절 끝의 "영상 장애 및 재개 촬영 순서"를 먼저 읽고, source Work의 suspension 확인 후 해당 SIGKILL 및 fencing 블록을 사용한다. RB에서 Work로 suspension이 반영되는 과정은 비동기이므로, RB의 dispatching=true만 보고 source를 중지하지 않는다. 아래 조회에서 manifests에 apps/v1 StatefulSet migration-demo/demo가 들어 있는 source Work를 찾고, 그 Work의 spec.suspendDispatching=true를 확인한 뒤 다음 scale 명령을 실행한다. Work 이름은 조회 결과를 사용한다. source의 PVC/PV는 유지한다.
 
 ~~~bash
 kubectl --kubeconfig="$KARMADA_KUBECONFIG" -n karmada-es-onpre1 get works -o yaml
@@ -621,7 +812,7 @@ Pod가 Ready가 되면 별도 터미널에서 확인한다.
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo get pod demo-0 \
   -o jsonpath='{.spec.containers[*].image}{"\n"}'
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo exec demo-0 -c app -- python -c \
-  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080").read().decode())' \
+  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/state").read().decode())' \
   | tee "$DEMO_ROOT/evidence/target-memory.json"
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n stateful-migration logs deployment/checkpoint-restore-webhook --tail=100
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo get pvc -o yaml > "$DEMO_ROOT/evidence/target-pvc.yaml"
@@ -634,13 +825,62 @@ kubectl --kubeconfig="$MGMT_KUBECONFIG" -n migration-demo get statefulmigration 
 1. source의 원래 프로세스가 중지되어 있다.
 2. target Pod의 image가 일반 app image에서 checkpoint image로 변경되어 있다.
 3. target worker의 CRI-O 로그에 restore 성공이 기록되고 Pod가 Ready가 된다.
-4. boot_id가 source와 같다. counter는 checkpoint 시점부터 다시 진행한다. checkpoint 이후 source에서 기록한 최신 counter와 완전히 같을 필요는 없다.
+4. boot_id가 source와 같다. 영상 pause 체크포인트라면 frame과 paused 상태도 같아야 한다. 검증 후 resume하면 frame이 증가한다. 재생 중 백업은 checkpoint 이후 진행분을 잃을 수 있다.
 5. PV marker가 같고, target PV의 NFS server/path도 같다.
 6. RB의 dispatch가 재개되어 일반적인 Work 반영이 다시 이루어진다.
 
 Pod Ready, 동일한 파일 접근, restore-phase=succeeded만으로는 성공으로 판단하지 않는다. checkpoint image의 Pod에서 kubectl exec를 사용할 수 없는 runtime이라면 port-forward로 HTTP 응답을 확인한다. checkpoint 전에 연결했다가 끊어진 port-forward는 새로 연결한다.
 
 종료 시 PV migration을 다시 실행해야 한다면 RB의 suspension이 해제되었는지 확인하고 manager-active patch로 되돌린다. backup을 재개하기 전에 StatefulMigration.sourceClusters가 onpre2로 갱신되었는지 확인하고, onpre2에도 checkpoint DaemonSet과 push Secret을 설치한다. 첫 단방향 시연에서는 정기 백업을 자동으로 재개할 필요가 없다.
+
+### 영상 장애 및 재개 촬영 순서
+
+9절의 Completed 백업 및 이미지 고정 확인 이후에만 진행한다. member1은 NFS 서버이므로 전원을 끄거나 NFS를 중단하지 않는다.
+
+1. 정확한 장면 비교: pause 상태의 백업을 사용하고 아래 10절의 RB/Work suspension 확인 -> source replicas=0으로 서비스 중단 -> onpre2 복원 순서를 따른다. 이것은 통제된 서비스 중단 및 수동 복구다.
+2. 실제 프로세스 강제 종료를 포함하려면, **RB와 source Work의 dispatch 중지가 확인된 뒤**, 아래 명령으로 source 컨테이너를 종료하고 즉시 replicas=0으로 fencing한다. 종료 명령의 연결 끊김은 예상할 수 있다. kubelet이 잠시 일반 이미지로 재시작할 수 있으므로 source Pod 삭제 완료를 반드시 확인한다. 그 재시작은 checkpoint 복원이 아니다.
+
+~~~bash
+# 10절에서 source Work.spec.suspendDispatching=true를 확인한 뒤에만 실행
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- \
+  python -c 'import os, signal; os.kill(1, signal.SIGKILL)'
+# 위 명령이 종료 코드 137/연결 종료를 반환해도 다음 fencing 명령은 실행
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo scale statefulset demo --replicas=0
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo wait --for=delete pod/demo-0 --timeout=120s
+~~~
+
+이 블록은 set -e로 묶지 않는다. 강제 종료 실패 시 오류를 확인하고 source Pod가 사라지기 전에는 target을 실행하지 않는다. 이후 10절의 demo-placement를 onpre2로 변경하는 명령부터 계속한다. 복구 자동화 여부는 11절의 별도 조건을 따른다.
+
+onpre2 Pod Ready 후 MGMT의 port-forward 터미널에서 대상만 바꾸어 같은 로컬 포트를 연다.
+
+~~~bash
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo \
+  port-forward pod/demo-0 18080:8080 --address=127.0.0.1
+~~~
+
+기존 SSH 터널은 유지한다. 브라우저에서 Reconnect를 누른다. 새 탭으로 접속해도 같은 서버 boot_id와 정지 프레임이 나와야 한다. MGMT 작업 터미널에서 **재생 재개 전에** 비교한다.
+
+~~~bash
+curl --fail http://127.0.0.1:18080/state \
+  | tee "$DEMO_ROOT/evidence/target-memory.json"
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+p=Path(os.environ['DEMO_ROOT'])/'evidence'
+a=json.loads((p/'source-memory.json').read_text())
+b=json.loads((p/'target-memory.json').read_text())
+assert a['paused'] and b['paused'], 'pause 상태의 checkpoint인지 확인'
+assert a['frame'] > 0 and a['frame']==b['frame'], (a,b)
+assert a['boot_id']==b['boot_id'], '일반 재시작: 메모리 복원 아님'
+assert a['marker']==b['marker'], 'PV 데이터 확인 필요'
+print('PASS: same boot_id, paused frame and PV marker')
+PY
+~~~
+
+PASS 이후 브라우저의 Play / Resume을 누르고 seconds/frame이 증가하는 모습을 촬영한다. 원본/대상 Pod 이름뿐 아니라 클러스터, checkpoint image, runtime restore 로그도 함께 기록한다. 복원 후에도 paused=true인 것은 checkpoint 시점 상태를 보존한 정상 결과다.
+
+재생을 멈추지 않고 백업한 뒤 나중에 장애를 내는 두 번째 실험에서는 frame 동일성 검사를 사용하지 않는다. 백업 시각과 장애 시각의 차이만큼 되감길 수 있음을 영상에 표시한다. 같은 boot_id와 checkpoint 이후의 재생은 검증할 수 있지만 마지막 화면과의 완전 일치는 보장하지 않는다.
+
 
 ## 11. 자동 application failover 영상으로 진행하기 위한 조건
 
