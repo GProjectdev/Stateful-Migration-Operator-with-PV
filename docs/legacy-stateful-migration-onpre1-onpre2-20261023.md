@@ -4,9 +4,9 @@
 
 ## 현재 진행 위치와 읽는 순서 (2026-10-24 갱신)
 
-사용자 로그 기준 controller-manager 교체/리더 선출과 영상 이미지 push까지 완료했다. 영상은 member1에 준비되어 있다. **8.3부터 실행 -> 8절 화면 확인 -> 9절 체크포인트 확보 -> 11절 자동 Failover 사전 검사** 순서로 진행한다. 8.1/8.2의 설치·영상 변환·이미지 빌드는 완료한 경우 반복하지 않는다. **10절은 수동 진단 경로이므로 자동 Failover 촬영에서는 실행하지 않는다.**
+사용자 로그 기준 영상 Pod/PVC, CheckpointBackup Completed, checkpoint image pull 및 Gracefully 정책 dry-run까지 확인했다. **현재 이어서 실행할 단계는 [11.1 호환 패치 적용·빌드](legacy-auto-failover-validation.md)**다. dry-run은 정책을 저장하지 않았으므로 실제 배치는 여전히 onpre1이다. 8~9절의 준비를 반복하거나 10절의 수동 재배치를 혼합하지 않는다.
 
-이번 문서는 동적 PVC 배포 명령과 자동 Failover 실험 설계를 제공한다. 자동 복구가 현재 고정 구버전 코드에서 검증 완료됐다는 뜻은 아니다. 11절의 코드상 차단 조건이 남아 있으면 장애 주입을 실행하지 않는다. 실제 PV/프로세스 복원 검증은 아직 수행하지 않았다.
+촬영 전 manager 호환 패치를 적용한 뒤 11절의 cordon → Pod 삭제 → 실제 target 복원 시험을 수행한다. 로컬 소스/테스트 검증과 실제 클러스터 CRI-O 복원 성공은 별개다.
 
 ## 1. 현재 환경에서 무엇을 바꾸는가
 
@@ -567,13 +567,12 @@ kubectl --kubeconfig="$ONPRE1_KUBECONFIG" get storageclass legacy-nfs-client
 kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo get sts,pvc
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo get sts,pvc
 # onpre2에 demo 및 data-demo-0가 없어야 한다.
-# 시연 전용 release만 중지: 기존에 Bound인 NFS 볼륨의 마운트에는 영향 없음.
+# target provisioner는 실행 상태로 유지할 수 있다. 11절에서 PV 선생성 순서를 보호한다.
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner   get deployment -l app.kubernetes.io/instance=legacy-nfs -o yaml   > "$DEMO_ROOT/evidence/target-nfs-provisioner-before.yaml"
-kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner   scale deployment -l app.kubernetes.io/instance=legacy-nfs --replicas=0
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner   get deployment,pods -l app.kubernetes.io/instance=legacy-nfs
 ~~~
 
-Pod가 남아 있으면 종료를 확인한 뒤 진행한다. target에서 동적 PV가 먼저 생기면 구버전 PV migration이 기존 PVC 수를 보고 복사를 생략할 수 있다. 이 방지는 운영 전체 Provisioner 중단을 뜻하지 않는다.
+target에 기존 demo Pod/PVC가 있으면 자동 삭제하지 말고 상태를 확인한다. target PVC가 먼저 생성되어 빈 PV에 연결되지 않도록 11절의 수정된 manager가 실제 PV 준비 후 dispatch를 재개한다. provisioner 중지는 이 순서 보장의 대체 수단이 아니다.
 
 아래 initContainer는 같은 PVC에 영상 복사가 끝날 때까지 기다린다. 앱 이미지는 이미 빌드한 legacy-video-demo를 그대로 사용한다. 복원 대상에서는 기존 NFS 파일의 .ready가 있으므로 초기화가 즉시 완료된다. initContainer가 재생 위치를 저장하거나 복구하지 않는다.
 
@@ -944,103 +943,16 @@ PASS 이후 브라우저의 Play / Resume을 누르고 seconds/frame이 증가�
 재생을 멈추지 않고 백업한 뒤 나중에 장애를 내는 두 번째 실험에서는 frame 동일성 검사를 사용하지 않는다. 백업 시각과 장애 시각의 차이만큼 되감길 수 있음을 영상에 표시한다. 같은 boot_id와 checkpoint 이후의 재생은 검증할 수 있지만 마지막 화면과의 완전 일치는 보장하지 않는다.
 
 
-## 11. Karmada 자동 Application Failover 시나리오와 실행 게이트
+## 11. Karmada 자동 Application Failover 검증
 
-### 11.1 선택한 장애 종류와 정책 준비
+현재 v1.19 webhook과 구버전 manager의 호환 수정 및 cordon → Pod 삭제 시험은 [자동 Failover 패치·검증 가이드](legacy-auto-failover-validation.md)를 따른다. 기존 11절의 Graciously 정책과 SIGSTOP 시험은 이 절차로 대체한다.
 
-이번 시나리오는 **Application Failover**이다. member1 Kubernetes와 NFS는 정상으로 두고 영상 Pod의 health를 Unhealthy로 만든다. 전체 서버 shutdown이나 네트워크 단절을 사용하지 않는다. Karmada의 자동 감지/스케줄링과 컨트롤러의 메모리 복구까지 모두 관찰해야 한다.
-
-최초 배포는 8.3의 onpre1 고정 정책으로 영상/PVC/체크포인트 준비를 끝낸다. 자동 실험 준비 정책은 아래처럼 ordered clusterAffinities로 onpre1을 우선하고 onpre2를 fallback으로 둔다. source와 target을 한 Duplicated 목록에 동시에 넣지 않는다. replicas는 StatefulSet의 1을 유지한다. 실제 v1.19 scheduler가 onpre1 하나를 선택하는지는 RB에서 확인한다.
-
-**현재는 파일 생성 및 server dry-run까지만 실행한다. 아래 정책을 실제 apply하는 단계는 11.2 차단 조건 해결 후이다.**
-
-~~~bash
-cat > "$DEMO_ROOT/rendered/demo-auto-policy.yaml" <<'EOF'
-apiVersion: policy.karmada.io/v1alpha1
-kind: PropagationPolicy
-metadata:
-  name: demo-placement
-  namespace: migration-demo
-spec:
-  propagateDeps: true
-  resourceSelectors:
-  - apiVersion: apps/v1
-    kind: StatefulSet
-    name: demo
-  placement:
-    clusterAffinities:
-    - affinityName: primary
-      clusterNames: [onpre1]
-    - affinityName: backup
-      clusterNames: [onpre2]
-    replicaScheduling:
-      replicaSchedulingType: Duplicated
-  failover:
-    application:
-      decisionConditions:
-        tolerationSeconds: 60
-      purgeMode: Graciously
-      gracePeriodSeconds: 600
-EOF
-# 기존 clusterAffinity와 새 clusterAffinities가 공존하지 않도록 후보 patch 생성
-python3 - <<'PY'
-import os, json, yaml
-from pathlib import Path
-p=Path(os.environ['DEMO_ROOT'])/'rendered'
-d=yaml.safe_load((p/'demo-auto-policy.yaml').read_text())['spec']
-d['placement']['clusterAffinity']=None
-(p/'demo-auto-policy.patch.json').write_text(json.dumps({'spec':d}))
-PY
-kubectl --kubeconfig="$KARMADA_KUBECONFIG" -n migration-demo \
-  patch propagationpolicy demo-placement --type=merge \
-  --patch-file "$DEMO_ROOT/rendered/demo-auto-policy.patch.json" --dry-run=server -o yaml
-~~~
-
-server dry-run이 거부되면 실제 적용하지 않는다. 특히 purgeMode는 설치된 API의 enum을 확인한다. 구버전의 Graciously와 새 API의 값이 다르면 한쪽만 바꿔 호환된다고 판단하지 않는다.
-
-근거: [Karmada ordered cluster affinities](https://karmada.io/docs/v1.16/userguide/scheduling/resource-propagating/), [구버전 Application Failover hook](https://github.com/GProjectdev/Karmada_with_PVMigration/blob/74c02e295fcba4fafbc4a79113c76988f87fed6c/pkg/controllers/applicationfailover/rb_application_failover_controller.go). Karmada의 reschedule과 이 fork의 restore gate는 별도 검증 대상이다.
-
-### 11.2 현재 자동 실행 차단 조건 — 해결 전 장애 주입 금지
-
-고정 소스 pvmigration_controller.go에서 다음을 확인했다.
-
-- 473–488행: target claimRef UID를 지우고 StorageClassName과 NFS server/path를 복제한다. 동적 NFS PV도 이 경로로 수집할 수 있다.
-- 289–300행: target PVC 개수로 부족 replica 수를 계산한다. 그래서 onpre2의 demo PVC를 미리 만들거나 빈 볼륨으로 Bound시키면 안 된다.
-- 615–637행: restore-phase가 비어 있으면 25초 뒤 dispatch 재개를 시도한다. CheckpointRestore가 실제 member API에 도착하기 전이라도 진행될 수 있다.
-- 716–728행: manager 자체의 unsuspend는 dispatching=false를 쓴다. 이전에 수정한 별도 suspension-controller 코드와 다른 경로다. 현재 API의 true/필드 생략 규약과 맞지 않는다.
-
-따라서 단순히 restore/suspension replicas를 1로 올리고 정책을 apply하는 명령만으로 자동 복원이 보장되지 않는다. 다음 작업이 먼저 필요하다: manager의 false 쓰기를 필드 제거로 수정, timeout 기반 조기 해제 방지, 실제 target CR/PV 준비를 확인하는 공통 release gate, 원본/대상 동시 실행을 막는 fencing 확인. 이는 **이번 문서 수정에서 구현하지 않은 컨트롤러 변경**이다. 자동화 준비 완료로 표시하지 않는다.
-
-9절은 정확한 한 번의 checkpoint를 고정하는 준비 실습이다. 그 절에서 중지한 backup/checkpoint 구성요소는 정기 백업 실험 시 다시 활성화해야 하며, 그 전에 sourceClusters와 Secret을 확인한다. 자동 복원 준비 후에는 6절에서 중지한 restore/suspension도 활성화해야 한다. 활성화와 manager rebuild는 위 gate 변경과 함께 별도로 검증한다.
-
-### 11.3 차단 조건 해결 후 촬영할 실험 순서
-
-1. 후보 정책의 실제 patch 적용, RB.spec.clusters가 최초 onpre1/replicas=1인지 확인한다. onpre2에는 demo PVC가 없어야 한다.
-2. 양쪽 controller와 target webhook을 준비하고 app이 Healthy인지 확인한다. 정상/paused 상태에서 checkpoint를 만들고 Completed 및 실제 registry image를 확인한다.
-3. 정확한 장면 비교는 pause checkpoint로 진행한다. 재생 중 장애 실험은 최신 checkpoint로 되감길 수 있음을 표시한다.
-4. 아래 source 전용 장애 명령은 앱 메모리 프로세스를 멈추고 readiness 실패 플래그를 만든다. 이 코드는 **정상 checkpoint 완료 후, 자동 release gate 검증 후에만 실행**한다. kubelet 자체와 NFS는 중단하지 않는다. readiness 파일은 PVC가 아닌 컨테이너 /tmp이므로 이전 정상 checkpoint에는 존재하지 않는다.
-
-~~~bash
-# 준비되지 않은 현재 고정 버전에서는 실행하지 않는다.
-kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- \
-  python -c "from pathlib import Path; import os, signal; Path('/tmp/legacy-demo-unhealthy').touch(); os.kill(1, signal.SIGSTOP)"
-~~~
-
-5. Pod Ready=False -> RB.status.aggregatedStatus의 onpre1 Unhealthy -> Karmada가 eviction/suspension/재배치를 수행 -> target PV 및 CheckpointRestore 준비 -> dispatch 재개 -> target 복원을 순서대로 기록한다. 사람이 clusterNames를 바꾸거나 RB 상태 annotation을 성공으로 조작하지 않는다.
-6. source 프로세스가 실제 중지/격리됐는지 확인한다. SIGSTOP이 허용되지 않았거나 source가 재시작하면 이 증거가 없으므로 target을 실행하는 자동 gate가 열려서는 안 된다. 단순 readiness 실패는 fencing을 입증하지 않는다.
-7. target PVC가 Bound이고 그 PV의 NFS server/path가 evidence/source-video-pv.json과 정확히 일치해야 한다. 새 빈 경로이면 실패다.
-8. 10절 끝의 화면 재접속 및 boot_id/frame 비교만 사용한다. 10절의 수동 재배치 명령은 실행하지 않는다. 이미지가 checkpoint로 바뀌고 runtime 복원 로그가 있어야 한다.
-
-실험을 중단하고 source로 돌아갈 때에는 먼저 target이 실행되지 않으며 RB 배치도 source인지 확인한 후에만 다음을 실행한다. 이미 target이 복원됐다면 source를 재개하지 않는다.
-
-~~~bash
-# target 미실행 및 source 배치가 확인된 경우에만
-kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- \
-  python -c "from pathlib import Path; import os, signal; os.kill(1, signal.SIGCONT); Path('/tmp/legacy-demo-unhealthy').unlink(missing_ok=True)"
-~~~
-
-성공 영상의 표현: "Karmada Application Failover로 재배치하고 checkpoint 시점의 영상 상태를 복원했다." 브라우저 port-forward를 대상에 다시 연결하는 작업은 수동이며, 사용자 접속 경로의 무중단 자동 전환까지 구현한 것은 아니다. member1 전체 장애, NFS HA, 장애 직전까지의 zero-loss 상태 보존을 주장하지 않는다.
-
+- 정책 API 입력은 Gracefully, 구버전 내부 eviction task는 Graciously로 변환한다.
+- 새 manager 이미지와 strict-demo-restore annotation을 사용한다.
+- 별도 suspension-controller는 0으로 유지하며, target PV·CheckpointRestore와 source 종료를 manager에서 확인한 뒤 배포를 재개한다.
+- target NFS provisioner 중지는 필수 조건이 아니다. 원본과 같은 NFS PV가 실제로 먼저 생성되는지 검증한다.
+- source checkpoint를 보존하고 10절의 수동 배치 변경과 혼합하지 않는다.
+- 로컬 테스트와 실제 클러스터에서의 CRI-O 복원 성공은 별개의 검증이다.
 
 ## 12. 원래 controller-manager로 복구
 
