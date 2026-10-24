@@ -2,6 +2,12 @@
 
 작성일: 2026-10-23. 대상: MGMT + Push member onpre1 → onpre2. **설치 절차와 보조 파일을 준비한 문서이며, 실제 MGMT에 배포하거나 복원을 검증한 결과는 아니다.**
 
+## 현재 진행 위치와 읽는 순서 (2026-10-24 갱신)
+
+사용자 로그 기준 controller-manager 교체/리더 선출과 영상 이미지 push까지 완료했다. 영상은 member1에 준비되어 있다. **8.3부터 실행 -> 8절 화면 확인 -> 9절 체크포인트 확보 -> 11절 자동 Failover 사전 검사** 순서로 진행한다. 8.1/8.2의 설치·영상 변환·이미지 빌드는 완료한 경우 반복하지 않는다. **10절은 수동 진단 경로이므로 자동 Failover 촬영에서는 실행하지 않는다.**
+
+이번 문서는 동적 PVC 배포 명령과 자동 Failover 실험 설계를 제공한다. 자동 복구가 현재 고정 구버전 코드에서 검증 완료됐다는 뜻은 아니다. 11절의 코드상 차단 조건이 남아 있으면 장애 주입을 실행하지 않는다. 실제 PV/프로세스 복원 검증은 아직 수행하지 않았다.
+
 ## 1. 현재 환경에서 무엇을 바꾸는가
 
 사용자가 제공한 Pod 목록에 따르면 karmada-controller-manager는 ReplicaSet 소유 Pod로 실행 중이며 이미지가 docker.io/karmada/karmada-controller-manager:v1.19.0이다. Deployment 이름은 아래 조회로 최종 확인한다. API 서버는 Kubernetes v1.36.2, scheduler/webhook/aggregated-apiserver는 Karmada v1.19.0이다.
@@ -501,7 +507,7 @@ kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner get pvc legacy-nfs-
 
 테스트 PVC는 유지해도 된다. Retain 정책이므로 삭제해도 PV와 NFS 디렉터리가 자동 정리되지 않는다. PVC Bound는 동적 할당 확인이며 앱 Pod의 실제 I/O는 아래 demo 단계에서 검증한다.
 
-**중요:** Provisioner는 설치하고 별도 PVC로 검증하지만, 아래 migration-demo StatefulSet은 기존 방식대로 정적 PV + `storageClassName: ""`를 사용한다. 이를 `legacy-nfs-client`로 바꾸지 않는다. 대상에서 동적 할당이 먼저 일어나 새 디렉터리를 연결하는 것을 피하고, 구버전 PV migration이 동일한 `/mnt/nfs/legacy-demo` 경로를 연결하도록 하기 위함이다. 동적 할당 PVC 자체의 migration 시연은 별도로 경합과 PV annotation 처리를 검증해야 한다.
+**현재 기본 시나리오:** 소스는 legacy-nfs-client 동적 할당을 사용한다. 아래 8.3에서 StatefulSet의 volumeClaimTemplates가 PVC를 만들고 onpre1 Provisioner가 PV를 만든다. target은 기존 소스 NFS 경로를 복제한 PV를 사용해야 하므로, 이 시연 전용 onpre2 Provisioner를 잠시 중지한다. onpre2의 다른 동적 PVC 사용자가 있다면 이 release를 공유하지 말고 시연 전용 provisioner를 분리한다.
 
 ### 8.2 영상 StatefulSet과 volumeClaimTemplates 준비
 
@@ -552,32 +558,26 @@ export NFS_SERVER=192.168.30.101
 export NFS_PATH=/mnt/nfs/legacy-demo
 ~~~
 
-PV 자체는 클러스터 범위 리소스로 별도 생성하고, StatefulSet에는 volumeClaimTemplates로 PVC 템플릿을 넣는다. data 템플릿이 data-demo-0 PVC를 만들고, legacy-demo-source PV의 claimRef와 연결된다. 별도의 앱 PVC manifest를 만들지 않는다.
+### 8.3 지금 시작: 동적 PVC 영상 StatefulSet 배포
 
-NFS export는 양쪽 worker에서 마운트 가능해야 한다. 실습 전용 디렉터리, 동일 UID 권한을 사용한다. storageClassName은 비워 두어 대상의 default dynamic provisioner가 새 빈 볼륨을 먼저 만들지 않게 한다.
+영상 이미지 build/push와 member1 영상 준비가 끝났다면 **여기부터 시작한다.** source-pv.yaml을 생성하거나 적용하지 않는다. 최초 배포 기준이다. demo 또는 data-demo-0가 이미 있으면 먼저 상태를 확인하고, 기존 정적 PVC를 임의로 지우지 않는다.
 
 ~~~bash
-cat > "$DEMO_ROOT/rendered/source-pv.yaml" <<EOF
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: legacy-demo-source
-spec:
-  mountOptions: [vers=4.1]
-  capacity:
-    storage: 1Gi
-  accessModes: [ReadWriteMany]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
-  claimRef:
-    namespace: migration-demo
-    name: data-demo-0
-  nfs:
-    server: "$NFS_SERVER"
-    path: "$NFS_PATH"
-EOF
-kubectl --kubeconfig="$ONPRE1_KUBECONFIG" apply -f "$DEMO_ROOT/rendered/source-pv.yaml"
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" get storageclass legacy-nfs-client
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo get sts,pvc
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo get sts,pvc
+# onpre2에 demo 및 data-demo-0가 없어야 한다.
+# 시연 전용 release만 중지: 기존에 Bound인 NFS 볼륨의 마운트에는 영향 없음.
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner   get deployment -l app.kubernetes.io/instance=legacy-nfs -o yaml   > "$DEMO_ROOT/evidence/target-nfs-provisioner-before.yaml"
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner   scale deployment -l app.kubernetes.io/instance=legacy-nfs --replicas=0
+kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n nfs-provisioner   get deployment,pods -l app.kubernetes.io/instance=legacy-nfs
+~~~
 
+Pod가 남아 있으면 종료를 확인한 뒤 진행한다. target에서 동적 PV가 먼저 생기면 구버전 PV migration이 기존 PVC 수를 보고 복사를 생략할 수 있다. 이 방지는 운영 전체 Provisioner 중단을 뜻하지 않는다.
+
+아래 initContainer는 같은 PVC에 영상 복사가 끝날 때까지 기다린다. 앱 이미지는 이미 빌드한 legacy-video-demo를 그대로 사용한다. 복원 대상에서는 기존 NFS 파일의 .ready가 있으므로 초기화가 즉시 완료된다. initContainer가 재생 위치를 저장하거나 복구하지 않는다.
+
+~~~bash
 cat > "$DEMO_ROOT/rendered/demo.yaml" <<EOF
 apiVersion: v1
 kind: Service
@@ -606,11 +606,34 @@ spec:
       labels: {app: legacy-demo}
     spec:
       terminationGracePeriodSeconds: 20
+      initContainers:
+      - name: wait-video
+        image: "$ACCOUNT/legacy-video-demo:$TAG"
+        command: [python, -u, -c]
+        args:
+        - |
+          import time
+          from pathlib import Path
+          root = Path('/data/video')
+          while not ((root / '.ready').exists() and any((root / 'frames').glob('*.jpg'))):
+              print('Waiting for video copy into dynamically provisioned PVC', flush=True)
+              time.sleep(2)
+        volumeMounts:
+        - name: data
+          mountPath: /data
       containers:
       - name: app
         image: "$ACCOUNT/legacy-video-demo:$TAG"
         ports:
         - containerPort: 8080
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "from pathlib import Path; import sys; sys.exit(int(Path('/tmp/legacy-demo-unhealthy').exists()))"
+          periodSeconds: 5
+          failureThreshold: 2
         volumeMounts:
         - name: data
           mountPath: /data
@@ -619,7 +642,7 @@ spec:
       name: data
     spec:
       accessModes: [ReadWriteMany]
-      storageClassName: ""
+      storageClassName: legacy-nfs-client
       resources:
         requests:
           storage: 1Gi
@@ -654,6 +677,45 @@ kubectl --kubeconfig="$ONPRE1_KUBECONFIG" apply -f "$DEMO_ROOT/rendered/demo-ser
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" apply -f "$DEMO_ROOT/rendered/demo-service.yaml"
 kubectl --kubeconfig="$KARMADA_KUBECONFIG" apply --dry-run=server -f "$DEMO_ROOT/rendered/demo-workload.yaml"
 kubectl --kubeconfig="$KARMADA_KUBECONFIG" apply -f "$DEMO_ROOT/rendered/demo-workload.yaml"
+# Karmada Work 반영은 비동기다. PVC가 아직 NotFound라면 생성된 뒤 wait 실행.
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo get sts,pods,pvc
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo wait   --for=jsonpath='{.status.phase}'=Bound pvc/data-demo-0 --timeout=180s
+export SOURCE_PV="$(kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo   get pvc data-demo-0 -o jsonpath='{.spec.volumeName}')"
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" get pv "$SOURCE_PV" -o json   > "$DEMO_ROOT/evidence/source-video-pv.json"
+python3 - <<'PY'
+import json, os, shlex
+from pathlib import Path
+p=Path(os.environ['DEMO_ROOT'])/'evidence/source-video-pv.json'
+v=json.loads(p.read_text())['spec']
+assert v['storageClassName']=='legacy-nfs-client'
+n=v['nfs']
+assert n['server']=='192.168.30.101', n
+assert n['path'].startswith('/mnt/nfs/') and '..' not in Path(n['path']).parts, n
+assert n['path']!='/mnt/nfs/legacy-demo', '기존 정적 PV를 사용 중인지 확인'
+print('member1에서 아래 export 한 줄을 먼저 실행:')
+print('export TARGET_NFS_PATH='+shlex.quote(n['path']))
+PY
+~~~
+
+**member1 호스트에서 실행:** 위 출력의 export TARGET_NFS_PATH=...를 먼저 복사해 실행한다. 경로를 추측하지 않는다. 새 PVC의 동적 경로로 기존 영상 파일을 복사한다.
+
+~~~bash
+(
+  set -e
+  : "${TARGET_NFS_PATH:?MGMT에서 출력한 export를 먼저 실행}"
+  test "$TARGET_NFS_PATH" != /mnt/nfs/legacy-demo
+  test -d "$TARGET_NFS_PATH"
+  sudo mkdir -p "$TARGET_NFS_PATH/video"
+  sudo cp -a /mnt/nfs/legacy-demo/video/. "$TARGET_NFS_PATH/video/"
+  sudo chmod -R a+rX "$TARGET_NFS_PATH/video"
+  test -n "$(find "$TARGET_NFS_PATH/video/frames" -maxdepth 1 -name '*.jpg' -print -quit)"
+  sudo touch "$TARGET_NFS_PATH/video/.ready"
+)
+~~~
+
+**다시 MGMT에서 실행:** initContainer가 종료되고 영상 앱이 시작한다.
+
+~~~bash
 kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo rollout status statefulset/demo --timeout=180s
 kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo get pods,pvc -o wide
 kubectl --kubeconfig="$ONPRE2_KUBECONFIG" -n migration-demo get pods,pvc
@@ -686,7 +748,7 @@ curl --fail http://127.0.0.1:18080/state \
   | tee "$DEMO_ROOT/evidence/source-memory.json"
 ~~~
 
-paused=true와 frame>0을 확인한다. 브라우저의 **Disconnect for checkpoint**를 누르고 잠시 후 port-forward 터미널에서 Ctrl+C한다. HTTP 요청이 없는 상태로 다음 9절 백업을 실행한다. 체크포인트에 불필요한 활성 TCP 연결을 포함하지 않기 위한 절차다. HTTP probe는 데모 Pod에 추가하지 않는다.
+paused=true와 frame>0을 확인한다. 브라우저의 **Disconnect for checkpoint**를 누르고 잠시 후 port-forward 터미널에서 Ctrl+C한다. HTTP 요청이 없는 상태로 다음 9절 백업을 실행한다. 체크포인트에 불필요한 활성 TCP 연결을 포함하지 않기 위한 절차다. HTTP probe는 데모 Pod에 추가하지 않는다. manifest의 exec readiness probe는 장애 플래그 파일만 확인하며 재생 프로세스와 TCP 연결을 만들지 않는다.
 
 
 ## 9. 백업 생성
@@ -737,7 +799,7 @@ kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n stateful-migration get pods -l app.
 
 DaemonSet/RBAC만 삭제한다. CRD, PVC, PV, registry image는 삭제하지 않는다. 재조회 결과 checkpoint-backup-controller Pod가 하나도 남지 않았는지 확인한 뒤, registry의 최종 image digest를 다시 조회하여 이번 복원에 사용할 값을 확정하고 기록한다. Pod 종료 전에 확인한 digest만으로는 같은 tag의 마지막 push가 끝났다고 판단할 수 없다. 이후에도 원래 실행 중이던 Pod의 상태는 checkpoint 시점보다 더 진행될 수 있다. 복원은 checkpoint 시점으로 돌아가는 것이므로, 그 이후의 모든 변경 사항까지 보존한다고 보장할 수 없다. 애플리케이션 정합성이 필요하면 checkpoint 전에 쓰기를 일시 중지한다.
 
-## 10. 실행 순서를 확인하는 수동 migration 실습
+## 10. 수동 진단 전용 — Karmada 자동 Failover 촬영에서는 건너뜀
 
 **이 단계는 자동 장애 감지 시연이 아니다.** 컨트롤러의 각 단계를 확인하기 위해 backup/restore/suspension을 순서대로 실행한다. pvmigration 원본에는 restore-phase가 없을 때의 25초 fallback과 자체 unsuspend 동작이 있다. 복원 준비 전에 dispatch가 재개되는 것을 막기 위해 PV 준비 후 pvMigration만 일시 중지한다. PV 로직의 소스는 변경하지 않는다.
 
@@ -882,35 +944,103 @@ PASS 이후 브라우저의 Play / Resume을 누르고 seconds/frame이 증가�
 재생을 멈추지 않고 백업한 뒤 나중에 장애를 내는 두 번째 실험에서는 frame 동일성 검사를 사용하지 않는다. 백업 시각과 장애 시각의 차이만큼 되감길 수 있음을 영상에 표시한다. 같은 boot_id와 checkpoint 이후의 재생은 검증할 수 있지만 마지막 화면과의 완전 일치는 보장하지 않는다.
 
 
-## 11. 자동 application failover 영상으로 진행하기 위한 조건
+## 11. Karmada 자동 Application Failover 시나리오와 실행 게이트
 
-위 절차는 수동 실습이다. 완전 자동 동작으로 촬영하려면 구버전 fork의 applicationfailover controller가 수행하는 Unhealthy 판정과 suspend, scheduler의 target 재배치, restore/PV 양쪽 gate 통과, target의 실제 복원까지 수동 개입 없이 확인해야 한다. 이는 단순히 cluster를 NotReady로 만드는 시험과는 다른 경로다.
+### 11.1 선택한 장애 종류와 정책 준비
 
-구버전 API에서 application failover의 기본 항목은 다음과 같다. 현재 v1.19 API에서 explain/server dry-run으로 확인한다.
+이번 시나리오는 **Application Failover**이다. member1 Kubernetes와 NFS는 정상으로 두고 영상 Pod의 health를 Unhealthy로 만든다. 전체 서버 shutdown이나 네트워크 단절을 사용하지 않는다. Karmada의 자동 감지/스케줄링과 컨트롤러의 메모리 복구까지 모두 관찰해야 한다.
 
-~~~yaml
+최초 배포는 8.3의 onpre1 고정 정책으로 영상/PVC/체크포인트 준비를 끝낸다. 자동 실험 준비 정책은 아래처럼 ordered clusterAffinities로 onpre1을 우선하고 onpre2를 fallback으로 둔다. source와 target을 한 Duplicated 목록에 동시에 넣지 않는다. replicas는 StatefulSet의 1을 유지한다. 실제 v1.19 scheduler가 onpre1 하나를 선택하는지는 RB에서 확인한다.
+
+**현재는 파일 생성 및 server dry-run까지만 실행한다. 아래 정책을 실제 apply하는 단계는 11.2 차단 조건 해결 후이다.**
+
+~~~bash
+cat > "$DEMO_ROOT/rendered/demo-auto-policy.yaml" <<'EOF'
+apiVersion: policy.karmada.io/v1alpha1
+kind: PropagationPolicy
+metadata:
+  name: demo-placement
+  namespace: migration-demo
 spec:
   propagateDeps: true
+  resourceSelectors:
+  - apiVersion: apps/v1
+    kind: StatefulSet
+    name: demo
+  placement:
+    clusterAffinities:
+    - affinityName: primary
+      clusterNames: [onpre1]
+    - affinityName: backup
+      clusterNames: [onpre2]
+    replicaScheduling:
+      replicaSchedulingType: Duplicated
   failover:
     application:
       decisionConditions:
         tolerationSeconds: 60
       purgeMode: Graciously
       gracePeriodSeconds: 600
+EOF
+# 기존 clusterAffinity와 새 clusterAffinities가 공존하지 않도록 후보 patch 생성
+python3 - <<'PY'
+import os, json, yaml
+from pathlib import Path
+p=Path(os.environ['DEMO_ROOT'])/'rendered'
+d=yaml.safe_load((p/'demo-auto-policy.yaml').read_text())['spec']
+d['placement']['clusterAffinity']=None
+(p/'demo-auto-policy.patch.json').write_text(json.dumps({'spec':d}))
+PY
+kubectl --kubeconfig="$KARMADA_KUBECONFIG" -n migration-demo \
+  patch propagationpolicy demo-placement --type=merge \
+  --patch-file "$DEMO_ROOT/rendered/demo-auto-policy.patch.json" --dry-run=server -o yaml
 ~~~
 
-onpre1로만 고정한 demo-placement로는 onpre2에 자동 재배치할 수 없다. 두 cluster를 모두 허용하면서 최초 배치를 onpre1의 1 replica로 만드는 배치 전략과 RB.spec.clusters[].replicas를 확인한다. Duplicated를 두 cluster에 지정하면 양쪽에서 실행되므로, cluster 목록만 그대로 확장해서는 안 된다.
+server dry-run이 거부되면 실제 적용하지 않는다. 특히 purgeMode는 설치된 API의 enum을 확인한다. 구버전의 Graciously와 새 API의 값이 다르면 한쪽만 바꿔 호환된다고 판단하지 않는다.
 
-자동화 전에 해결하거나 확인해야 할 구현 조건은 다음과 같다.
+근거: [Karmada ordered cluster affinities](https://karmada.io/docs/v1.16/userguide/scheduling/resource-propagating/), [구버전 Application Failover hook](https://github.com/GProjectdev/Karmada_with_PVMigration/blob/74c02e295fcba4fafbc4a79113c76988f87fed6c/pkg/controllers/applicationfailover/rb_application_failover_controller.go). Karmada의 reschedule과 이 fork의 restore gate는 별도 검증 대상이다.
 
-- 기존 pvMigration과 suspension의 중복 unsuspend 동작을 정리하거나, target CR 도착까지 확인하는 공통 gate를 마련한다.
-- pvMigration의 false 쓰기를 v1.19에 맞게 dispatching 필드 제거로 변경한다. 수동 실습에서는 해당 코드가 실행되기 전에 pvMigration을 중지한다.
-- restore-phase가 없을 때의 25초 fallback으로 dispatch가 먼저 재개되지 않는지 확인한다.
-- target CR의 배치 결정과 실제 target API 도착 사이의 시간 차이를 처리한다.
-- source fencing과 checkpoint 시점의 애플리케이션 정합성을 확인한다.
-- 실제 Unhealthy 판정, gracious eviction, stateful workload 전파가 현재 v1.19와의 혼합 구성에서 정상 동작하는지 확인한다.
+### 11.2 현재 자동 실행 차단 조건 — 해결 전 장애 주입 금지
 
-이 항목들은 **아직 수정하거나 실증하지 않은 자동화 조건**이다. 이 문서의 수동 실습을 수동 개입 없는 자동 장애 복구라고 설명해서는 안 된다. 원래의 두 branch를 그대로 적용하면 현재 v1.19에서 완전 자동으로 성공한다고 코드만으로 보장할 수는 없다.
+고정 소스 pvmigration_controller.go에서 다음을 확인했다.
+
+- 473–488행: target claimRef UID를 지우고 StorageClassName과 NFS server/path를 복제한다. 동적 NFS PV도 이 경로로 수집할 수 있다.
+- 289–300행: target PVC 개수로 부족 replica 수를 계산한다. 그래서 onpre2의 demo PVC를 미리 만들거나 빈 볼륨으로 Bound시키면 안 된다.
+- 615–637행: restore-phase가 비어 있으면 25초 뒤 dispatch 재개를 시도한다. CheckpointRestore가 실제 member API에 도착하기 전이라도 진행될 수 있다.
+- 716–728행: manager 자체의 unsuspend는 dispatching=false를 쓴다. 이전에 수정한 별도 suspension-controller 코드와 다른 경로다. 현재 API의 true/필드 생략 규약과 맞지 않는다.
+
+따라서 단순히 restore/suspension replicas를 1로 올리고 정책을 apply하는 명령만으로 자동 복원이 보장되지 않는다. 다음 작업이 먼저 필요하다: manager의 false 쓰기를 필드 제거로 수정, timeout 기반 조기 해제 방지, 실제 target CR/PV 준비를 확인하는 공통 release gate, 원본/대상 동시 실행을 막는 fencing 확인. 이는 **이번 문서 수정에서 구현하지 않은 컨트롤러 변경**이다. 자동화 준비 완료로 표시하지 않는다.
+
+9절은 정확한 한 번의 checkpoint를 고정하는 준비 실습이다. 그 절에서 중지한 backup/checkpoint 구성요소는 정기 백업 실험 시 다시 활성화해야 하며, 그 전에 sourceClusters와 Secret을 확인한다. 자동 복원 준비 후에는 6절에서 중지한 restore/suspension도 활성화해야 한다. 활성화와 manager rebuild는 위 gate 변경과 함께 별도로 검증한다.
+
+### 11.3 차단 조건 해결 후 촬영할 실험 순서
+
+1. 후보 정책의 실제 patch 적용, RB.spec.clusters가 최초 onpre1/replicas=1인지 확인한다. onpre2에는 demo PVC가 없어야 한다.
+2. 양쪽 controller와 target webhook을 준비하고 app이 Healthy인지 확인한다. 정상/paused 상태에서 checkpoint를 만들고 Completed 및 실제 registry image를 확인한다.
+3. 정확한 장면 비교는 pause checkpoint로 진행한다. 재생 중 장애 실험은 최신 checkpoint로 되감길 수 있음을 표시한다.
+4. 아래 source 전용 장애 명령은 앱 메모리 프로세스를 멈추고 readiness 실패 플래그를 만든다. 이 코드는 **정상 checkpoint 완료 후, 자동 release gate 검증 후에만 실행**한다. kubelet 자체와 NFS는 중단하지 않는다. readiness 파일은 PVC가 아닌 컨테이너 /tmp이므로 이전 정상 checkpoint에는 존재하지 않는다.
+
+~~~bash
+# 준비되지 않은 현재 고정 버전에서는 실행하지 않는다.
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- \
+  python -c "from pathlib import Path; import os, signal; Path('/tmp/legacy-demo-unhealthy').touch(); os.kill(1, signal.SIGSTOP)"
+~~~
+
+5. Pod Ready=False -> RB.status.aggregatedStatus의 onpre1 Unhealthy -> Karmada가 eviction/suspension/재배치를 수행 -> target PV 및 CheckpointRestore 준비 -> dispatch 재개 -> target 복원을 순서대로 기록한다. 사람이 clusterNames를 바꾸거나 RB 상태 annotation을 성공으로 조작하지 않는다.
+6. source 프로세스가 실제 중지/격리됐는지 확인한다. SIGSTOP이 허용되지 않았거나 source가 재시작하면 이 증거가 없으므로 target을 실행하는 자동 gate가 열려서는 안 된다. 단순 readiness 실패는 fencing을 입증하지 않는다.
+7. target PVC가 Bound이고 그 PV의 NFS server/path가 evidence/source-video-pv.json과 정확히 일치해야 한다. 새 빈 경로이면 실패다.
+8. 10절 끝의 화면 재접속 및 boot_id/frame 비교만 사용한다. 10절의 수동 재배치 명령은 실행하지 않는다. 이미지가 checkpoint로 바뀌고 runtime 복원 로그가 있어야 한다.
+
+실험을 중단하고 source로 돌아갈 때에는 먼저 target이 실행되지 않으며 RB 배치도 source인지 확인한 후에만 다음을 실행한다. 이미 target이 복원됐다면 source를 재개하지 않는다.
+
+~~~bash
+# target 미실행 및 source 배치가 확인된 경우에만
+kubectl --kubeconfig="$ONPRE1_KUBECONFIG" -n migration-demo exec demo-0 -c app -- \
+  python -c "from pathlib import Path; import os, signal; os.kill(1, signal.SIGCONT); Path('/tmp/legacy-demo-unhealthy').unlink(missing_ok=True)"
+~~~
+
+성공 영상의 표현: "Karmada Application Failover로 재배치하고 checkpoint 시점의 영상 상태를 복원했다." 브라우저 port-forward를 대상에 다시 연결하는 작업은 수동이며, 사용자 접속 경로의 무중단 자동 전환까지 구현한 것은 아니다. member1 전체 장애, NFS HA, 장애 직전까지의 zero-loss 상태 보존을 주장하지 않는다.
+
 
 ## 12. 원래 controller-manager로 복구
 
