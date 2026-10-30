@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -136,7 +137,7 @@ func TestGroupSourceOnlyFencesWithoutControlJob(t *testing.T) {
 func groupClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, api.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, batchv1.AddToScheme, api.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}

@@ -7,7 +7,7 @@
   "rules": [
     {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create"]},
     {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["get", "list", "watch", "create"]},
-    {"apiGroups": ["apps"], "resources": ["statefulsets"], "verbs": ["get"]},
+    {"apiGroups": ["apps"], "resources": ["statefulsets"], "verbs": ["get", "patch"]},
     {"apiGroups": [""], "resources": ["persistentvolumeclaims", "persistentvolumes"], "verbs": ["get", "list", "watch"]},
     {"apiGroups": ["ml.dcn.ssu.ac.kr"], "resources": ["nodeprovisions"], "verbs": ["get", "list", "watch"]},
     {

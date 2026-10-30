@@ -99,6 +99,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return r.Client.Status().Update(ctx, &plan)
 	})
+	if err == nil {
+		err = r.wakePreparedWorkload(ctx, req.NamespacedName)
+	}
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 }
 
