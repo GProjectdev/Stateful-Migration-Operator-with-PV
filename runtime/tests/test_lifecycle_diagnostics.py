@@ -63,6 +63,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
                     "warn": lambda message: None,
                     "os": SimpleNamespace(_exit=exits.append),
                     "EXIT_CODE": 99,
+                    "CHECKPOINT_FAILURE_EXIT_CODE": 98,
                 }
                 exec(compile(_functions(path, names), str(path), "exec"), scope)
 
@@ -74,7 +75,7 @@ class LifecycleDiagnosticTests(unittest.TestCase):
 
                 scope["_start_watchdog_thread"]()
                 callbacks[1]()
-                self.assertEqual(exits, [99])
+                self.assertEqual(exits, [98 if root.name == "runtime" else 99])
 
                 output = stderr.getvalue()
                 self.assertIn("checkpoint watchdog armed", output)

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -175,38 +176,74 @@ def publish_round(checkpoint_path, context):
     if context is None:
         return
     read_manifest, read_generation = _distributed.read_manifest, _distributed.read_generation
-    with control_lock(timeout=300):
+    def revalidate():
         manifest = read_manifest()
         if (manifest.get("checkpointID") != context["checkpointID"]
                 or manifest.get("targets") != "all"
                 or read_generation() != context["generation"]):
             raise GroupConflict("checkpoint round changed during serialization")
+        active = _read(_active_path())
+        if active and active.get("state") not in ("completed", "retired"):
+            raise GroupConflict("cannot publish during a prepared group operation")
+
+    with control_lock():
+        revalidate()
         if os.path.realpath(checkpoint_path) != _path(context["checkpointPath"]):
             raise GroupConflict("producer checkpoint path mismatch")
-        metadata = dict(context, sha256=_digest(checkpoint_path),
-                        sizeBytes=os.path.getsize(checkpoint_path))
+    artifact = _path(context["artifactPath"])
+    os.makedirs(os.path.dirname(artifact), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(artifact), prefix=".artifact-")
+    stage = "copy"
+    started = time.monotonic()
+    def diagnostic():
+        print("[FluidCR publication] checkpoint={} rank={} stage={} elapsed_s={:.3f}".format(
+            context["checkpointID"], context["rank"], stage, time.monotonic() - started),
+            file=sys.stderr, flush=True)
+
+    def identity(stat):
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+    try:
+        diagnostic()
+        with os.fdopen(fd, "wb") as out, open(checkpoint_path, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            stage = "fsync"
+            diagnostic()
+            os.fsync(out.fileno())
+        stage = "hash"
+        diagnostic()
+        metadata = dict(context, sha256=_digest(tmp), sizeBytes=os.path.getsize(tmp))
         marker = _path("rounds/{}/ranks/{}.json".format(context["checkpointID"], context["rank"]))
-        previous = _read(marker)
-        if previous is not None and previous != metadata:
-            raise GroupConflict("immutable rank metadata already exists with different contents")
-        artifact = _path(context["artifactPath"])
+        existing = None
         if os.path.exists(artifact):
+            existing = identity(os.stat(artifact))
             if _digest(artifact) != metadata["sha256"] or os.path.getsize(artifact) != metadata["sizeBytes"]:
                 raise GroupConflict("immutable rank artifact already exists with different contents")
-        else:
-            os.makedirs(os.path.dirname(artifact), exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(artifact), prefix=".artifact-")
-            try:
-                with os.fdopen(fd, "wb") as out, open(checkpoint_path, "rb") as inp:
-                    shutil.copyfileobj(inp, out)
-                    out.flush()
-                    os.fsync(out.fileno())
+        stage = "commit"
+        diagnostic()
+        with control_lock():
+            revalidate()
+            previous = _read(marker)
+            if previous is not None and previous != metadata:
+                raise GroupConflict("immutable rank metadata already exists with different contents")
+            if existing is not None:
+                if identity(os.stat(artifact)) != existing:
+                    raise GroupConflict("immutable artifact changed during publication; retry")
+            elif os.path.exists(artifact):
+                raise GroupConflict("immutable artifact appeared during publication; retry")
+            else:
                 os.replace(tmp, artifact)
-            finally:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-        if previous is None:
-            _write(marker, metadata)
+            if previous is None:
+                _write(marker, metadata)
+        stage = "complete"
+        diagnostic()
+    except Exception:
+        stage += " failed"
+        diagnostic()
+        raise
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def validate_request(payload):

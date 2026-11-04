@@ -276,8 +276,10 @@ def _save_checkpoint(path: str) -> None:
         os.makedirs(ckpt_dir, exist_ok=True)
 
     tmp_path = path + ".tmp"
+    print("[FluidCR checkpoint] stage=serialize begin", file=sys.stderr, flush=True)
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+    print("[FluidCR checkpoint] stage=serialize complete", file=sys.stderr, flush=True)
     group_restore.publish_round(path, round_context)
 
 

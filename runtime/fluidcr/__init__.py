@@ -42,6 +42,9 @@ import threading
 from typing import Any, Iterable, Iterator, Optional, Tuple
 
 from fluidcr._config import CHECKPOINT_PATH, EXIT_CODE, log, warn
+
+# Always distinct from the configurable successful snapshot code and from 99.
+CHECKPOINT_FAILURE_EXIT_CODE = 98 if EXIT_CODE != 98 else 97
 from fluidcr._hook import install_hook
 from fluidcr.backends import get_active, get_backends
 
@@ -403,7 +406,7 @@ def _release_gpu_best_effort(backend: Any) -> None:
 # forcibly terminate the process.  Anything stuck inside HAMi's libvgpu.so
 # (CUDA copies during ``save_checkpoint`` or ``release_gpu``, DataLoader
 # worker cleanup in ``sys.exit``, etc.) is bypassed by this watchdog so the
-# Launcher always observes the checkpoint exit code.
+# Launcher observes a failure rather than an incomplete successful checkpoint.
 _SIGUSR1_WATCHDOG_TIMEOUT: int = int(
     os.environ.get("FLUIDCR_CHECKPOINT_WATCHDOG_TIMEOUT", "60")
 )
@@ -463,13 +466,13 @@ def _start_watchdog_thread() -> None:
             return  # cancelled: this rank rendezvoused and is parking as a survivor
         _lifecycle_diagnostic(
             f"checkpoint watchdog fired timeout_s={_SIGUSR1_WATCHDOG_TIMEOUT} "
-            f"exit_code={EXIT_CODE}"
+            f"exit_code={CHECKPOINT_FAILURE_EXIT_CODE}"
         )
         warn(
             f"Checkpoint watchdog fired after {_SIGUSR1_WATCHDOG_TIMEOUT}s -- "
             "forcing exit."
         )
-        os._exit(EXIT_CODE)
+        os._exit(CHECKPOINT_FAILURE_EXIT_CODE)
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
@@ -566,9 +569,10 @@ def perform_checkpoint_and_exit(backend: Any = None) -> None:
         backend = get_active()
     if backend is None:
         _lifecycle_diagnostic(
-            f"checkpoint save_exit skipped backend=none exit_code={EXIT_CODE}"
+            f"checkpoint save_exit failed backend=none exit_code={CHECKPOINT_FAILURE_EXIT_CODE}"
         )
-        os._exit(EXIT_CODE)
+        os._exit(CHECKPOINT_FAILURE_EXIT_CODE)
+        return
 
     backend_name = getattr(backend, "name", type(backend).__name__)
     _lifecycle_diagnostic(f"checkpoint save begin backend={backend_name}")
@@ -595,6 +599,8 @@ def perform_checkpoint_and_exit(backend: Any = None) -> None:
             f"error_type={type(exc).__name__}"
         )
         warn(f"Error saving checkpoint: {exc}")
+        os._exit(CHECKPOINT_FAILURE_EXIT_CODE)
+        return
 
     # Best-effort GPU release in a background thread with a timeout.  The
     # checkpoint is already on disk; cleanup is best-effort only.
@@ -647,7 +653,8 @@ def _sigusr1_handler(signum: int, frame: Any) -> None:
             "checkpoint signal branch backend=none action=exit"
         )
         log("SIGUSR1 received but no ML framework imported -- nothing to save.")
-        os._exit(EXIT_CODE)
+        os._exit(CHECKPOINT_FAILURE_EXIT_CODE)
+        return
 
     backend_name = getattr(backend, "name", type(backend).__name__)
     if distributed_checkpoint_enabled():

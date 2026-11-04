@@ -220,6 +220,7 @@ def main(command: List[str]) -> int:
             continue
 
         # Unexpected failure.
+        _lifecycle_log(f"checkpoint unavailable worker_exit_code={rc} action=abort")
         _log(f"[Launcher] Unexpected exit code {rc}. Aborting.")
         record_runtime_status(state="Failed")
         return rc

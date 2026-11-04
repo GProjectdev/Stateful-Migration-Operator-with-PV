@@ -85,15 +85,17 @@ make docker-push IMG=<REGISTRY>/stateful-migration-system:<TAG>
 
 ### FluidCR payload 호환 overlay
 
+E2 publication failure fix and Buildah deployment: [release guide](docs/e2-checkpoint-publication.md).
+
 제공된 FluidCR의 rank checkpoint API는 신호 전송 직후 `checkpoint-signalled`를 반환할 수 있습니다.
 이 상태를 완료로 취급하지 않도록, 이 저장소의 overlay는 `wait:true` 요청에 대해
 애플리케이션 완료 잠금을 확인한 뒤 응답하도록 보완합니다. 원본 FluidCR 소스는 변경하지 않습니다.
 
 ```bash
-docker build -f Dockerfile.payload-overlay \
+buildah bud -f Dockerfile.payload-overlay \
   --build-arg FLUIDCR_PAYLOAD_IMAGE=<YOUR_EXISTING_FLUIDCR_PAYLOAD_IMAGE> \
   -t <REGISTRY>/fluidcr-payload:stateful-wait .
-docker push <REGISTRY>/fluidcr-payload:stateful-wait
+buildah push <REGISTRY>/fluidcr-payload:stateful-wait docker://<REGISTRY>/fluidcr-payload:stateful-wait
 ```
 
 Source/Target FluidCR 주입 웹훅의 `--payload-image`를 이 이미지로 변경한 뒤 새로운 workload Pod를 배포하세요.
