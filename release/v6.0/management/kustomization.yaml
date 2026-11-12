@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../config/management
+commonAnnotations:
+  architecture.dcnlab.com/display-name: "Multi-Cluster Restore Controller"
+  architecture.dcnlab.com/release: v6.0
+images:
+  - name: ghcr.io/gprojectdev/stateful-migration-system
+    newName: docker.io/jeongseungjun/stateful-migration-system
+    newTag: v6.0
