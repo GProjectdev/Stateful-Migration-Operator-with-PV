@@ -158,6 +158,10 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
+	if cancelled, err := r.cancelUnstartedScheduledChild(ctx, &migration); err != nil || cancelled {
+		return ctrl.Result{}, err
+	}
+
 	log.Info("reconciling FluidCRMigration", "workload", migration.Spec.WorkloadRef.Name, "phase", migration.Status.Phase)
 	return r.reconcileWorkflow(ctx, &migration)
 }
@@ -340,7 +344,7 @@ func controlledBy(child, parent *fluidcrv1alpha1.FluidCRMigration) bool {
 
 func activeScheduledChild(children []fluidcrv1alpha1.FluidCRMigration) *fluidcrv1alpha1.FluidCRMigration {
 	for i := range children {
-		if !durableFullCheckpointComplete(&children[i]) {
+		if !durableFullCheckpointComplete(&children[i]) && !cancelledBeforeActuation(&children[i]) {
 			return &children[i]
 		}
 	}

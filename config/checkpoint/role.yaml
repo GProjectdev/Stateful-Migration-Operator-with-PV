@@ -90,6 +90,17 @@
         "update",
         "patch"
       ]
+    },
+    {
+      "apiGroups": [
+        "fluidcr.dcnlab.com"
+      ],
+      "resources": [
+        "fluidcrmigrations"
+      ],
+      "verbs": [
+        "create"
+      ]
     }
   ]
 }
