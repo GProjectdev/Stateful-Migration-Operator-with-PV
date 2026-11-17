@@ -1541,7 +1541,10 @@ func targetRanksPresent(targets []target, targetRanks map[int64]bool) bool {
 }
 
 func resolvePodRank(m *fluidcrv1alpha1.FluidCRMigration, pod *corev1.Pod) (int64, error) {
-	if m.Spec.PartialCheckpoint == nil {
+	if m.Spec.PartialCheckpoint == nil && m.Spec.WorkloadRef.Kind != "StatefulSet" {
+		// Legacy full checkpoints on unranked workloads retain their behavior.
+		// StatefulSet ordinals identify ranks for full checkpoints too; returning
+		// zero for every pod corrupts the evidence used by evaluation and resume.
 		return 0, nil
 	}
 	switch m.Spec.WorkloadRef.Kind {
