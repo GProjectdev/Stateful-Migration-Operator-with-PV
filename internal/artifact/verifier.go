@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	api "github.com/GProjectdev/Stateful-Migration-Operator-with-PV/api/v1alpha1"
+	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -185,6 +186,12 @@ func (v *Verifier) Poll(ctx context.Context) error {
 	for i := range plans.Items {
 		p := &plans.Items[i]
 		if (p.Spec.SourceCluster != v.ClusterName && p.Spec.TargetCluster != v.ClusterName) || !p.DeletionTimestamp.IsZero() {
+			continue
+		}
+		// Match the member actuator's terminal receipt gate. Completed restores
+		// need no new archive reports; keep every hash check for active/new
+		// generations, whose UID/checkpoint-bound receipt will not match.
+		if groupcontract.PartialTargetVerified(p) || groupcontract.TargetVerified(p) {
 			continue
 		}
 		found, verified, message := false, true, "SHA256 verified"
