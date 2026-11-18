@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/types"
 	"net/http"
+	"path"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -70,7 +73,12 @@ func (r *FluidCRMigrationReconciler) resumeWithExec(ctx context.Context, m *flui
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	command := []string{"env", "PYTHONPATH=/opt/fluidcr", "python3", "-c", resumeInPlaceScript, id}
+	checkpointEnv, err := r.resumeCheckpointEnv(ctx, t)
+	if err != nil {
+		return err
+	}
+	command := append([]string{"env", "PYTHONPATH=/opt/fluidcr"}, checkpointEnv...)
+	command = append(command, "python3", "-c", resumeInPlaceScript, id)
 	if err := r.PodExecutor.Execute(ctx, t.namespace, t.podName, t.container, command); err != nil {
 		return err
 	}
@@ -89,4 +97,55 @@ func (r *FluidCRMigrationReconciler) resumeWithExec(ctx context.Context, m *flui
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// CRI-restored containers can retain the snapshotted process environment while
+// a new exec receives a different OCI environment. Resolve only the explicit
+// checkpoint contract from the current UID-validated Pod, never a PID fallback.
+func (r *FluidCRMigrationReconciler) resumeCheckpointEnv(ctx context.Context, t target) ([]string, error) {
+	var pod corev1.Pod
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: t.namespace, Name: t.podName}, &pod); err != nil {
+		return nil, err
+	}
+	if pod.UID != t.podUID || !pod.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("resume pod UID changed or deleting")
+	}
+	var container *corev1.Container
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == t.container {
+			container = &pod.Spec.Containers[i]
+			break
+		}
+	}
+	if container == nil {
+		return nil, fmt.Errorf("resume container missing")
+	}
+	values := map[string]string{}
+	for _, e := range container.Env {
+		if e.Name == "FLUIDCR_CHECKPOINT_PATH" || e.Name == "FLUIDCR_CHECKPOINT_DIR" {
+			if e.ValueFrom != nil || values[e.Name] != "" {
+				return nil, fmt.Errorf("checkpoint environment must be explicit and unique")
+			}
+			values[e.Name] = e.Value
+		}
+	}
+	replace := strings.NewReplacer("$(POD_NAME)", pod.Name, "$(POD_NAMESPACE)", pod.Namespace, "$(POD_UID)", string(pod.UID), "$(NODE_NAME)", pod.Spec.NodeName, "$(RANK)", strconv.FormatInt(t.rank, 10))
+	root, file := replace.Replace(values["FLUIDCR_CHECKPOINT_DIR"]), replace.Replace(values["FLUIDCR_CHECKPOINT_PATH"])
+	if !path.IsAbs(root) || root == "/" || path.Clean(root) != root || !path.IsAbs(file) || path.Clean(file) != file || strings.Contains(root+file, "$(") || !strings.HasPrefix(file, root+"/") {
+		return nil, fmt.Errorf("invalid explicit checkpoint root/path")
+	}
+	writable := false
+	for _, mount := range container.VolumeMounts {
+		if !mount.ReadOnly && (mount.MountPath == root || strings.HasPrefix(root, strings.TrimSuffix(mount.MountPath, "/")+"/")) {
+			writable = true
+		}
+	}
+	if !writable {
+		return nil, fmt.Errorf("checkpoint root is not on a writable container mount")
+	}
+	return []string{"FLUIDCR_CHECKPOINT_DIR=" + root, "FLUIDCR_CHECKPOINT_PATH=" + file}, nil
 }

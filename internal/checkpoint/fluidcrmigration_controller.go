@@ -155,7 +155,13 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Single-shot once terminal for the current spec generation.
 	if isTerminalPhase(migration.Status.Phase) && migration.Status.ObservedGeneration == migration.Generation {
-		return ctrl.Result{}, nil
+		retry, err := r.retryFailedResumeAllowed(ctx, &migration)
+		if err != nil || !retry {
+			return ctrl.Result{}, err
+		}
+		if remaining := time.Until(migration.Status.CompletionTime.Add(10 * time.Second)); remaining > 0 {
+			return ctrl.Result{RequeueAfter: remaining}, nil
+		}
 	}
 
 	if cancelled, err := r.cancelUnstartedScheduledChild(ctx, &migration); err != nil || cancelled {
@@ -163,7 +169,13 @@ func (r *FluidCRMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	log.Info("reconciling FluidCRMigration", "workload", migration.Spec.WorkloadRef.Name, "phase", migration.Status.Phase)
-	return r.reconcileWorkflow(ctx, &migration)
+	result, err := r.reconcileWorkflow(ctx, &migration)
+	if err == nil && migration.Status.Phase == fluidcrv1alpha1.PhaseFailed {
+		if c := meta.FindStatusCondition(migration.Status.Conditions, conditionReady); c != nil && c.Reason == "ResumeFailed" {
+			result.RequeueAfter = 10 * time.Second
+		}
+	}
+	return result, err
 }
 
 func (r *FluidCRMigrationReconciler) reconcileSchedule(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration) (ctrl.Result, error) {
