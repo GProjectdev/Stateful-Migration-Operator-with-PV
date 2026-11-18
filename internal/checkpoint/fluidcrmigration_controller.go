@@ -188,7 +188,7 @@ func (r *FluidCRMigrationReconciler) reconcileSchedule(ctx context.Context, pare
 			if err := validateReservedScheduledChild(parent, parent.Status.CurrentRun, child); err != nil {
 				return ctrl.Result{}, err
 			}
-			blocking := activeScheduledChild(children) != nil
+			blocking := activeScheduledChildForParent(parent, children) != nil
 			result, err := r.updateScheduleFromCurrentChild(ctx, parent, child, blocking)
 			if err != nil || blocking {
 				return result, err
@@ -206,7 +206,7 @@ func (r *FluidCRMigrationReconciler) reconcileSchedule(ctx context.Context, pare
 			return r.blockScheduleOnPinnedCurrentRun(ctx, parent, fmt.Sprintf("waiting for pinned scheduled child %s UID %s, found UID %s", child.Name, parent.Status.CurrentRun.UID, child.UID))
 		}
 	}
-	active := activeScheduledChild(children)
+	active := activeScheduledChildForParent(parent, children)
 	current := active
 	if current == nil && parent.Status.CurrentRun != nil {
 		current = childByName(children, parent.Status.CurrentRun.Name)
@@ -264,7 +264,8 @@ func (r *FluidCRMigrationReconciler) blockScheduleOnPinnedCurrentRun(ctx context
 }
 
 func (r *FluidCRMigrationReconciler) updateScheduleFromCurrentChild(ctx context.Context, parent *fluidcrv1alpha1.FluidCRMigration, current *fluidcrv1alpha1.FluidCRMigration, blocking bool) (ctrl.Result, error) {
-	parent.Status.CurrentRun = scheduledRunReference(current, false)
+	// Keep failed evidence for a verified full-group recovery handoff as well.
+	parent.Status.CurrentRun = scheduledRunReference(current, terminalFailedFullChild(current))
 	if durableFullCheckpointComplete(current) && !sameRunReference(parent.Status.LastSuccessfulFullCheckpoint, current) {
 		parent.Status.LastSuccessfulCheckpoint = scheduledRunReference(current, true)
 		parent.Status.LastSuccessfulFullCheckpoint = scheduledRunReference(current, true)

@@ -1,0 +1,45 @@
+Failed periodic checkpoint handoff — 2026-11-18
+
+A real single-Spot FIS interruption in the four-rank acceptance left a periodic
+child Failed. activeScheduledChild treated every non-durable child as active,
+including finalized failures. The disabled parent never acknowledged Paused,
+so the management full-group recovery waited indefinitely for quiescence.
+
+The checkpoint controller now acknowledges a disabled schedule when a full
+Failed child is terminal, observedGeneration matches, completionTime is present
+and the child is not deleting. This acknowledges stopped controller actuation;
+it does not certify successful checkpoint bytes, released application locks or
+resumed training. Nonterminal, deleting, stale, partial and incomplete durable
+success cases still block. The Failed child and checkpoint data are retained.
+CurrentRun.Result retains its failed spec/status for the existing management
+handoff; LastSuccessfulFullCheckpoint still requires actual complete exports.
+No CRD fields, force-finalizer path or upstream Karmada changes were introduced.
+
+An enabled schedule continues blocking on that failed child until management
+publishes training.dcnlab.com/verified-scheduled-retirements after an actual
+Verified full-group restore and source-fence validation. Its receipt binds policy,
+source world, exact failed-child UID/generation/checkpointID, every rank/Pod UID,
+RestoreRequest UID, operation, fence evidence and verification time. The member
+matches these fields against its retained child before allowing a fresh round.
+This is an authenticated management command under the existing API/RBAC trust
+model, not an assertion that a Failed migration became Completed. Multiple
+retirements remain keyed by immutable child UID. Failure history is not deleted.
+
+Regression coverage includes pause-with-failure versus usable success, continued
+enabled blocking without verified receipt, new-round creation after exact
+receipt, nonterminal pause refusal, and wrong UID/world/generation/rank/fence
+rejection. go test ./... passed outside the local-port-restricted sandbox.
+
+Buildah/registry-verified checkpoint-role image:
+docker.io/jeongseungjun/stateful-migration-system@sha256:bdbee5a79ddd9074ee14fdd30dc4e8ebbacbbbdc0c16c51260912e54f5b5b31e
+Applied only to AWS/ONPRE1 stateful-checkpoint. The management counterpart is in
+HybridSpotVM_ManagementSystem/internal/management/failed_schedule_handoff.go.
+
+Live component evidence: /home/ubuntu/v3-validation-20261118/gpt2-four-rank-payloadfix-fis-09
+The original FIS event was reused; no second fault was injected for this repair.
+RestoreRequest dbd6bff2-bc9e-4bc8-bfd6-9ac04ed8bdb8 became Verified at10:32:27UTC.
+Failed child33af329f-bd86-4f22-9c78-c4233e36ce90 remained Failed, the exact receipt
+propagated to the member, and fresh child846e1ec4-38ba-4275-92b2-7136e4721bdd
+entered AppCheckpointing. Its durable completion and final goal are reported in
+the later validation TXT; creation alone is not completion. This acceptance was
+upgraded during recovery and is ineligible as formal recovery-latency evidence.
