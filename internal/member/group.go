@@ -184,6 +184,29 @@ func groupPrepared(plan *api.RestorePlan) bool {
 	s := plan.Status.GroupControl
 	return s != nil && s.OperationUID == plan.Spec.GroupRestore.OperationUID && s.CheckpointID == plan.Spec.CheckpointRef.CheckpointID && s.CheckpointGeneration > 0 && s.PrepareJobUID != "" && s.PreparedAt != nil && plan.Status.ObservedGeneration == plan.Generation
 }
+
+// Restored launchers wait on the operation-owned locks with their REST server
+// closed. Requiring PodReady (the REST-port probe) before releasing those locks
+// deadlocks. All mapped containers must actually be running before the existing
+// resume Job may release the barrier. Ready and post-resume progress remain
+// necessary for Running/Verified; source and archive gates are unchanged.
+func groupContainersRunning(pod *corev1.Pod, mapping *api.RestorePod) bool {
+	if len(mapping.Archives) == 0 {
+		return false
+	}
+	for _, archive := range mapping.Archives {
+		found := false
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name == archive.ContainerName && status.State.Running != nil && status.ContainerID != "" {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
 func groupSourceReceipt(plan *api.RestorePlan) error {
 	if plan.Spec.SourceCluster == plan.Spec.TargetCluster {
 		return groupcontract.ValidateFences(plan, plan.Status.SourceFences)

@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -221,8 +222,21 @@ func TestGroupEndToEndFencingPrepareAdmissionResume(t *testing.T) {
 	target.UID = "new"
 	target.Spec.NodeName = node.Name
 	target.Status.Phase = corev1.PodRunning
-	target.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	target.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	target.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: p.Spec.Pods[0].Archives[0].ContainerName, ContainerID: "cri-o://restored", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}}}
 	if err := c.Create(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	reconcileGroup(t, r, p)
+	if p.Status.Phase != "Prepared" {
+		t.Fatalf("must wait for actual mapped container execution: %+v", p.Status)
+	}
+	var premature batchv1.Job
+	if err := c.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: groupJobName(p, "resume")}, &premature); !apierrors.IsNotFound(err) {
+		t.Fatalf("resume created before all launchers running: %v", err)
+	}
+	target.Status.ContainerStatuses[0].State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+	if err := c.Status().Update(ctx, target); err != nil {
 		t.Fatal(err)
 	}
 	reconcileGroup(t, r, p)
@@ -230,6 +244,14 @@ func TestGroupEndToEndFencingPrepareAdmissionResume(t *testing.T) {
 		t.Fatalf("want Resuming not premature Running: %+v", p.Status)
 	}
 	completeGroupJob(t, c, p, "resume", 7)
+	reconcileGroup(t, r, p)
+	if p.Status.Phase != "Resuming" || p.Status.GroupControl.ResumedAt == nil {
+		t.Fatalf("resume receipt must not certify readiness: %+v", p.Status)
+	}
+	target.Status.Conditions[0].Status = corev1.ConditionTrue
+	if err := c.Status().Update(ctx, target); err != nil {
+		t.Fatal(err)
+	}
 	reconcileGroup(t, r, p)
 	if p.Status.Phase != "Running" || p.Status.GroupControl.ResumedAt == nil || p.Status.GroupControl.ResumeJobUID == "" {
 		t.Fatalf("resume evidence missing: %+v", p.Status)

@@ -146,6 +146,7 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		}
 	}
 	prepared, running := true, true
+	groupLaunchersRunning := plan.Spec.GroupRestore != nil
 	staged := plan.Spec.PartialRestore != nil
 	failure := ""
 	statuses := make([]api.PodStatus, 0, len(plan.Spec.Pods))
@@ -202,6 +203,7 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		}
 		if apierrors.IsNotFound(err) {
 			running = false
+			groupLaunchersRunning = false
 			statuses = append(statuses, api.PodStatus{Name: mapping.TargetPod, Phase: "Pending", Message: "waiting for externally created Pod"})
 			continue
 		}
@@ -242,6 +244,9 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 		if pod.Status.Phase != corev1.PodRunning || !ready || pod.Spec.NodeName != mapping.TargetNode {
 			running = false
 		}
+		if pod.Status.Phase != corev1.PodRunning || pod.Spec.NodeName != mapping.TargetNode || !groupContainersRunning(&pod, &mapping) {
+			groupLaunchersRunning = false
+		}
 		if staged && !ready && failure == "" && mappingReady {
 			if err := r.probeStagedTarget(ctx, plan, &mapping, &pod, sourceFences); err != nil {
 				status.Message = "waiting for staged launcher evidence: " + err.Error()
@@ -260,7 +265,7 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 	if staged && !running && allTargetsStaged(plan, statuses) {
 		return "StagedReady", "restored launchers staged; waiting for restore-owned round release", statuses, sourceFences, nil
 	}
-	if running {
+	if running || groupLaunchersRunning {
 		if plan.Spec.GroupRestore != nil {
 			done, err := r.resumeGroup(ctx, plan)
 			if err != nil {
@@ -268,6 +273,9 @@ func (r *Reconciler) evaluate(ctx context.Context, plan *api.RestorePlan) (strin
 			}
 			if !done {
 				return "Resuming", "waiting for operation-owned resume Job", statuses, sourceFences, nil
+			}
+			if !running {
+				return "Resuming", "operation-owned resume completed; waiting for planned Pods to become Ready", statuses, sourceFences, nil
 			}
 		}
 		return "Running", "all planned Pods are Running and Ready; CRIU restore success is not attested", statuses, sourceFences, nil

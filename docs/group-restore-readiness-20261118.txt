@@ -1,0 +1,62 @@
+Full-group restore readiness barrier fix — 2026-11-18
+
+Observed failure
+The four-rank GPT-2 component acceptance used four distinct g6.xlarge GPU
+workers in aws1, one rank/GPU per VM, full durable checkpoint and one new OD
+worker. All four checkpoint archives were exported and all source Pod UIDs
+were positively fenced. The prepare Job succeeded, and restored trainer
+containers were Running, but their TCP control-port readiness probes stayed
+false. Only the restored launcher process remained: it was waiting on the
+operation-owned lock and its REST server was intentionally closed.
+
+Cause
+internal/member/reconciler.go required PodReady before resumeGroup could
+create the resume Job. fluidcr/launcher.py closes its REST server before the
+CRIU checkpoint and starts it only after lock removal. group_restore.py
+prepare_group creates those locks, and resume_group releases them. A control
+port readiness probe therefore produced a circular dependency. This is not a
+DDP rank-count limitation or a reason to weaken UID/source-fencing guards.
+
+Change
+internal/member/group.go: groupContainersRunning requires each mapped archive
+container to have Running state and a nonempty CRI container ID.
+internal/member/reconciler.go allows the existing operation-owned resume Job
+only after all mapped Pods/containers are Running on their exact target nodes.
+All existing plan UID/generation, source fencing, current artifact, target node
+capability, injection and shared-PVC validation still precede this release.
+The phase remains Resuming until all target Pods become Ready. Management
+Verified still requires fresh post-resume TrainingRuntime progress; no status
+is manually promoted and no finalizer is bypassed.
+
+Regression evidence
+internal/member/group_test.go TestGroupEndToEndFencingPrepareAdmissionResume
+now models the actual closed-control-port state. It verifies that Waiting
+containers cannot create the resume Job; Running but unready mapped containers
+can release the existing barrier; a completed resume Job alone cannot certify
+Running; Ready is still required afterward. Existing management/fencing tests
+and the complete go test ./... suite passed. No CRD or upstream Karmada change.
+
+Image deployed to AWS and ONPRE1 stateful-member only
+ docker.io/jeongseungjun/stateful-migration-system@sha256:339e68a1561577aabf1d8be5a9a3fe6d5e70370ce9f98fafae22a1908a6ddf5a
+Source tree hash: 0d65c18da6cec5d49c6db75918d79bb7455d691806e68cbf149621fc2053d9b9
+Buildah build/push and registry digest verification succeeded.
+Private deployment backups and build/test receipts:
+ /home/ubuntu/v3-validation-20261118/member-barrier-fix
+
+Live acceptance after rollout
+ /home/ubuntu/v3-validation-20261118/gpt2-four-rank-od-03
+RestoreRequest UID: 6f70c8d2-35b2-4c6a-9aac-8a5223ee3888
+Verified at: 2026-11-18T07:42:55Z
+Four new Pod UIDs; every rank passed model, optimizer, RNG, step restore audit
+and finite-gradient/changed-parameter optimizer update. All four reached step
+211 from checkpoint step109 (at least100 new updates) before normal cleanup.
+All five historical EC2 IDs positively terminated, root EBS volumes confirmed
+absent, temporary keypairs removed, PVC/PV/NFS/checkpoints retained.
+
+Limits
+This was an OD-only component test, not A, B or C quantitative evidence. The
+controller changed during the diagnostic, so its elapsed time is not a formal
+recovery latency. Goal8000 was not changed or completed: the test stopped after
+its component proof to avoid unnecessary billed work. Actual single-Spot FIS,
+policy-triggered transitions and formal locked-goal completion are distinct
+requirements and are not certified by this receipt.
