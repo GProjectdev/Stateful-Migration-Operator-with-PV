@@ -276,6 +276,9 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	if node.Labels[RuntimeCapabilityLabel] != "true" {
 		return fmt.Errorf("target node lacks admin-certified restore-from-file capability")
 	}
+	if !provisionAffinityAllows(pod, &node) {
+		return fmt.Errorf("target provision UID is excluded by submitted Pod affinity; wait for current workload template")
+	}
 	var existing corev1.Pod
 	if err = w.Reader.Get(ctx, client.ObjectKeyFromObject(pod), &existing); err == nil {
 		return fmt.Errorf("mapped Pod already exists; automatic adoption is forbidden")
@@ -326,6 +329,52 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	}
 	pinNode(pod, mapping.TargetNode)
 	return nil
+}
+
+// Karmada may propagate the new allocation override after the restore backend
+// releases replicas. Reject a CREATE carrying the previous allocation UIDs so
+// the StatefulSet retries with its current template. Never rewrite user affinity
+// or admit an immutable Pending Pod pinned to an incompatible target.
+func provisionAffinityAllows(pod *corev1.Pod, node *corev1.Node) bool {
+	const key = "ml.dcn.ssu.ac.kr/node-provision-uid"
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil || pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return true
+	}
+	value, exists := node.Labels[key]
+	for _, term := range pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		allowed := true
+		for _, expr := range term.MatchExpressions {
+			if expr.Key != key {
+				continue
+			}
+			contains := false
+			for _, candidate := range expr.Values {
+				contains = contains || candidate == value
+			}
+			matches := false
+			switch expr.Operator {
+			case corev1.NodeSelectorOpIn:
+				matches = exists && contains
+			case corev1.NodeSelectorOpNotIn:
+				matches = !contains
+			case corev1.NodeSelectorOpExists:
+				matches = exists
+			case corev1.NodeSelectorOpDoesNotExist:
+				matches = !exists
+			case corev1.NodeSelectorOpGt, corev1.NodeSelectorOpLt:
+				if exists && len(expr.Values) == 1 {
+					n, e1 := strconv.ParseInt(value, 10, 64)
+					limit, e2 := strconv.ParseInt(expr.Values[0], 10, 64)
+					matches = e1 == nil && e2 == nil && ((expr.Operator == corev1.NodeSelectorOpGt && n > limit) || (expr.Operator == corev1.NodeSelectorOpLt && n < limit))
+				}
+			}
+			allowed = allowed && matches
+		}
+		if allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Webhook) planForAdmission(ctx context.Context, pod *corev1.Pod) (api.RestorePlan, error) {

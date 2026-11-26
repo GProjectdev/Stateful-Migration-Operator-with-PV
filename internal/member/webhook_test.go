@@ -94,6 +94,49 @@ func TestMutationIdempotentPreservesSchedulingAndImage(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsPreviousAllocationUntilTemplatePropagates(t *testing.T) {
+	plan, pod, node := fixture()
+	const key = "ml.dcn.ssu.ac.kr/node-provision-uid"
+	node.Labels[key] = "new-spot-uid"
+	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{
+		{Key: "user-gpu", Operator: corev1.NodeSelectorOpExists},
+		{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{"survivor-uid", "lost-spot-uid", "od-uid"}},
+	}}}}}}
+	w := NewWebhook(testClient(t, plan, node), "target")
+	before := pod.DeepCopy()
+	if err := w.Apply(context.Background(), pod); err == nil || !strings.Contains(err.Error(), "wait for current workload template") {
+		t.Fatalf("stale allocation CREATE must be retried, got %v", err)
+	}
+	if !reflect.DeepEqual(before, pod) {
+		t.Fatal("rejected Pod or user constraints were mutated")
+	}
+	pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[1].Values[1] = "new-spot-uid"
+	before = pod.DeepCopy()
+	if err := w.Apply(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions, pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions) || !nodePinned(pod, node.Name) {
+		t.Fatal("current allocation must preserve expressions and pin the exact target")
+	}
+}
+
+func TestProvisionAffinityPreservesORTerms(t *testing.T) {
+	_, pod, node := fixture()
+	const key = "ml.dcn.ssu.ac.kr/node-provision-uid"
+	node.Labels[key] = "current"
+	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+		{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{"old"}}}},
+		{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{"current"}}}},
+	}}}}
+	if !provisionAffinityAllows(pod, node) {
+		t.Fatal("one compatible OR branch must remain usable")
+	}
+	delete(node.Labels, key)
+	if provisionAffinityAllows(pod, node) {
+		t.Fatal("missing provision UID cannot satisfy In")
+	}
+}
+
 func TestAdmissionFailsClosed(t *testing.T) {
 	cases := []struct {
 		name   string
