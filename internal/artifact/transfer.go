@@ -32,12 +32,20 @@ func Upload(storeRoot, sourceRoot string, plan *api.RestorePlan, archive api.Arc
 	if sourceRoot == "" {
 		sourceRoot = DefaultRoot
 	}
-	if err := Verify(sourceRoot, archive.SourcePath, archive.SHA256); err != nil {
-		return fmt.Errorf("source archive verification failed: %w", err)
+	if _, err := RelativePath(archive.SourcePath); err != nil {
+		return err
 	}
 	key, err := ObjectKey(plan, archive)
 	if err != nil {
 		return err
+	}
+	// The durable, content-addressed copy is authoritative after export. Local
+	// staging may have been reclaimed; verify the durable bytes before reuse.
+	if err := Verify(storeRoot, HostRoot+"/"+key, archive.SHA256); err == nil {
+		return nil
+	}
+	if err := Verify(sourceRoot, archive.SourcePath, archive.SHA256); err != nil {
+		return fmt.Errorf("source archive verification failed: %w", err)
 	}
 	if err := copyAtomic(sourceRoot, archive.SourcePath, storeRoot, key, archive.SHA256); err != nil {
 		return err

@@ -95,3 +95,36 @@ func TestConcurrentIdenticalDigestWritersDoNotClobberTempFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestVerifiedDurableArchiveSurvivesLocalStagingReclamation(t *testing.T) {
+	source, store, target := t.TempDir(), t.TempDir(), t.TempDir()
+	data := []byte("durable checkpoint after local staging reclamation")
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	if err := os.WriteFile(filepath.Join(source, "src.tar"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	plan := &api.RestorePlan{ObjectMeta: metav1.ObjectMeta{Name: "plan", Namespace: "ns"}}
+	a := api.Archive{SourcePath: HostRoot + "/src.tar", TargetPath: HostRoot + "/restored.tar", SHA256: digest}
+	if err := Upload(store, source, plan, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(source, "src.tar")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Upload(store, source, plan, a); err != nil {
+		t.Fatal("verified durable copy unavailable after local cleanup", err)
+	}
+	if err := Download(store, target, plan, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(target, a.TargetPath, digest); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := ObjectKey(plan, a)
+	if err := os.WriteFile(filepath.Join(store, key), []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Upload(store, source, plan, a); err == nil {
+		t.Fatal("corrupt durable archive accepted with missing source")
+	}
+}
