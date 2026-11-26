@@ -184,7 +184,8 @@ func completeGroupJob(t *testing.T, c client.Client, p *api.RestorePlan, action 
 func TestGroupEndToEndFencingPrepareAdmissionResume(t *testing.T) {
 	ctx := context.Background()
 	p, old, node, pvc, pv := groupFixture()
-	c := groupClient(t, p, old, node, pvc, pv)
+	work := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: "jobs", UID: "local-world"}}
+	c := groupClient(t, p, old, node, pvc, pv, work)
 	r := NewReconciler(c, c, "target")
 	r.GroupControlImage = "control@sha256:" + strings.Repeat("b", 64)
 	candidate := old.DeepCopy()

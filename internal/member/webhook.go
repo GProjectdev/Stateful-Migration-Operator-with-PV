@@ -9,6 +9,7 @@ import (
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/artifact"
 	"github.com/GProjectdev/Stateful-Migration-Operator-with-PV/internal/groupcontract"
 	admissionv1 "k8s.io/api/admission/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -279,6 +280,9 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	if !provisionAffinityAllows(pod, &node) {
 		return fmt.Errorf("target provision UID is excluded by submitted Pod affinity; wait for current workload template")
 	}
+	if err := w.groupPlacementReady(ctx, &plan, pod); err != nil {
+		return err
+	}
 	var existing corev1.Pod
 	if err = w.Reader.Get(ctx, client.ObjectKeyFromObject(pod), &existing); err == nil {
 		return fmt.Errorf("mapped Pod already exists; automatic adoption is forbidden")
@@ -331,6 +335,68 @@ func (w *Webhook) Apply(ctx context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
+// Every rank must see the SAME new allocation set, including ranks remaining
+// on surviving nodes. Checking only its own target admits part of the old
+// StatefulSet revision and prevents the next stable checkpoint snapshot.
+func (w *Webhook) groupPlacementReady(ctx context.Context, plan *api.RestorePlan, pod *corev1.Pod) error {
+	if plan.Spec.GroupRestore == nil || plan.Spec.WorkloadRef.Kind != "StatefulSet" {
+		return nil
+	}
+	var work appsv1.StatefulSet
+	if err := w.Reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: plan.Spec.WorkloadRef.Name}, &work); err != nil {
+		return err
+	}
+	if work.Labels["training.dcnlab.com/run-uid"] == "" {
+		return nil // Generic restore users do not use framework allocation overrides.
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.UID != work.UID || !work.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("group placement workload incarnation mismatch")
+	}
+	const key = "ml.dcn.ssu.ac.kr/node-provision-uid"
+	wanted := map[string]bool{}
+	for _, mapping := range plan.Spec.Pods {
+		var node corev1.Node
+		if err := w.Reader.Get(ctx, client.ObjectKey{Name: mapping.TargetNode}, &node); err != nil {
+			return err
+		}
+		uid := node.Labels[key]
+		if uid == "" || !node.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("group target allocation identity unavailable")
+		}
+		wanted[uid] = true
+	}
+	if int64(len(wanted)) != plan.Spec.GroupRestore.WorldSize {
+		return fmt.Errorf("group target allocation set is incomplete")
+	}
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil || pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return fmt.Errorf("waiting for complete group allocation affinity before admitting any rank")
+	}
+	terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) == 0 {
+		return fmt.Errorf("empty group placement affinity")
+	}
+	for _, term := range terms {
+		found := false
+		for _, expr := range term.MatchExpressions {
+			if expr.Key != key || expr.Operator != corev1.NodeSelectorOpIn || len(expr.Values) != len(wanted) {
+				continue
+			}
+			seen := map[string]bool{}
+			for _, value := range expr.Values {
+				if wanted[value] {
+					seen[value] = true
+				}
+			}
+			found = found || len(seen) == len(wanted)
+		}
+		if !found {
+			return fmt.Errorf("waiting for complete group allocation affinity before admitting any rank")
+		}
+	}
+	return nil
+}
+
 // Karmada may propagate the new allocation override after the restore backend
 // releases replicas. Reject a CREATE carrying the previous allocation UIDs so
 // the StatefulSet retries with its current template. Never rewrite user affinity
@@ -356,7 +422,7 @@ func provisionAffinityAllows(pod *corev1.Pod, node *corev1.Node) bool {
 			case corev1.NodeSelectorOpIn:
 				matches = exists && contains
 			case corev1.NodeSelectorOpNotIn:
-				matches = !contains
+				matches = !exists || !contains
 			case corev1.NodeSelectorOpExists:
 				matches = exists
 			case corev1.NodeSelectorOpDoesNotExist:

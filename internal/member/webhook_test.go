@@ -137,6 +137,40 @@ func TestProvisionAffinityPreservesORTerms(t *testing.T) {
 	}
 }
 
+func TestGroupPlacementBlocksSurvivorsUntilWholeAllocationSetPropagates(t *testing.T) {
+	plan, pod, survivor := fixture()
+	const key = "ml.dcn.ssu.ac.kr/node-provision-uid"
+	plan.Spec.WorkloadRef.Kind = "StatefulSet"
+	plan.Spec.WorkloadRef.Name = "job"
+	plan.Spec.GroupRestore = &api.GroupRestoreSpec{WorldSize: 2}
+	plan.Spec.Pods = []api.RestorePod{{TargetNode: "node-a"}, {TargetNode: "replacement"}}
+	survivor.Labels[key] = "survivor-uid"
+	replacement := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Labels: map[string]string{key: "new-uid"}}}
+	work := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "jobs", UID: "member-workload", Labels: map[string]string{"training.dcnlab.com/run-uid": "run"}}}
+	yes := true
+	pod.OwnerReferences = []metav1.OwnerReference{{Kind: "StatefulSet", Name: "job", UID: work.UID, Controller: &yes}}
+	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{"survivor-uid", "lost-uid"}}}}}}}}
+	w := NewWebhook(testClient(t, work, survivor, replacement), "target")
+	if !provisionAffinityAllows(pod, survivor) {
+		t.Fatal("fixture must reproduce the previously admitted survivor")
+	}
+	before := pod.DeepCopy()
+	if err := w.groupPlacementReady(context.Background(), plan, pod); err == nil {
+		t.Fatal("survivor must wait too, otherwise revisions are mixed")
+	}
+	if !reflect.DeepEqual(before, pod) {
+		t.Fatal("must not rewrite stale template or constraints")
+	}
+	pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values[1] = "new-uid"
+	if err := w.groupPlacementReady(context.Background(), plan, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Spec.Affinity = nil
+	if err := w.groupPlacementReady(context.Background(), plan, pod); err == nil {
+		t.Fatal("initial cross-cluster copy must wait for Cloud allocation override too")
+	}
+}
+
 func TestAdmissionFailsClosed(t *testing.T) {
 	cases := []struct {
 		name   string
