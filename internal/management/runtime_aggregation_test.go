@@ -37,3 +37,41 @@ func TestRuntimeVerificationUsesReflectedMemberGeneration(t *testing.T) {
 		})
 	}
 }
+
+func TestCrossClusterRuntimeTemplateGeneration(t *testing.T) {
+	for _, mode := range []string{"valid", "wrong-uid", "stale", "missing-uid", "missing-generation", "missing-receipt", "invalid-member"} {
+		t.Run(mode, func(t *testing.T) {
+			req, cp := fixture()
+			plan := mustDesiredPlan(req)
+			plan.Generation = 1
+			plan.Status.Clusters = []api.ClusterStatus{{ClusterName: "target", ObservedGeneration: 1, Phase: "Running", Pods: []api.PodStatus{{Name: "db-0", UID: "target-pod-uid", Phase: "Running"}}}}
+			tr := trainingRuntime(req, "target-pod-uid", metav1.Now())
+			tr.SetGeneration(2)
+			cluster := tr.Object["status"].(map[string]interface{})["clusters"].([]interface{})[0].(map[string]interface{})
+			delete(cluster, "observedGeneration")
+			s := cluster["status"].(map[string]interface{})
+			s["observedGeneration"] = int64(1)
+			s["observedTemplateUID"] = string(tr.GetUID())
+			s["observedTemplateGeneration"] = int64(2)
+			switch mode {
+			case "wrong-uid":
+				s["observedTemplateUID"] = "other"
+			case "stale":
+				s["observedTemplateGeneration"] = int64(1)
+			case "missing-uid":
+				delete(s, "observedTemplateUID")
+			case "missing-generation":
+				delete(s, "observedTemplateGeneration")
+			case "missing-receipt":
+				delete(s, "observedTemplateUID")
+				delete(s, "observedTemplateGeneration")
+			case "invalid-member":
+				s["observedGeneration"] = int64(0)
+			}
+			got := reconcile(t, testClient(t, req, cp, plan, tr), req)
+			if (got.Status.Phase == "Verified") != (mode == "valid") {
+				t.Fatalf("unexpected verification: %+v", got.Status)
+			}
+		})
+	}
+}

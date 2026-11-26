@@ -203,7 +203,7 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, key ctrl.Request) (ct
 					break
 				}
 			}
-			phase, message = "Running", s.Message
+			phase, message = "Running", "target runtime verification pending: "+err.Error()
 		}
 	}
 	if matches > 1 {
@@ -399,14 +399,26 @@ func (r *RestoreReconciler) validateTargetRuntime(ctx context.Context, req *api.
 			generation = cluster["observedGeneration"]
 		}
 		observed, valid := int64From(generation)
-		if !valid || observed != tr.GetGeneration() {
-			return nil, fmt.Errorf("TrainingRuntime observedGeneration mismatch")
+		if !valid || observed < 1 {
+			return nil, fmt.Errorf("TrainingRuntime member generation missing")
 		}
 		if outer, found := cluster["observedGeneration"]; found {
 			value, valid := int64From(outer)
 			if !valid || value != observed {
 				return nil, fmt.Errorf("conflicting TrainingRuntime generation receipts")
 			}
+		}
+		// A newly created target has local generation 1 even when the source
+		// template has already advanced. Require its separately bound receipt.
+		uid, hasUID := status["observedTemplateUID"]
+		templateGeneration, hasGeneration := status["observedTemplateGeneration"]
+		if hasUID || hasGeneration {
+			n, ok := int64From(templateGeneration)
+			if !hasUID || uid != string(tr.GetUID()) || !ok || n != tr.GetGeneration() || n < 1 {
+				return nil, fmt.Errorf("TrainingRuntime template identity or generation mismatch")
+			}
+		} else if observed != tr.GetGeneration() {
+			return nil, fmt.Errorf("TrainingRuntime observedGeneration mismatch")
 		}
 		runtimeStatus = status
 	}
