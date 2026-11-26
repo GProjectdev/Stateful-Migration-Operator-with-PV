@@ -28,7 +28,7 @@ func (c *wakeClient) Patch(ctx context.Context, obj client.Object, patch client.
 }
 
 func TestPreparedWorkloadWake(t *testing.T) {
-	for _, mode := range []string{"ready", "preparing", "stale", "uid", "deleting", "source", "fence", "retry"} {
+	for _, mode := range []string{"ready", "preparing", "stale", "uid", "deleting", "source", "fence", "retry", "framework", "framework-wrong-parent", "framework-wrong-template", "missing-template"} {
 		t.Run(mode, func(t *testing.T) {
 			p, _, _, _, _ := groupFixture()
 			p.UID = "plan"
@@ -40,7 +40,18 @@ func TestPreparedWorkloadWake(t *testing.T) {
 			p.Status.SourceFences = []api.SourcePodFenceStatus{{PodName: "trainer-0", SourcePodUID: "old", ObservedGeneration: 1, Phase: "SourceGone", DeleteRequestedAt: &now, GoneObservedAt: &now}}
 			sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "trainer", Namespace: p.Namespace, UID: "local-world", Labels: map[string]string{WorkloadUIDLabel: "world"}}}
 			sts.Spec.Template.Labels = map[string]string{WorkloadUIDLabel: "world"}
+			if mode == "framework" || mode == "framework-wrong-parent" || mode == "framework-wrong-template" {
+				sts.Labels["training.dcnlab.com/run-uid"] = "run"
+				sts.Annotations = map[string]string{"resourcetemplate.karmada.io/uid": "world"}
+				sts.Spec.Template.Labels = nil
+			}
 			switch mode {
+			case "framework-wrong-parent":
+				sts.Annotations["resourcetemplate.karmada.io/uid"] = "other"
+			case "framework-wrong-template":
+				sts.Spec.Template.Labels = map[string]string{WorkloadUIDLabel: "other"}
+			case "missing-template":
+				sts.Spec.Template.Labels = nil
 			case "preparing":
 				p.Status.Phase = "Preparing"
 			case "stale":
@@ -66,7 +77,7 @@ func TestPreparedWorkloadWake(t *testing.T) {
 			r := NewReconciler(c, c, "target")
 			key := client.ObjectKeyFromObject(p)
 			err := r.wakePreparedWorkload(context.Background(), key)
-			wantErr := mode == "uid" || mode == "fence" || mode == "retry"
+			wantErr := mode == "uid" || mode == "fence" || mode == "retry" || mode == "framework-wrong-parent" || mode == "framework-wrong-template" || mode == "missing-template"
 			if (err != nil) != wantErr {
 				t.Fatalf("error=%v", err)
 			}
@@ -81,7 +92,7 @@ func TestPreparedWorkloadWake(t *testing.T) {
 			if err := c.Get(context.Background(), client.ObjectKeyFromObject(sts), &got); err != nil {
 				t.Fatal(err)
 			}
-			wantWake := mode == "ready" || mode == "retry"
+			wantWake := mode == "ready" || mode == "retry" || mode == "framework"
 			if (got.Annotations[preparedWorkloadAnnotation] != "") != wantWake {
 				t.Fatalf("annotations=%v", got.Annotations)
 			}

@@ -39,7 +39,14 @@ func (r *Reconciler) wakePreparedWorkload(ctx context.Context, key client.Object
 	if origin == "" {
 		origin = string(sts.UID)
 	}
-	if plan.Spec.WorkloadRef.UID == "" || origin != plan.Spec.WorkloadRef.UID || sts.Spec.Template.Labels[WorkloadUIDLabel] != origin {
+	templateOrigin := sts.Spec.Template.Labels[WorkloadUIDLabel]
+	// Framework templates preserve user labels. Verify the propagated parent
+	// identity rather than requiring an injected label in its Pod template.
+	frameworkParent := sts.Labels["training.dcnlab.com/run-uid"] != "" &&
+		sts.Labels[WorkloadUIDLabel] == origin &&
+		sts.Annotations["resourcetemplate.karmada.io/uid"] == origin
+	if plan.Spec.WorkloadRef.UID == "" || origin != plan.Spec.WorkloadRef.UID ||
+		(templateOrigin != origin && !(templateOrigin == "" && frameworkParent)) {
 		return fmt.Errorf("prepared workload origin UID mismatch")
 	}
 	receipt := plan.Status.GroupControl
